@@ -2,7 +2,7 @@
 
 以馬丁現貨策略為核心的回測與掃描工具，包含：
 - 策略回測核心（`martin.py`）
-- 參數掃描與單次回測 GUI（`martin_gui.py`）
+- 參數掃描與單次回測 GUI（`martin_gui.py`，PySide6 / Qt）
 - 高波動幣種掃描 GUI（`volatility_scanner_gui.py`）
 - 命令列測試腳本（`test_strategy.py`）
 
@@ -23,14 +23,16 @@
   - `ccxt`
   - `pandas`
   - `numpy`
-  - `matplotlib`
-  - `numba`
-  - `pyarrow`（選用，用於 Parquet 快取）
+- `matplotlib`
+- `numba`
+- `PySide6`（GUI 介面）
+- `pyarrow`（選用，用於 Parquet 快取）
 
 安裝：
 ```bash
 pip install -r requirements.txt
 ```
+GUI 需要 PySide6（已包含於 requirements.txt）。
 若要啟用 Parquet 快取：
 ```bash
 pip install pyarrow
@@ -65,6 +67,13 @@ python test_strategy.py
 - 平行網格掃描參數
 - 顯示 Top 結果
 - 以最佳參數繪製策略曲線與 Buy & Hold 對比
+
+## Screenshots
+### martin_gui.py
+![martin_gui](screenshot%20martin_gui.png)
+
+### volatility_scanner_gui.py
+![volatility_scanner_gui](screenshot%20volatility_scanner_gui.png)
 
 ## Project Structure
 - `martin.py`：策略核心、資料抓取、快取、回測、績效統計

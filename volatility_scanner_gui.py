@@ -1,38 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-Volatility Scanner GUI for Martin Strategy
+Volatility Scanner GUI for Martin Strategy (PySide6)
 用來掃描高波動幣種，輔助馬丁策略選幣。
 """
 
-import threading
-import tkinter as tk
-from tkinter import ttk, messagebox
-import pandas as pd
-import numpy as np
-import ccxt
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-from datetime import datetime, timedelta
 import traceback
+import threading
 import concurrent.futures
-import requests
 import time
-import json
 import re
+import math
+from datetime import datetime, timedelta
 
+import numpy as np
+import pandas as pd
+import ccxt
+import requests
+
+import matplotlib
+matplotlib.use("QtAgg")
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal, Slot, QTimer
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QLineEdit, QComboBox, QPushButton, QLabel, QSplitter, QTableWidget,
+    QTableWidgetItem, QMessageBox, QGroupBox, QStatusBar, QProgressBar,
+    QAbstractItemView, QHeaderView, QCheckBox,
+)
 
 # 嘗試匯入 martin.py 以重用 get_klines
 try:
     import martin
-except ImportError:
-    messagebox.showerror("Import Error", "無法匯入 martin.py，請確保檔案在同一目錄下。")
-    raise
+    _import_error = None
+except Exception as e:
+    martin = None
+    _import_error = e
 
-import math
-
-# ... (imports remain the same)
 
 # ===================== 指標計算 (From scan_vol_rank.py) =====================
 def realized_vol_annual_from_closes(closes: pd.Series, bars_per_year: float) -> float:
@@ -45,8 +51,9 @@ def realized_vol_annual_from_closes(closes: pd.Series, bars_per_year: float) -> 
         return float("nan")
     return float(np.std(rets, ddof=1) * math.sqrt(bars_per_year))
 
+
 def true_atr_pct(df: pd.DataFrame, n: int = 14) -> float:
-    req = {"high","low","close"}
+    req = {"high", "low", "close"}
     if not req.issubset(df.columns):
         return float("nan")
     h = df["high"].to_numpy(dtype=float)
@@ -54,10 +61,12 @@ def true_atr_pct(df: pd.DataFrame, n: int = 14) -> float:
     c = df["close"].to_numpy(dtype=float)
     if c.size < n or c[-1] <= 0:
         return float("nan")
-    prev_c = np.roll(c, 1); prev_c[0] = c[0]
+    prev_c = np.roll(c, 1)
+    prev_c[0] = c[0]
     tr = np.maximum.reduce([h - l, np.abs(h - prev_c), np.abs(l - prev_c)])
     atr_last = tr[-n:].mean()
     return float(atr_last / c[-1])
+
 
 def approx_atr_pct_from_close(closes: pd.Series, n: int = 14) -> float:
     c = closes.to_numpy(dtype=float)
@@ -66,6 +75,7 @@ def approx_atr_pct_from_close(closes: pd.Series, n: int = 14) -> float:
     tr = np.abs(np.diff(c))
     atr_last = tr[-n:].mean()
     return float(atr_last / c[-1])
+
 
 def bb_width_pct(closes: pd.Series, n: int = 20, k: float = 2.0) -> float:
     c = closes.to_numpy(dtype=float)
@@ -78,6 +88,7 @@ def bb_width_pct(closes: pd.Series, n: int = 20, k: float = 2.0) -> float:
         return float("nan")
     return float((2.0 * k * sd) / ma)
 
+
 def fetch_top_mc_coins(limit=250):
     """
     Fetch top N coins by market cap from CoinGecko.
@@ -87,409 +98,537 @@ def fetch_top_mc_coins(limit=250):
     params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
-        "per_page": min(limit, 250), # CoinGecko max per page is 250
+        "per_page": min(limit, 250),
         "page": 1,
-        "sparkline": "false"
+        "sparkline": "false",
     }
-    
+
     mapping = {}
     try:
-        # Page 1
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            for i, item in enumerate(data):
+            for item in data:
                 sym = item['symbol'].lower()
                 if sym not in mapping:
                     mapping[sym] = item['market_cap_rank']
-        
-        # If limit > 250, fetch page 2
+
         if limit > 250:
             params["page"] = 2
             params["per_page"] = limit - 250
-            time.sleep(1.0) # Rate limit politeness
+            time.sleep(1.0)
             resp = requests.get(url, params=params, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                for i, item in enumerate(data):
+                for item in data:
                     sym = item['symbol'].lower()
                     if sym not in mapping:
                         mapping[sym] = item['market_cap_rank']
-        
+
         return mapping
     except Exception as e:
         print(f"CoinGecko API Error: {e}")
         return {}
 
+
 def is_stablecoin_base(base: str) -> bool:
     b = (base or "").upper()
     if not b:
         return False
-    # Common stablecoins (expand as needed)
     stable_set = {
-        "USDT","USDC","USDD","TUSD","BUSD","DAI","FRAX","FDUSD","USDP","GUSD",
-        "PYUSD","USDS","USDE","USD1","USDI","USDJ","USDK","USDX","USTC","EUR",
-        "EURT","EURS","GBP","GBPT","USDR","USDN","USDB",
+        "USDT", "USDC", "USDD", "TUSD", "BUSD", "DAI", "FRAX", "FDUSD", "USDP", "GUSD",
+        "PYUSD", "USDS", "USDE", "USD1", "USDI", "USDJ", "USDK", "USDX", "USTC", "EUR",
+        "EURT", "EURS", "GBP", "GBPT", "USDR", "USDN", "USDB",
     }
     if b in stable_set:
         return True
-    # Catch USD* tokens like USD1, USDC, USDT, USDP, etc.
     if re.match(r"^USD[A-Z0-9]{0,4}$", b):
         return True
-    # Catch *USD (rare, but defensive)
     if b.endswith("USD"):
         return True
     return False
 
-class VolatilityScannerGUI(tk.Tk):
+
+class ScanSignals(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+    log = Signal(str)
+    progress = Signal(int, int)
+    warning = Signal(str)
+    stopped = Signal(str)
+
+
+class ScanWorker(QRunnable):
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = ScanSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            result = self.fn(self.signals, *self.args, **self.kwargs)
+            self.signals.finished.emit(result)
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+
+
+class MarqueeLabel(QLabel):
+    def __init__(self, text="", parent=None, interval_ms=120):
+        super().__init__(text, parent)
+        self._full_text = text
+        self._offset = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._interval_ms = interval_ms
+
+    def setFullText(self, text: str):
+        self._full_text = text or ""
+        self._offset = 0
+        self._refresh()
+
+    def _needs_marquee(self) -> bool:
+        fm = self.fontMetrics()
+        return fm.horizontalAdvance(self._full_text) > self.contentsRect().width()
+
+    def _refresh(self):
+        if not self._full_text:
+            self.setText("")
+            self._timer.stop()
+            return
+        if self._needs_marquee():
+            if not self._timer.isActive():
+                self._timer.start(self._interval_ms)
+        else:
+            self._timer.stop()
+            self.setText(self._full_text)
+
+    def _tick(self):
+        if not self._needs_marquee():
+            self._refresh()
+            return
+        s = self._full_text + "   "
+        if self._offset >= len(s):
+            self._offset = 0
+        view = s[self._offset:] + s[:self._offset]
+        self.setText(view)
+        self._offset += 1
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh()
+
+
+class VolatilityScannerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("Crypto Volatility Scanner")
-        self.geometry("1300x800") # Slightly wider for new columns
+        self.setWindowTitle("Crypto Volatility Scanner")
+        self.resize(900, 820)
 
-        # 資料變數
-        self.scan_results = None  # DataFrame
-
-        self.is_scanning = False
+        self.thread_pool = QThreadPool.globalInstance()
         self.stop_event = threading.Event()
 
-        # --- 上方控制區 ---
-        ctrl_frame = ttk.LabelFrame(self, text="Scanner Settings")
-        ctrl_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+        self.scan_results = None
+        self.cols = [
+            "Symbol", "Price", "Avg_Vol(M)", "RV(Ann)%", "ATR(Month)%",
+            "Max_DD(%)", "Change(%)", "MC Rank",
+        ]
 
-        # 第一排：交易所、Quote、Interval、天數
-        row1 = ttk.Frame(ctrl_frame)
-        row1.pack(fill=tk.X, padx=5, pady=2)
-        
-        ttk.Label(row1, text="Exchange:").pack(side=tk.LEFT)
-        self.cb_exchange = ttk.Combobox(row1, values=["binance", "bybit", "okx", "gateio"], width=10)
-        self.cb_exchange.set("binance")
-        self.cb_exchange.pack(side=tk.LEFT, padx=5)
+        self._build_ui()
+        self._apply_style()
 
-        ttk.Label(row1, text="Quote Asset:").pack(side=tk.LEFT)
-        self.e_quote = ttk.Entry(row1, width=8)
-        self.e_quote.insert(0, "USDT")
-        self.e_quote.pack(side=tk.LEFT, padx=5)
+    def _apply_style(self):
+        app = QApplication.instance()
+        if app:
+            app.setStyle("Fusion")
 
-        ttk.Label(row1, text="Interval:").pack(side=tk.LEFT)
-        self.cb_interval = ttk.Combobox(row1, values=["5m", "15m", "1h", "4h", "1d"], width=6)
-        self.cb_interval.set("4h")
-        self.cb_interval.pack(side=tk.LEFT, padx=5)
+        base_font = QFont("Avenir Next", 11)
+        self.setFont(base_font)
 
-        ttk.Label(row1, text="Scan Days:").pack(side=tk.LEFT)
-        self.e_days = ttk.Entry(row1, width=6)
-        self.e_days.insert(0, "730")
-        self.e_days.pack(side=tk.LEFT, padx=5)
+        self.setStyleSheet(
+            """
+            QMainWindow { background: #2f2f2f; }
+            QWidget { color: #f2f2f2; }
+            QGroupBox { font-weight: 600; border: 1px solid #7c7c7c; border-radius: 10px; margin-top: 12px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #ffffff; }
+            QLabel { color: #e8e8e8; }
+            QLineEdit, QComboBox {
+                background: #ffffff; color: #1d1d1d; border: 1px solid #b9b9b9; border-radius: 6px; padding: 4px 6px;
+            }
+            QComboBox QAbstractItemView { background: #ffffff; color: #1d1d1d; }
+            QTableWidget { background: #ffffff; color: #1d1d1d; border: 1px solid #7c7c7c; border-radius: 8px; gridline-color: #d0d0d0; }
+            QHeaderView::section { background: #e9e9e9; color: #1d1d1d; padding: 6px; border: 0px; }
+            QTabWidget::pane { border: 1px solid #6e6e6e; border-radius: 8px; }
+            QPushButton { background: #59626a; color: #ffffff; border: 0px; border-radius: 8px; padding: 6px 12px; }
+            QPushButton:hover { background: #4f575e; }
+            QPushButton:pressed { background: #454c52; }
+            QPushButton#btnPrimary { background: #2d6a7a; font-weight: 700; }
+            QPushButton#btnPrimary:hover { background: #295f6d; }
+            QPushButton#btnPrimary:pressed { background: #23535f; }
+            QPushButton#btnDanger { background: #8a2d3a; }
+            QPushButton#btnDanger:hover { background: #7a2833; }
+            QPushButton#btnDanger:pressed { background: #6b232c; }
+            QSplitter::handle { background: #7c7c7c; }
+            """
+        )
 
-        # 第二排：過濾條件 (Volume, Top N)
-        row2 = ttk.Frame(ctrl_frame)
-        row2.pack(fill=tk.X, padx=5, pady=2)
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
 
-        ttk.Label(row2, text="Pre-filter 24h Vol (M):").pack(side=tk.LEFT)
-        self.e_min_vol = ttk.Entry(row2, width=8)
-        self.e_min_vol.insert(0, "10") # 10M (Pre-filter)
-        self.e_min_vol.pack(side=tk.LEFT, padx=5)
+        main_layout = QVBoxLayout(central)
 
-        ttk.Label(row2, text="Min Avg Daily Vol (M):").pack(side=tk.LEFT)
-        self.e_min_avg_vol = ttk.Entry(row2, width=8)
-        self.e_min_avg_vol.insert(0, "40") # 40M (Avg Vol)
-        self.e_min_avg_vol.pack(side=tk.LEFT, padx=5)
+        # Top controls
+        ctrl_group = QGroupBox("Scanner Settings")
+        main_layout.addWidget(ctrl_group)
+        ctrl_layout = QVBoxLayout(ctrl_group)
 
-        ttk.Label(row2, text="Scan Top N (by Vol):").pack(side=tk.LEFT)
-        self.e_top_n = ttk.Entry(row2, width=6)
-        self.e_top_n.insert(0, "50")
-        self.e_top_n.pack(side=tk.LEFT, padx=5)
+        row1 = QHBoxLayout()
+        row2 = QHBoxLayout()
+        row3 = QHBoxLayout()
+        row4 = QHBoxLayout()
 
-        self.btn_scan = ttk.Button(row2, text="Start Scan", command=self.start_scan_thread)
-        self.btn_scan.pack(side=tk.LEFT, padx=5)
+        ctrl_layout.addLayout(row1)
+        ctrl_layout.addLayout(row2)
+        ctrl_layout.addLayout(row3)
+        ctrl_layout.addLayout(row4)
 
-        self.btn_stop = ttk.Button(row2, text="Stop", command=self.stop_scan, state=tk.DISABLED)
-        self.btn_stop.pack(side=tk.LEFT, padx=5)
+        # Row 1
+        row1.addWidget(QLabel("Exchange:"))
+        self.cb_exchange = QComboBox()
+        self.cb_exchange.addItems(["binance", "bybit", "okx", "gateio"])
+        self.cb_exchange.setCurrentText("binance")
+        self.cb_exchange.setMinimumWidth(100)
+        row1.addWidget(self.cb_exchange)
 
-        self.lbl_status = ttk.Label(row2, text="Ready.", foreground="#00FF00")
-        self.lbl_status.pack(side=tk.LEFT, padx=10)
+        row1.addWidget(QLabel("Quote Asset:"))
+        self.e_quote = QLineEdit("USDT")
+        self.e_quote.setMaximumWidth(80)
+        row1.addWidget(self.e_quote)
 
-        # 進度條
-        self.progress = ttk.Progressbar(row2, orient=tk.HORIZONTAL, length=200, mode='determinate')
-        self.progress.pack(side=tk.LEFT, padx=10)
+        row1.addWidget(QLabel("Interval:"))
+        self.cb_interval = QComboBox()
+        self.cb_interval.addItems(["15m", "1h", "4h", "1d"])
+        self.cb_interval.setCurrentText("4h")
+        self.cb_interval.setMaximumWidth(80)
+        row1.addWidget(self.cb_interval)
 
-        # 第三排：Market Cap Filter
-        row3 = ttk.Frame(ctrl_frame)
-        row3.pack(fill=tk.X, padx=5, pady=2)
-        
-        self.chk_mc_filter_var = tk.BooleanVar(value=True)
-        self.chk_mc_filter = ttk.Checkbutton(row3, text="Filter Top Rank (CoinGecko)", variable=self.chk_mc_filter_var)
-        self.chk_mc_filter.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(row3, text="Max Rank:").pack(side=tk.LEFT)
-        self.e_max_rank = ttk.Entry(row3, width=6)
-        self.e_max_rank.insert(0, "100")
-        self.e_max_rank.pack(side=tk.LEFT, padx=5)
+        row1.addWidget(QLabel("Scan Days:"))
+        self.e_days = QLineEdit("730")
+        self.e_days.setMaximumWidth(80)
+        row1.addWidget(self.e_days)
 
-        # 第四排：手動輸入 Symbol
-        row4 = ttk.Frame(ctrl_frame)
-        row4.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(row4, text="Manual Add (Base):").pack(side=tk.LEFT)
-        self.e_manual = ttk.Entry(row4, width=40)
-        self.e_manual.pack(side=tk.LEFT, padx=5)
-        ttk.Label(row4, text="(e.g. SUI, BTC. Separated by space/comma)").pack(side=tk.LEFT)
+        row1.addStretch(1)
 
-        # --- 主畫面分割 (左: 表格, 右: 圖表) ---
-        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Row 2
+        row2.addWidget(QLabel("Pre-filter 24h Vol (M):"))
+        self.e_min_vol = QLineEdit("10")
+        self.e_min_vol.setMaximumWidth(90)
+        row2.addWidget(self.e_min_vol)
 
-        # 左側表格
-        frame_table = ttk.Frame(paned)
-        paned.add(frame_table, weight=1)
+        row2.addWidget(QLabel("Min Avg Daily Vol (M):"))
+        self.e_min_avg_vol = QLineEdit("40")
+        self.e_min_avg_vol.setMaximumWidth(90)
+        row2.addWidget(self.e_min_avg_vol)
 
-        # Updated columns: Removed ATR(Day)%, Removed BBW(%), Added ATR(Month)%, Added MC Rank
-        cols = ("Symbol", "Price", "Avg_Vol(M)", "RV(Ann)%", "ATR(Month)%", "Max_DD(%)", "Change(%)", "MC Rank")
-        self.tree = ttk.Treeview(frame_table, columns=cols, show="headings")
-        for c in cols:
-            self.tree.heading(c, text=c, command=lambda _c=c: self.sort_tree(_c, False))
-            self.tree.column(c, width=75, anchor="center")
-        
-        # Scrollbar
-        sb = ttk.Scrollbar(frame_table, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=sb.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        row2.addWidget(QLabel("Scan Top N (by Vol):"))
+        self.e_top_n = QLineEdit("50")
+        self.e_top_n.setMaximumWidth(80)
+        row2.addWidget(self.e_top_n)
 
-        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        row2.addStretch(1)
 
-        # 右側圖表
-        frame_chart = ttk.Frame(paned)
-        paned.add(frame_chart, weight=1)
+        # Row 3
+        self.chk_mc_filter = QCheckBox("Filter Top Rank (CoinGecko)")
+        self.chk_mc_filter.setChecked(True)
+        row3.addWidget(self.chk_mc_filter)
 
+        row3.addWidget(QLabel("Max Rank:"))
+        self.e_max_rank = QLineEdit("100")
+        self.e_max_rank.setMaximumWidth(80)
+        row3.addWidget(self.e_max_rank)
+
+        row3.addStretch(1)
+
+        self.btn_scan = QPushButton("Start Scan")
+        self.btn_scan.setObjectName("btnPrimary")
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setObjectName("btnDanger")
+        self.btn_stop.setEnabled(False)
+
+        row3.addWidget(self.btn_scan)
+        row3.addWidget(self.btn_stop)
+
+        self.lbl_status = MarqueeLabel("Ready.")
+        self.lbl_status.setStyleSheet("color: #9ddc91;")
+        self.lbl_status.setFixedWidth(170)
+        self.lbl_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row3.addWidget(self.lbl_status)
+
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(220)
+        row3.addWidget(self.progress)
+        row3.addStretch(0)
+
+        # Row 4
+        row4.addWidget(QLabel("Manual Add (Base):"))
+        self.e_manual = QLineEdit()
+        self.e_manual.setMinimumWidth(320)
+        row4.addWidget(self.e_manual)
+        row4.addWidget(QLabel("(e.g. SUI, BTC. Separated by space/comma)"))
+        row4.addStretch(1)
+
+        self.btn_scan.clicked.connect(self.start_scan)
+        self.btn_stop.clicked.connect(self.stop_scan)
+
+        # Splitter (vertical: table on top, chart at bottom)
+        splitter = QSplitter(Qt.Vertical)
+        main_layout.addWidget(splitter, 1)
+
+        # Table
+        table_wrap = QWidget()
+        table_layout = QVBoxLayout(table_wrap)
+        self.table = QTableWidget(0, len(self.cols))
+        self.table.setHorizontalHeaderLabels(self.cols)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSortingEnabled(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        col_widths = [110, 90, 110, 90, 110, 100, 90, 80]
+        for i, w in enumerate(col_widths):
+            self.table.setColumnWidth(i, w)
+        table_layout.addWidget(self.table)
+        splitter.addWidget(table_wrap)
+
+        self.table.horizontalHeader().sectionClicked.connect(self.on_header_clicked)
+        self.table.itemSelectionChanged.connect(self.on_table_select)
+
+        # Chart
+        chart_wrap = QWidget()
+        chart_layout = QVBoxLayout(chart_wrap)
         self.fig = Figure(figsize=(5, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=frame_chart)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas = FigureCanvas(self.fig)
+        chart_layout.addWidget(self.canvas)
+        splitter.addWidget(chart_wrap)
 
-    def log(self, msg):
-        self.lbl_status.config(text=msg)
-        self.update_idletasks()
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
 
-    def start_scan_thread(self):
-        if self.is_scanning:
-            return
-        self.is_scanning = True
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+    def _set_status(self, msg, ok=True):
+        self.lbl_status.setFullText(msg)
+        self.lbl_status.setStyleSheet("color: #9ddc91;" if ok else "color: #f3b6b6;")
+        self.status_bar.showMessage(msg)
+
+    def start_scan(self):
         self.stop_event.clear()
-        self.btn_scan.config(state=tk.DISABLED)
-        self.btn_stop.config(state=tk.NORMAL)
-        self.progress['value'] = 0
-        threading.Thread(target=self.run_scan, daemon=True).start()
+        self.btn_scan.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.progress.setValue(0)
+        self._set_status("Starting scan...")
+
+        worker = ScanWorker(self._run_scan_logic)
+        worker.signals.log.connect(lambda m: self._set_status(m, ok=True))
+        worker.signals.progress.connect(self._on_progress)
+        worker.signals.warning.connect(self._show_warning)
+        worker.signals.stopped.connect(lambda m: self._set_status(m, ok=False))
+        worker.signals.error.connect(self._show_error)
+        worker.signals.finished.connect(self._on_scan_finished)
+
+        self.thread_pool.start(worker)
 
     def stop_scan(self):
-        if self.is_scanning:
-            self.stop_event.set()
-            self.log("Stopping scan...")
-            self.btn_stop.config(state=tk.DISABLED)
+        self.stop_event.set()
+        self.btn_stop.setEnabled(False)
+        self._set_status("Stopping scan...", ok=False)
 
-    def run_scan(self):
-        try:
-            exch_name = self.cb_exchange.get()
-            quote_asset = self.e_quote.get().upper()
-            interval = self.cb_interval.get()
-            days = int(self.e_days.get())
-            min_vol_pre = float(self.e_min_vol.get()) * 1_000_000
-            min_avg_vol = float(self.e_min_avg_vol.get()) * 1_000_000
-            top_n = int(self.e_top_n.get())
+    @Slot(int, int)
+    def _on_progress(self, value, total):
+        if total > 0:
+            self.progress.setMaximum(total)
+        self.progress.setValue(value)
 
-            use_mc_filter = self.chk_mc_filter_var.get()
-            max_rank = int(self.e_max_rank.get())
-            
-            mc_mapping = {}
-            if use_mc_filter:
-                self.log("Fetching Market Cap Rank from CoinGecko...")
-                mc_mapping = fetch_top_mc_coins(limit=max(max_rank, 250))
-                if not mc_mapping:
-                    self.log("Warning: CoinGecko fetch failed. MC filter ignored.")
+    @Slot(str)
+    def _show_warning(self, msg):
+        QMessageBox.warning(self, "Warning", msg)
 
-            self.log(f"Fetching tickers from {exch_name}...")
-            
-            # 1. 初始化交易所
-            ex_cls = getattr(ccxt, exch_name)()
-            markets = ex_cls.load_markets()
-            
-            # 2. 篩選 Tickers (Spot Only for simplicity, or allow perps if user wants)
-            # 這裡我們主要找 Spot 或 Swap，優先找 Quote 符合的
-            tickers = ex_cls.fetch_tickers()
-            
-            # Prepare manual symbols
-            manual_input = self.e_manual.get().strip()
-            manual_bases = set()
-            if manual_input:
-                # Split by comma or space
-                parts = manual_input.replace(",", " ").split()
-                for p in parts:
-                    p = p.strip().upper()
-                    # Remove quote if user typed SUI/USDT
-                    if '/' in p:
-                        p = p.split('/')[0]
-                    manual_bases.add(p)
-            
-            # Construct target manual symbols (e.g. SUI/USDT) to check existence
-            manual_pairs_needed = {f"{b}/{quote_asset}" for b in manual_bases}
-            manual_pairs_found = set()
+    @Slot(str)
+    def _show_error(self, tb):
+        self._set_status("Scan failed.", ok=False)
+        QMessageBox.critical(self, "Error", tb)
+        self.btn_scan.setEnabled(True)
+        self.btn_stop.setEnabled(False)
 
-            candidates = []
-            for symbol, ticker in tickers.items():
-                if not ticker: continue
-                # 簡單過濾：必須包含 Quote Asset (e.g. BTC/USDT)
-                if f"/{quote_asset}" not in symbol and not symbol.endswith(quote_asset):
+    @Slot(object)
+    def _on_scan_finished(self, df):
+        self.scan_results = df
+        self.update_table()
+        self.btn_scan.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        if self.stop_event.is_set():
+            self._set_status("Scan stopped by user.", ok=False)
+        else:
+            self._set_status("Scan completed.")
+
+    # --------- scan logic (background) ---------
+    def _run_scan_logic(self, signals: ScanSignals):
+        exch_name = self.cb_exchange.currentText()
+        quote_asset = self.e_quote.text().upper().strip()
+        interval = self.cb_interval.currentText()
+        days = int(self.e_days.text())
+        min_vol_pre = float(self.e_min_vol.text()) * 1_000_000
+        min_avg_vol = float(self.e_min_avg_vol.text()) * 1_000_000
+        top_n = int(self.e_top_n.text())
+
+        use_mc_filter = self.chk_mc_filter.isChecked()
+        max_rank = int(self.e_max_rank.text())
+
+        mc_mapping = {}
+        if use_mc_filter:
+            signals.log.emit("Fetching Market Cap Rank from CoinGecko...")
+            mc_mapping = fetch_top_mc_coins(limit=max(max_rank, 250))
+            if not mc_mapping:
+                signals.log.emit("Warning: CoinGecko fetch failed. MC filter ignored.")
+
+        signals.log.emit(f"Fetching tickers from {exch_name}...")
+
+        ex_cls = getattr(ccxt, exch_name)()
+        ex_cls.load_markets()
+        tickers = ex_cls.fetch_tickers()
+
+        manual_input = self.e_manual.text().strip()
+        manual_bases = set()
+        if manual_input:
+            parts = manual_input.replace(",", " ").split()
+            for p in parts:
+                p = p.strip().upper()
+                if '/' in p:
+                    p = p.split('/')[0]
+                manual_bases.add(p)
+
+        manual_pairs_needed = {f"{b}/{quote_asset}" for b in manual_bases}
+        manual_pairs_found = set()
+
+        candidates = []
+        for symbol, ticker in tickers.items():
+            if not ticker:
+                continue
+            if f"/{quote_asset}" not in symbol and not symbol.endswith(quote_asset):
+                continue
+
+            base = symbol.split('/')[0] if '/' in symbol else symbol.replace(quote_asset, "")
+            is_manual = (base in manual_bases)
+            if is_manual:
+                if symbol == f"{base}/{quote_asset}":
+                    manual_pairs_found.add(symbol)
+
+            if not is_manual:
+                if is_stablecoin_base(base):
                     continue
-                
-                base = symbol.split('/')[0] if '/' in symbol else symbol.replace(quote_asset, "")
 
-                # Check if this is a manual override symbol
-                is_manual = (base in manual_bases)
-                if is_manual:
-                    # Check partial match or exact match depending on exchange format
-                    # Most CCXT tickers are BASE/QUOTE
-                    if symbol == f"{base}/{quote_asset}":
-                         manual_pairs_found.add(symbol)
-                
-                if not is_manual:
-                    # 過濾 Stablecoins
-                    if is_stablecoin_base(base):
+                rank = -1
+                if mc_mapping:
+                    base_lower = base.lower()
+                    if base_lower in mc_mapping:
+                        rank = mc_mapping[base_lower]
+                        if rank > max_rank:
+                            continue
+                    else:
                         continue
-                    
-                    # Market Cap Filter
-                    rank = -1
-                    if mc_mapping:
-                        base_lower = base.lower()
-                        # Mapping usually has 'btc', 'eth'. Tickers are 'BTC/USDT'.
-                        if base_lower in mc_mapping:
-                            rank = mc_mapping[base_lower]
-                            if rank > max_rank:
-                                continue # Rank too low (number too high)
-                        else:
-                            continue # Not in top N list
-                else:
-                    # For manual, we still try to get rank if available, but don't filter
-                    rank = -1
-                    if mc_mapping:
-                        base_lower = base.lower()
-                        if base_lower in mc_mapping:
-                            rank = mc_mapping[base_lower]
-
-                # 過濾掉槓桿代幣等 (簡單判斷: 包含 DOWN, UP, BEAR, BULL 且長度怪怪的，這裡先不嚴格過濾)
-                
-                vol = ticker.get('quoteVolume') or 0
-                if not is_manual and vol < min_vol_pre:
-                    continue
-                
-                candidates.append({
-                    'symbol': symbol,
-                    'volume': vol,
-                    'close': ticker.get('close'),
-                    'mc_rank': rank,
-                    'is_manual': is_manual
-                })
-
-            
-            # Check for missing manual symbols
-            if manual_bases:
-                # manual_pairs_needed vs manual_pairs_found
-                # We simply check if we found a valid ticker for the base
-                # Actually, our manual_pairs_found logic above only adds if exact match BASE/QUOTE
-                # Let's check which BASES were not found
-                found_bases = {p.split('/')[0] for p in manual_pairs_found}
-                missing_bases = manual_bases - found_bases
-                if missing_bases:
-                    msg = f"Warning: The following manual symbols were not found on {exch_name} (Quote: {quote_asset}):\n" + ", ".join(missing_bases)
-                    self.after(0, lambda: messagebox.showwarning("Symbol Not Found", msg))
-            # Separate candidates
-            manual_candidates = [c for c in candidates if c['symbol'] in manual_pairs_found]
-            auto_candidates = [c for c in candidates if c['symbol'] not in manual_pairs_found]
-            
-            # Sort Auto candidates by volume and take Top N
-            auto_candidates.sort(key=lambda x: x['volume'], reverse=True)
-            auto_candidates = auto_candidates[:top_n]
-            
-            # Combine: Manual + Auto (ensure no duplicates, though manual_pairs_found check should handle it)
-            # Priorities manual first
-            final_candidates = manual_candidates + auto_candidates
-            candidates = final_candidates
-            total_cands = len(candidates)
-            self.log(f"Found {total_cands} candidates. Fetching K-lines (Parallel)...")
-            
-            # 設定進度條最大值
-            self.after(0, lambda: self.progress.configure(maximum=total_cands))
-
-            results = []
-            
-            # 計算需要的 bars 數 / 時間區間
-            end_dt = datetime.now()
-            start_dt = end_dt - timedelta(days=days)
-            start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-            end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-            # 準備參數供平行處理
-            scan_args = {
-                "interval": interval,
-                "start_str": start_str,
-                "end_str": end_str,
-                "exch_name": exch_name,
-                "quote_asset": quote_asset,
-                "days": days,
-                "min_avg_vol": min_avg_vol
-            }
-
-            completed_count = 0
-            
-            # 使用 ThreadPoolExecutor 進行平行掃描
-            # 建議 worker 數不要太多，以免觸發 API Rate Limit (雖然 martin.py 有 retry)
-            # 一般 5~10 左右
-            max_workers = 8 
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # 提交所有任務
-                future_to_cand = {executor.submit(self.process_coin, cand, scan_args): cand for cand in candidates}
-                
-                for future in concurrent.futures.as_completed(future_to_cand):
-                    if self.stop_event.is_set():
-                        break
-                    
-                    cand = future_to_cand[future]
-                    sym = cand['symbol']
-                    
-                    try:
-                        res = future.result()
-                        if res:
-                            results.append(res)
-                    except Exception as e:
-                        print(f"Error processing {sym}: {e}")
-                    
-                    completed_count += 1
-                    # 更新進度條與狀態
-                    self.after(0, lambda v=completed_count: self.progress.configure(value=v))
-                    self.log(f"Scanning {completed_count}/{total_cands}...")
-
-            if self.stop_event.is_set():
-                self.log("Scan stopped by user.")
             else:
-                self.log("Scan completed.")
+                rank = -1
+                if mc_mapping:
+                    base_lower = base.lower()
+                    if base_lower in mc_mapping:
+                        rank = mc_mapping[base_lower]
 
-            self.scan_results = pd.DataFrame(results)
-            self.after(0, self.update_table)
+            vol = ticker.get('quoteVolume') or 0
+            if not is_manual and vol < min_vol_pre:
+                continue
 
-        except Exception as e:
-            traceback.print_exc()
-            err_msg = str(e)
-            self.after(0, lambda: messagebox.showerror("Error", err_msg))
-            self.after(0, lambda: self.log("Scan failed."))
-        finally:
-            self.is_scanning = False
-            self.after(0, lambda: self.btn_scan.config(state=tk.NORMAL))
-            self.after(0, lambda: self.btn_stop.config(state=tk.DISABLED))
+            candidates.append({
+                'symbol': symbol,
+                'volume': vol,
+                'close': ticker.get('close'),
+                'mc_rank': rank,
+                'is_manual': is_manual,
+            })
+
+        if manual_bases:
+            found_bases = {p.split('/')[0] for p in manual_pairs_found}
+            missing_bases = manual_bases - found_bases
+            if missing_bases:
+                msg = (
+                    f"Warning: The following manual symbols were not found on {exch_name} "
+                    f"(Quote: {quote_asset}):\n" + ", ".join(missing_bases)
+                )
+                signals.warning.emit(msg)
+
+        manual_candidates = [c for c in candidates if c['symbol'] in manual_pairs_found]
+        auto_candidates = [c for c in candidates if c['symbol'] not in manual_pairs_found]
+        auto_candidates.sort(key=lambda x: x['volume'], reverse=True)
+        auto_candidates = auto_candidates[:top_n]
+
+        candidates = manual_candidates + auto_candidates
+        total_cands = len(candidates)
+        signals.log.emit(f"Found {total_cands} candidates. Fetching K-lines (Parallel)...")
+
+        results = []
+
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=days)
+        start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        scan_args = {
+            "interval": interval,
+            "start_str": start_str,
+            "end_str": end_str,
+            "exch_name": exch_name,
+            "quote_asset": quote_asset,
+            "days": days,
+            "min_avg_vol": min_avg_vol,
+        }
+
+        completed_count = 0
+        max_workers = 8
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_cand = {executor.submit(self.process_coin, cand, scan_args): cand for cand in candidates}
+            for future in concurrent.futures.as_completed(future_to_cand):
+                if self.stop_event.is_set():
+                    signals.stopped.emit("Scan stopped by user.")
+                    break
+
+                cand = future_to_cand[future]
+                sym = cand['symbol']
+                try:
+                    res = future.result()
+                    if res:
+                        results.append(res)
+                except Exception as e:
+                    print(f"Error processing {sym}: {e}")
+
+                completed_count += 1
+                signals.progress.emit(completed_count, total_cands)
+                signals.log.emit(f"Scanning {completed_count}/{total_cands}...")
+
+        if self.stop_event.is_set():
+            signals.log.emit("Scan stopped by user.")
+        else:
+            signals.log.emit("Scan completed.")
+
+        return pd.DataFrame(results)
 
     def process_coin(self, cand, args):
-        """單一幣種處理邏輯 (在 Worker Thread 執行)"""
         if self.stop_event.is_set():
             return None
-            
+
         sym = cand['symbol']
         interval = args['interval']
         start_str = args['start_str']
@@ -497,74 +636,58 @@ class VolatilityScannerGUI(tk.Tk):
         exch_name = args['exch_name']
         quote_asset = args['quote_asset']
         days = args['days']
-        days = args['days']
         min_avg_vol = args['min_avg_vol']
         is_manual = cand.get('is_manual', False)
 
         try:
             base = sym.split('/')[0] if '/' in sym else sym.replace(quote_asset, "")
-            
-            # 呼叫 martin.get_klines
+
             df = martin.get_klines(
                 symbol=base,
                 interval=interval,
                 start=start_str,
                 end=end_str,
                 exch_list=[exch_name],
-                refresh_policy="auto"
+                refresh_policy="auto",
             )
-            
+
             if df is None or df.empty or len(df) < 50:
                 return None
 
-            # --- 計算指標 ---
             closes = df['close'].astype(float)
-            
-            # 1. 漲跌幅
+
             change = (closes.iloc[-1] / closes.iloc[0]) - 1.0
 
-            # 2. 年化波動率 (RV Annual)
-            # 計算 bars_per_year
             step_ms = martin._interval_ms(interval)
             bars_per_year = (365.25 * 24 * 3600) / (step_ms / 1000.0)
             rv_annual = realized_vol_annual_from_closes(closes, bars_per_year)
 
-            # 3. ATR %
             atr_p = true_atr_pct(df, n=14)
             if not np.isfinite(atr_p):
                 atr_p = approx_atr_pct_from_close(closes, n=14)
-            
-            # 3.1 ATR Daily Estimate (Square Root of Time Rule)
-            # bars_per_day = 24h / interval_hours
+
             bars_per_day = 24 * 3600 * 1000 / step_ms
             atr_daily_est = atr_p * np.sqrt(bars_per_day)
-
-            # 3.2 ATR Monthly Estimate (Approx 30 days)
             atr_monthly_est = atr_daily_est * np.sqrt(30)
 
-            # 4. BB Width %
             bbw_p = bb_width_pct(closes, n=20, k=2.0)
 
-            # 5. 最大回撤
             roll_max = closes.cummax()
             dd = (closes - roll_max) / roll_max
             max_dd = dd.min()
 
-            # 6. 平均日成交量
             quote_vols = df['volume'] * df['close']
             total_quote_vol = quote_vols.sum()
-            
+
             time_span_days = (df['time'].iloc[-1] - df['time'].iloc[0]).total_seconds() / 86400.0
-            
-            # Relaxed check: Allow coins with > 30 days history even if requested 'days' is larger
-            # This ensures we don't miss new volatile listings.
+
             if time_span_days < (days - 1) and time_span_days < 30 and not is_manual:
                 return None
 
-            if time_span_days < 0.5: time_span_days = 0.5
-            
+            if time_span_days < 0.5:
+                time_span_days = 0.5
+
             avg_daily_vol = total_quote_vol / time_span_days
-            
             if avg_daily_vol < min_avg_vol and not is_manual:
                 return None
 
@@ -579,25 +702,21 @@ class VolatilityScannerGUI(tk.Tk):
                 "Max_DD(%)": max_dd * 100,
                 "Change(%)": change * 100,
                 "MC Rank": cand.get('mc_rank', -1),
-                "df": df
+                "df": df,
             }
-
-        except Exception as e:
-            # print(f"Error in process_coin {sym}: {e}")
+        except Exception:
             return None
 
+    # --------- table / chart ---------
     def update_table(self):
-        # 清空表格
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        
+        self.table.setRowCount(0)
         if self.scan_results is None or self.scan_results.empty:
             return
 
-        # 預設依 RV(Ann)% 排序
         if "RV(Ann)%" in self.scan_results.columns:
             self.scan_results.sort_values("RV(Ann)%", ascending=False, inplace=True)
-        quote_asset = (self.e_quote.get() or "").upper()
+
+        quote_asset = (self.e_quote.text() or "").upper()
         raw_symbols = self.scan_results["Symbol"].tolist()
         norm_symbols = []
         for sym in raw_symbols:
@@ -609,7 +728,11 @@ class VolatilityScannerGUI(tk.Tk):
                 norm_symbols.append(sym)
         print("[Scan Results] Symbols:", ", ".join(norm_symbols))
 
-        for _, row in self.scan_results.iterrows():
+        self._render_table(self.scan_results)
+
+    def _render_table(self, df: pd.DataFrame):
+        self.table.setRowCount(0)
+        for _, row in df.iterrows():
             p_val = float(row['Price'])
             p_str = f"{p_val:.8f}" if p_val < 0.01 else f"{p_val:.4f}"
             vals = (
@@ -620,45 +743,63 @@ class VolatilityScannerGUI(tk.Tk):
                 f"{row['ATR(Month)%']:.2f}",
                 f"{row['Max_DD(%)']:.2f}",
                 f"{row['Change(%)']:.2f}",
-                f"{int(row['MC Rank'])}" if row['MC Rank'] > 0 else "-"
+                f"{int(row['MC Rank'])}" if row['MC Rank'] > 0 else "-",
             )
-            self.tree.insert("", tk.END, values=vals)
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(str(v))
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(r, c, item)
 
-    def on_tree_select(self, event):
-        sel = self.tree.selection()
-        if not sel: return
-        item = self.tree.item(sel[0])
-        sym = item['values'][0]
-        
-        # 找回對應的 df
-        record = self.scan_results[self.scan_results["Symbol"] == sym].iloc[0]
-        df = record["df"]
-        
+    @Slot(int)
+    def on_header_clicked(self, idx: int):
+        if self.scan_results is None or self.scan_results.empty:
+            return
+        col = self.cols[idx]
+        ascending = True
+        if getattr(self, "_sort_col", None) == col:
+            ascending = not getattr(self, "_sort_asc", True)
+        self._sort_col = col
+        self._sort_asc = ascending
+
+        if col in ["Symbol"]:
+            self.scan_results.sort_values(col, ascending=ascending, inplace=True)
+        else:
+            self.scan_results.sort_values(col, ascending=ascending, inplace=True, key=lambda s: pd.to_numeric(s, errors="coerce"))
+        self._render_table(self.scan_results)
+
+    @Slot()
+    def on_table_select(self):
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            return
+        idx = sel[0].row()
+        if self.scan_results is None or idx >= len(self.scan_results):
+            return
+        sym = self.scan_results.iloc[idx]["Symbol"]
+        record = self.scan_results[self.scan_results["Symbol"] == sym]
+        if record.empty:
+            return
+        df = record.iloc[0]["df"]
         self.plot_chart(df, sym)
 
     def plot_chart(self, df, title):
         self.ax.clear()
         self.ax.plot(df['time'], df['close'], label='Close')
-        self.ax.set_title(f"{title} - {self.cb_interval.get()}")
+        self.ax.set_title(f"{title} - {self.cb_interval.currentText()}")
         self.ax.set_xlabel("Time")
         self.ax.set_ylabel("Price")
         self.ax.grid(True, alpha=0.3)
         self.fig.tight_layout()
         self.canvas.draw()
 
-    def sort_tree(self, col, reverse):
-        l = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
-        # 嘗試轉成 float 排序
-        try:
-            l.sort(key=lambda t: float(t[0]), reverse=reverse)
-        except ValueError:
-            l.sort(reverse=reverse)
-
-        for index, (val, k) in enumerate(l):
-            self.tree.move(k, '', index)
-
-        self.tree.heading(col, command=lambda: self.sort_tree(col, not reverse))
 
 if __name__ == "__main__":
-    app = VolatilityScannerGUI()
-    app.mainloop()
+    app = QApplication([])
+    if _import_error is not None:
+        QMessageBox.critical(None, "Import Error", f"無法匯入 martin.py：\n{_import_error}")
+        raise SystemExit(1)
+    w = VolatilityScannerGUI()
+    w.show()
+    app.exec()
