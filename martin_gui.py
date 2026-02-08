@@ -23,6 +23,10 @@ except Exception as e:
     messagebox.showerror("Import Error", f"無法匯入 martin.py：\n{e}")
     raise
 
+CRYPTO_SYMBOLS = ["PUMP", "ASTER", "BONK", "ENA", "PEPE", "WLD", "WLFI", "ZEC", "TRUMP", "TAO", "SUI", "HBAR", "UNI",
+                  "NEAR", "FIL", "APT", "ARB", "DOGE", "SHIB", "ADA", "AVAX", "LINK", "XRP", "SOL", "LTC", "ETH",
+                  "BNB", "TRX", "BTC"]
+CRYPTO_INTERVALS = ["15m", "1h", "4h", "1d"]
 
 def parse_range_or_list(s: str, is_int=False):
     s = (s or "").strip()
@@ -139,8 +143,8 @@ class MartinGUI(tk.Tk):
 
         lf_data = ttk.LabelFrame(top, text="Data Settings")
         lf_data.pack(side=tk.LEFT, padx=4, pady=4, fill=tk.X)
-        self.e_symbol   = self._add_entry(lf_data, "Symbol:", "SUI", 10)
-        self.e_interval = self._add_entry(lf_data, "Interval：", "15m", 10)
+        self.e_symbol   = self._add_combobox(lf_data, "Symbol:", CRYPTO_SYMBOLS, default="SUI", width=10, state="normal")
+        self.e_interval = self._add_combobox(lf_data, "Interval：", CRYPTO_INTERVALS, default="15m", width=10, state="readonly")
         self.e_scan_days = self._add_entry(lf_data, "Scan Days:", "730", 10)
         self.e_start    = self._add_entry(lf_data, "Start (e.g.2025-07-01):", "", 12)
         self.e_end      = self._add_entry(lf_data, "End (e.g.2025-08-30):", "", 12)
@@ -210,8 +214,8 @@ class MartinGUI(tk.Tk):
 
         lf_data = ttk.LabelFrame(top, text="Data Settings")
         lf_data.pack(side=tk.LEFT, padx=4, pady=4, fill=tk.X)
-        self.s_symbol   = self._add_entry(lf_data, "Symbol:", "SUI", 10)
-        self.s_interval = self._add_entry(lf_data, "Interval：", "15m", 10)
+        self.s_symbol   = self._add_combobox(lf_data, "Symbol:", CRYPTO_SYMBOLS, default="SUI", width=10, state="normal")
+        self.s_interval = self._add_combobox(lf_data, "Interval：", CRYPTO_INTERVALS, default="15m", width=10, state="readonly")
         self.s_scan_days = self._add_entry(lf_data, "Scan Days:", "365", 10)
         self.s_start    = self._add_entry(lf_data, "Start (e.g.2025-07-01):", "", 12)
         self.s_end      = self._add_entry(lf_data, "End (e.g.2025-08-30):", "", 12)
@@ -282,6 +286,15 @@ class MartinGUI(tk.Tk):
             e.insert(0, default)
         e.pack(side=tk.LEFT, fill=tk.X, expand=True)
         return e
+
+    def _add_combobox(self, parent, label, values, default="", width=12, state="normal"):
+        row = ttk.Frame(parent); row.pack(anchor="w", pady=2, fill=tk.X)
+        ttk.Label(row, text=label, width=24, anchor="w").pack(side=tk.LEFT)
+        cb = ttk.Combobox(row, values=list(values), width=width, state=state)
+        if default:
+            cb.set(default)
+        cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        return cb
 
     # ---------- 數據擷取（帶快取） ----------
     def _fetch_klines_if_needed(self, symbol, interval, bars, start, end, refresh_policy):

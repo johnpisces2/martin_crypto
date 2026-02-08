@@ -412,7 +412,6 @@ class VolatilityScannerGUI(tk.Tk):
             # Priorities manual first
             final_candidates = manual_candidates + auto_candidates
             candidates = final_candidates
-
             total_cands = len(candidates)
             self.log(f"Found {total_cands} candidates. Fetching K-lines (Parallel)...")
             
@@ -598,6 +597,17 @@ class VolatilityScannerGUI(tk.Tk):
         # 預設依 RV(Ann)% 排序
         if "RV(Ann)%" in self.scan_results.columns:
             self.scan_results.sort_values("RV(Ann)%", ascending=False, inplace=True)
+        quote_asset = (self.e_quote.get() or "").upper()
+        raw_symbols = self.scan_results["Symbol"].tolist()
+        norm_symbols = []
+        for sym in raw_symbols:
+            if "/" in sym:
+                norm_symbols.append(sym.split("/")[0])
+            elif quote_asset and sym.endswith(quote_asset):
+                norm_symbols.append(sym[:-len(quote_asset)])
+            else:
+                norm_symbols.append(sym)
+        print("[Scan Results] Symbols:", ", ".join(norm_symbols))
 
         for _, row in self.scan_results.iterrows():
             p_val = float(row['Price'])
