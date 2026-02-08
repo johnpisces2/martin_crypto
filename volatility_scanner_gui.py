@@ -15,12 +15,12 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from datetime import datetime, timedelta
-from datetime import datetime, timedelta
 import traceback
 import concurrent.futures
 import requests
 import time
 import json
+import re
 
 
 # 嘗試匯入 martin.py 以重用 get_klines
@@ -121,6 +121,26 @@ def fetch_top_mc_coins(limit=250):
         print(f"CoinGecko API Error: {e}")
         return {}
 
+def is_stablecoin_base(base: str) -> bool:
+    b = (base or "").upper()
+    if not b:
+        return False
+    # Common stablecoins (expand as needed)
+    stable_set = {
+        "USDT","USDC","USDD","TUSD","BUSD","DAI","FRAX","FDUSD","USDP","GUSD",
+        "PYUSD","USDS","USDE","USD1","USDI","USDJ","USDK","USDX","USTC","EUR",
+        "EURT","EURS","GBP","GBPT","USDR","USDN","USDB",
+    }
+    if b in stable_set:
+        return True
+    # Catch USD* tokens like USD1, USDC, USDT, USDP, etc.
+    if re.match(r"^USD[A-Z0-9]{0,4}$", b):
+        return True
+    # Catch *USD (rare, but defensive)
+    if b.endswith("USD"):
+        return True
+    return False
+
 class VolatilityScannerGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -158,7 +178,7 @@ class VolatilityScannerGUI(tk.Tk):
 
         ttk.Label(row1, text="Scan Days:").pack(side=tk.LEFT)
         self.e_days = ttk.Entry(row1, width=6)
-        self.e_days.insert(0, "365")
+        self.e_days.insert(0, "730")
         self.e_days.pack(side=tk.LEFT, padx=5)
 
         # 第二排：過濾條件 (Volume, Top N)
@@ -313,9 +333,6 @@ class VolatilityScannerGUI(tk.Tk):
             manual_pairs_needed = {f"{b}/{quote_asset}" for b in manual_bases}
             manual_pairs_found = set()
 
-            # Stablecoins to exclude
-            exclude_bases = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USTC", "EUR", "GBP", "USDT"}
-
             candidates = []
             for symbol, ticker in tickers.items():
                 if not ticker: continue
@@ -335,7 +352,7 @@ class VolatilityScannerGUI(tk.Tk):
                 
                 if not is_manual:
                     # 過濾 Stablecoins
-                    if base in exclude_bases:
+                    if is_stablecoin_base(base):
                         continue
                     
                     # Market Cap Filter
