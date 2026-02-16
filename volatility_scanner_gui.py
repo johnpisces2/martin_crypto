@@ -23,7 +23,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal, Slot, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QComboBox, QPushButton, QLabel, QSplitter, QTableWidget,
@@ -224,7 +224,7 @@ class MarqueeLabel(QLabel):
 class VolatilityScannerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Crypto Volatility Scanner")
+        self.setWindowTitle("volatility_scanner_gui")
         self.resize(900, 820)
 
         self.thread_pool = QThreadPool.globalInstance()
@@ -238,6 +238,7 @@ class VolatilityScannerGUI(QMainWindow):
 
         self._build_ui()
         self._apply_style()
+        QTimer.singleShot(0, self._autosize_table_columns)
 
     def _apply_style(self):
         app = QApplication.instance()
@@ -259,7 +260,10 @@ class VolatilityScannerGUI(QMainWindow):
             }
             QComboBox QAbstractItemView { background: #ffffff; color: #1d1d1d; }
             QTableWidget { background: #ffffff; color: #1d1d1d; border: 1px solid #7c7c7c; border-radius: 8px; gridline-color: #d0d0d0; }
+            QTableWidget::item:selected { font-weight: 400; }
             QHeaderView::section { background: #e9e9e9; color: #1d1d1d; padding: 6px; border: 0px; }
+            QHeaderView::section:selected { font-weight: 400; }
+            QHeaderView::section:checked { font-weight: 400; }
             QTabWidget::pane { border: 1px solid #6e6e6e; border-radius: 8px; }
             QPushButton { background: #59626a; color: #ffffff; border: 0px; border-radius: 8px; padding: 6px 12px; }
             QPushButton:hover { background: #4f575e; }
@@ -395,10 +399,10 @@ class VolatilityScannerGUI(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSortingEnabled(False)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
-        col_widths = [110, 90, 110, 90, 110, 100, 90, 80]
-        for i, w in enumerate(col_widths):
-            self.table.setColumnWidth(i, w)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setHighlightSections(False)
+        self.table.setWordWrap(False)
+        self._autosize_table_columns()
         table_layout.addWidget(self.table)
         splitter.addWidget(table_wrap)
 
@@ -424,6 +428,25 @@ class VolatilityScannerGUI(QMainWindow):
         self.lbl_status.setFullText(msg)
         self.lbl_status.setStyleSheet("color: #9ddc91;" if ok else "color: #f3b6b6;")
         self.status_bar.showMessage(msg)
+
+    def _autosize_table_columns(self, max_col_width=280):
+        if not hasattr(self, "table") or self.table is None:
+            return
+        header = self.table.horizontalHeader()
+        metrics = QFontMetrics(header.font())
+        pad_px = 24
+        min_col_width = 80
+        for c in range(self.table.columnCount()):
+            h_item = self.table.horizontalHeaderItem(c)
+            text = h_item.text() if h_item is not None else ""
+            best = metrics.horizontalAdvance(text) + pad_px
+            for r in range(self.table.rowCount()):
+                item = self.table.item(r, c)
+                if item is None:
+                    continue
+                best = max(best, metrics.horizontalAdvance(item.text()) + pad_px)
+            self.table.setColumnWidth(c, min(max_col_width, max(min_col_width, best)))
+        header.setStretchLastSection(True)
 
     def start_scan(self):
         self.stop_event.clear()
@@ -751,6 +774,7 @@ class VolatilityScannerGUI(QMainWindow):
                 item = QTableWidgetItem(str(v))
                 item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(r, c, item)
+        self._autosize_table_columns()
 
     @Slot(int)
     def on_header_clicked(self, idx: int):
@@ -793,6 +817,10 @@ class VolatilityScannerGUI(QMainWindow):
         self.ax.grid(True, alpha=0.3)
         self.fig.tight_layout()
         self.canvas.draw()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._autosize_table_columns()
 
 
 if __name__ == "__main__":

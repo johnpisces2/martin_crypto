@@ -1,7 +1,9 @@
-requests
+    requests
 ccxt
 pandas
 numpy
 matplotlib
 numba
 PySide6
+# Optional for parquet cache support:
+# pyarrow

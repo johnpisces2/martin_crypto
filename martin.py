@@ -43,6 +43,7 @@ _EXCH_LIST = [
 
 # ===================== Parquet 快取設定 =====================
 DEFAULT_CACHE_DIR = "cache"
+ALLOWED_REFRESH_POLICIES = {"never", "auto", "force"}
 try:
     import pyarrow  # noqa: F401
     PARQUET_OK = True
@@ -139,7 +140,6 @@ def _ohlcv_to_taipei_df(ohlcv):
     df["close"] = df["close"].astype(float)
     df["time"]  = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("Asia/Taipei")
     df = df.drop_duplicates(subset="time").sort_values("time")
-    df = df.drop_duplicates(subset="time").sort_values("time")
     return df[["time","close","volume"]].copy()
 
 
@@ -229,6 +229,11 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
     """
     if (bars is None) and (start is None and end is None):
         raise ValueError("請提供 bars 或 start/end 其中一種方式。")
+
+    refresh_policy = (refresh_policy or "auto").strip().lower()
+    if refresh_policy not in ALLOWED_REFRESH_POLICIES:
+        allowed = ", ".join(sorted(ALLOWED_REFRESH_POLICIES))
+        raise ValueError(f"refresh_policy must be one of: {allowed}")
 
     base = symbol.upper()
     step_ms = _interval_ms(interval)
@@ -591,6 +596,9 @@ def martingale_backtest(
     if add_drop <= 0 or tp <= 0 or max_orders < 1 or multiplier <= 0:
         raise ValueError("參數異常：add_drop,tp需>0，max_orders>=1，multiplier>0")
 
+    if prices is None or len(prices) == 0:
+        raise ValueError("prices must contain at least 1 value")
+
     cash = capital
     qty = 0.0
     cost = 0.0
@@ -778,6 +786,8 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
     """Numba 版單次模擬（固定樓梯加倉）。"""
     trapped_bars = 0
     total_bars = prices.shape[0]
+    if total_bars == 0:
+        return np.nan, np.nan, 0, 0.0
 
     cash = capital
     qty = 0.0
