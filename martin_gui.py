@@ -14,7 +14,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal, Slot, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLineEdit, QComboBox, QPushButton, QLabel, QSplitter, QTextEdit,
@@ -36,34 +36,33 @@ CRYPTO_SYMBOLS = ["PUMP", "ASTER", "BONK", "ENA", "PEPE", "WLD", "WLFI", "ZEC", 
 CRYPTO_INTERVALS = ["15m", "1h", "4h", "1d"]
 
 
-def parse_range_or_list(s: str, is_int=False):
+def parse_range(s: str, is_int=False):
     s = (s or "").strip()
     if not s:
         return np.array([], dtype=int if is_int else float)
-    if ":" in s:
-        parts = s.split(":")
-        if len(parts) != 3:
-            raise ValueError("範圍格式應為 start:end:step")
-        a, b, c = parts
-        a = (int(a) if is_int else float(a))
-        b = (int(b) if is_int else float(b))
-        c = (int(c) if is_int else float(c))
-        if c == 0:
-            raise ValueError("step 不可為 0")
-        if is_int:
-            return np.arange(a, b + (1 if c > 0 else -1), c, dtype=int)
-        vals = []
-        x = a
-        forward = c > 0
-        if forward:
-            while x <= b + 1e-12:
-                vals.append(x); x += c
-        else:
-            while x >= b - 1e-12:
-                vals.append(x); x += c
-        return np.array(vals, dtype=float)
-    items = [t.strip() for t in s.split(",") if t.strip()]
-    return np.array([int(x) for x in items], dtype=int) if is_int else np.array([float(x) for x in items], dtype=float)
+    if ":" not in s:
+        raise ValueError("掃描參數僅支援範圍格式 start:end:step")
+    parts = s.split(":")
+    if len(parts) != 3:
+        raise ValueError("範圍格式應為 start:end:step")
+    a, b, c = parts
+    a = (int(a) if is_int else float(a))
+    b = (int(b) if is_int else float(b))
+    c = (int(c) if is_int else float(c))
+    if c == 0:
+        raise ValueError("step 不可為 0")
+    if is_int:
+        return np.arange(a, b + (1 if c > 0 else -1), c, dtype=int)
+    vals = []
+    x = a
+    forward = c > 0
+    if forward:
+        while x <= b + 1e-12:
+            vals.append(x); x += c
+    else:
+        while x >= b - 1e-12:
+            vals.append(x); x += c
+    return np.array(vals, dtype=float)
 
 
 def safe_float(s, default=None):
@@ -116,7 +115,7 @@ class MartinGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Spot Martingale GUI")
-        self.resize(970, 920)
+        self.resize(1030, 920)
 
         self.thread_pool = QThreadPool.globalInstance()
 
@@ -143,6 +142,7 @@ class MartinGUI(QMainWindow):
         self.nb.currentChanged.connect(self._on_main_tab_changed)
 
         self._apply_style()
+        QTimer.singleShot(0, self._autosize_scan_table_columns)
 
         QTimer.singleShot(0, lambda: self._set_splitter_when_ready(self.scan_splitter, self.INIT_SPLIT))
         QTimer.singleShot(0, lambda: self._set_splitter_when_ready(self.single_splitter, self.INIT_SPLIT))
@@ -167,7 +167,10 @@ class MartinGUI(QMainWindow):
             }
             QComboBox QAbstractItemView { background: #ffffff; color: #1d1d1d; }
             QTableWidget { background: #ffffff; color: #1d1d1d; border: 1px solid #7c7c7c; border-radius: 8px; gridline-color: #d0d0d0; }
+            QTableWidget::item:selected { font-weight: 400; }
             QHeaderView::section { background: #e9e9e9; color: #1d1d1d; padding: 6px; border: 0px; }
+            QHeaderView::section:selected { font-weight: 400; }
+            QHeaderView::section:checked { font-weight: 400; }
             QTabWidget::pane { border: 1px solid #6e6e6e; border-radius: 8px; }
             QTabBar::tab { background: #4b4b4b; color: #f2f2f2; padding: 6px 12px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
             QTabBar::tab:selected { background: #35507a; }
@@ -243,7 +246,7 @@ class MartinGUI(QMainWindow):
         layout.addLayout(top)
 
         gb_data = QGroupBox("Data Settings")
-        gb_grid = QGroupBox("Scan Parameters (range 'start:end:step' or list 'a,b,c')")
+        gb_grid = QGroupBox("Scan Parameters ('start:end:step')")
         gb_filter = QGroupBox("Filter Conditions (optional)")
 
         top.addWidget(gb_data)
@@ -305,10 +308,10 @@ class MartinGUI(QMainWindow):
         self.table.setHorizontalHeaderLabels(cols)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
-        col_widths = [90, 70, 90, 90, 110, 110, 110, 80, 150]
-        for i, w in enumerate(col_widths):
-            self.table.setColumnWidth(i, w)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setHighlightSections(False)
+        self.table.setWordWrap(False)
+        self._autosize_scan_table_columns()
         table_layout.addWidget(self.table)
 
         hint = QLabel("提示：雙擊表格繪圖，會自動切換到「Backtest Chart / Performance」。")
@@ -342,6 +345,27 @@ class MartinGUI(QMainWindow):
         self.scan_tabs.addTab(self.scan_tab_detail, "Backtest Chart / Performance")
 
         self.scan_tabs.currentChanged.connect(self._on_scan_tab_changed)
+
+    def _autosize_scan_table_columns(self, max_col_width=280):
+        if not hasattr(self, "table") or self.table is None:
+            return
+        header = self.table.horizontalHeader()
+        metrics = QFontMetrics(header.font())
+        pad_px = 24
+        min_col_width = 80
+
+        for c in range(self.table.columnCount()):
+            h_item = self.table.horizontalHeaderItem(c)
+            text = h_item.text() if h_item is not None else ""
+            best = metrics.horizontalAdvance(text) + pad_px
+            for r in range(self.table.rowCount()):
+                item = self.table.item(r, c)
+                if item is None:
+                    continue
+                best = max(best, metrics.horizontalAdvance(item.text()) + pad_px)
+            self.table.setColumnWidth(c, min(max_col_width, max(min_col_width, best)))
+
+        header.setStretchLastSection(True)
 
     # ---------- single tab ----------
     def _build_single_tab(self):
@@ -408,9 +432,15 @@ class MartinGUI(QMainWindow):
     def _on_scan_tab_changed(self, idx):
         if self.scan_tabs.widget(idx) == self.scan_tab_detail:
             self._set_splitter_when_ready(self.scan_splitter, self.INIT_SPLIT)
+        elif self.scan_tabs.widget(idx) == self.scan_tab_table:
+            self._autosize_scan_table_columns()
 
     def _on_main_tab_changed(self, _idx):
         self._set_splitter_when_ready(self.single_splitter, self.INIT_SPLIT)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._autosize_scan_table_columns()
 
     # ---------- data ----------
     def _fetch_klines_if_needed(self, symbol, interval, bars, start, end, refresh_policy):
@@ -461,10 +491,10 @@ class MartinGUI(QMainWindow):
         if prices_np.size < 2:
             raise ValueError("K 線資料不足（<2 根），無法回測/掃描。")
 
-        add_drop_arr = parse_range_or_list(self.e_add_drop.text())
-        tp_arr = parse_range_or_list(self.e_tp.text())
-        mul_arr = parse_range_or_list(self.e_multiplier.text())
-        mo_arr = parse_range_or_list(self.e_max_orders.text(), is_int=True)
+        add_drop_arr = parse_range(self.e_add_drop.text())
+        tp_arr = parse_range(self.e_tp.text())
+        mul_arr = parse_range(self.e_multiplier.text())
+        mo_arr = parse_range(self.e_max_orders.text(), is_int=True)
         if any(x.size == 0 for x in (add_drop_arr, tp_arr, mul_arr, mo_arr)):
             raise ValueError("掃描參數不得為空（add_drop/tp/multiplier/max_orders）")
 
@@ -518,6 +548,7 @@ class MartinGUI(QMainWindow):
                 item = QTableWidgetItem(str(row[col]))
                 item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(r, c, item)
+        self._autosize_scan_table_columns()
 
         self.scan_df = top_df.reset_index(drop=True)
         self._set_status("Scan completed。")
