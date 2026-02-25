@@ -8,10 +8,7 @@ import os
 import numpy as np
 import pandas as pd
 
-import matplotlib
-matplotlib.use("QtAgg")
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
+os.environ.setdefault("QT_API", "pyside6")
 
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal, Slot, QTimer
 from PySide6.QtGui import QFont, QFontMetrics
@@ -22,6 +19,11 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
 )
+
+import matplotlib
+matplotlib.use("QtAgg")
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 try:
     import martin
