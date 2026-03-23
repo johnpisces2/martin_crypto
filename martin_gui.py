@@ -384,7 +384,7 @@ class MartinGUI(QMainWindow):
         self.e_add_drop = self._add_entry(form_grid, "add_drop:", "0.010:0.080:0.001")
         self.e_tp = self._add_entry(form_grid, "tp:", "0.010:0.080:0.001")
         self.e_multiplier = self._add_entry(form_grid, "multiplier:", "1.5:2.0:0.1")
-        self.e_max_orders = self._add_entry(form_grid, "max_orders:", "5:9:1")
+        self.e_max_orders = self._add_entry(form_grid, "max_orders:", "5:10:1")
 
         form_filter = QFormLayout(gb_filter)
         self.e_min_trades = self._add_entry(form_filter, "min_trades:", "104")
@@ -499,7 +499,7 @@ class MartinGUI(QMainWindow):
         self.m_add_drop = self._add_entry(form_grid, "add_drop:", "0.010:0.080:0.001")
         self.m_tp = self._add_entry(form_grid, "tp:", "0.010:0.080:0.001")
         self.m_multiplier = self._add_entry(form_grid, "multiplier:", "1.5:2.0:0.1")
-        self.m_max_orders = self._add_entry(form_grid, "max_orders:", "5:9:1")
+        self.m_max_orders = self._add_entry(form_grid, "max_orders:", "5:10:1")
         self.m_sampling_mode = self._add_combobox(
             form_grid,
             "Sampling:",
