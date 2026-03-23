@@ -50,6 +50,8 @@ try:
 except Exception:
     PARQUET_OK = False
 
+LOCAL_TIMEZONE = "Asia/Taipei"
+
 
 def _ensure_dir(path: str):
     if not os.path.isdir(path):
@@ -119,12 +121,35 @@ def _interval_ms(interval: str) -> int:
     return val * sec * 1000
 
 
-def _to_ms(dt_str: str) -> int:
-    """把 'YYYY-MM-DD' 或 'YYYY.MM.DD' 轉為 UTC 毫秒"""
+def _to_timestamp(dt_str: str, *, end_of_day: bool = False) -> pd.Timestamp:
+    """把使用者輸入的日期/時間解析成 Asia/Taipei 時區 Timestamp。"""
     if "." in dt_str:
         dt_str = dt_str.replace(".", "-")
-    dt = pd.to_datetime(dt_str, utc=True)
+    dt_str = dt_str.strip()
+    date_only = (":" not in dt_str) and ("T" not in dt_str)
+    if end_of_day and date_only:
+        dt_str = f"{dt_str} 23:59:59.999"
+    ts = pd.Timestamp(pd.to_datetime(dt_str))
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(LOCAL_TIMEZONE)
+    else:
+        ts = ts.tz_convert(LOCAL_TIMEZONE)
+    return ts
+
+
+def _to_ms(dt_str: str, *, end_of_day: bool = False) -> int:
+    """把使用者輸入的日期/時間轉為 UTC 毫秒。日期格式預設以 Asia/Taipei 解讀。"""
+    dt = _to_timestamp(dt_str, end_of_day=end_of_day).tz_convert("UTC")
     return int(dt.timestamp() * 1000)
+
+
+def _range_is_covered(df: pd.DataFrame, start_ms: int, end_ms: int, step_ms: int) -> bool:
+    if df is None or df.empty:
+        return False
+    utc_idx = pd.DatetimeIndex(df["time"]).tz_convert("UTC")
+    first_ms = int(utc_idx[0].value // 1_000_000)
+    last_ms = int(utc_idx[-1].value // 1_000_000)
+    return (first_ms <= start_ms + step_ms) and (last_ms >= end_ms - step_ms)
 
 
 def _align_to_interval_end(now_ms: int, step_ms: int) -> int:
@@ -264,8 +289,9 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
                     refresh_since = cached_max_ms + step_ms
                     refresh_end = expected_end_ms
             else:
-                s_ms = _to_ms(start); e_ms = _to_ms(end)
-                if (cached_min_ms > s_ms + step_ms) or (cached_max_ms < e_ms - step_ms):
+                s_ms = _to_ms(start)
+                e_ms = _to_ms(end, end_of_day=True)
+                if not _range_is_covered(cached_df, s_ms, e_ms, step_ms):
                     need_refresh = True
                     refresh_since = s_ms
                     refresh_end = e_ms
@@ -329,12 +355,14 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
                 return out
             # 快取太短 → 走抓取流程
         else:
-            s_utc = pd.to_datetime(start, utc=True)
-            e_utc = pd.to_datetime(end,   utc=True)
+            s_ms = _to_ms(start)
+            e_ms = _to_ms(end, end_of_day=True)
+            s_utc = _to_timestamp(start).tz_convert("UTC")
+            e_utc = _to_timestamp(end, end_of_day=True).tz_convert("UTC")
             utc_idx = pd.DatetimeIndex(cached_df["time"]).tz_convert("UTC")
             mask = (utc_idx >= s_utc) & (utc_idx <= e_utc)
             sliced = cached_df.loc[mask].copy()
-            if not sliced.empty:
+            if _range_is_covered(sliced, s_ms, e_ms, step_ms):
                 base_attrs = getattr(cached_df, "attrs", {})
                 sliced.attrs["symbol"]   = base_attrs.get("symbol",   f"{base}USDT")
                 sliced.attrs["interval"] = base_attrs.get("interval", interval)
@@ -349,7 +377,7 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
         since_ms = end_ms - int(bars) * step_ms
     else:
         since_ms = _to_ms(start)
-        end_ms   = _to_ms(end)
+        end_ms   = _to_ms(end, end_of_day=True)
 
     last_error = None
     for name in exnames:

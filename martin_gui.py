@@ -4,20 +4,23 @@
 
 import traceback
 import os
+from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
 
 os.environ.setdefault("QT_API", "pyside6")
 
-from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal, Slot, QTimer
+from PySide6.QtCore import Qt, QDate, QAbstractTableModel, QModelIndex, QThreadPool, QRunnable, QObject, Signal, Slot, QTimer
 from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLineEdit, QComboBox, QPushButton, QLabel, QSplitter, QTextEdit,
-    QTableWidget, QTableWidgetItem, QFileDialog, QMessageBox, QGroupBox, QStatusBar,
+    QFileDialog, QMessageBox, QGroupBox, QStatusBar,
     QAbstractItemView,
     QHeaderView,
+    QDateEdit,
+    QTableView,
 )
 
 import matplotlib
@@ -41,6 +44,9 @@ CRYPTO_SYMBOLS = ["PUMP", "ASTER", "BONK", "ENA", "PEPE", "WLD", "WLFI", "ZEC", 
                   "NEAR", "FIL", "APT", "ARB", "DOGE", "SHIB", "ADA", "AVAX", "LINK", "XRP", "SOL", "LTC", "ETH",
                   "BNB", "TRX", "BCH", "BTC"]
 CRYPTO_INTERVALS = ["15m", "1h", "4h", "1d"]
+DEFAULT_REFRESH_POLICY = "auto"
+DEFAULT_FEE_RATE = 0.005
+DEFAULT_FEE_LABEL = "0.5%"
 
 
 def parse_range(s: str, is_int=False):
@@ -117,8 +123,61 @@ class Worker(QRunnable):
             self.signals.error.emit(traceback.format_exc())
 
 
+class DataFrameTableModel(QAbstractTableModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._frame = pd.DataFrame()
+        self._headers = []
+
+    @property
+    def frame(self) -> pd.DataFrame:
+        return self._frame
+
+    def set_frame(self, frame: pd.DataFrame, headers: list[str]):
+        self.beginResetModel()
+        self._headers = list(headers)
+        if frame is None or frame.empty or not self._headers:
+            self._frame = pd.DataFrame(columns=self._headers)
+        else:
+            self._frame = frame.loc[:, self._headers].reset_index(drop=True).copy()
+        self.endResetModel()
+
+    def clear(self):
+        self.set_frame(pd.DataFrame(), [])
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self._frame)
+
+    def columnCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self._headers)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        value = self._frame.iat[index.row(), index.column()]
+        if role == Qt.DisplayRole:
+            return "" if pd.isna(value) else str(value)
+        if role == Qt.TextAlignmentRole:
+            return int(Qt.AlignCenter)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            if 0 <= section < len(self._headers):
+                return self._headers[section]
+            return None
+        return str(section + 1)
+
+
 class MartinGUI(QMainWindow):
     INIT_SPLIT = 0.70
+    BACKTEST_CACHE_LIMIT = 24
 
     def __init__(self):
         super().__init__()
@@ -148,6 +207,8 @@ class MartinGUI(QMainWindow):
         self.mc_scan_df = None
         self._mc_executor = None
         self._mc_executor_workers = 0
+        self._backtest_cache = OrderedDict()
+        self._plot_states = {}
 
         self._build_scan_tab()
         self._build_mc_scan_tab()
@@ -161,6 +222,7 @@ class MartinGUI(QMainWindow):
 
         QTimer.singleShot(0, lambda: self._set_splitter_when_ready(self.scan_splitter, self.INIT_SPLIT))
         QTimer.singleShot(0, lambda: self._set_splitter_when_ready(self.single_splitter, self.INIT_SPLIT))
+        QTimer.singleShot(0, self._restore_startup_focus)
 
     def _apply_style(self):
         app = QApplication.instance()
@@ -178,12 +240,13 @@ class MartinGUI(QMainWindow):
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #ffffff; }
             QLabel { color: #e8e8e8; }
             QLabel#formLabel { font-size: 11pt; font-weight: 500; }
-            QLineEdit, QComboBox, QTextEdit {
+            QLabel#feeHintLabel { color: #d6d6d6; font-size: 10.5pt; padding: 0 6px; }
+            QLineEdit, QComboBox, QTextEdit, QDateEdit {
                 background: #ffffff; color: #1d1d1d; border: 1px solid #b9b9b9; border-radius: 6px; padding: 4px 6px;
             }
-            QComboBox QAbstractItemView { background: #ffffff; color: #1d1d1d; }
-            QTableWidget { background: #ffffff; color: #1d1d1d; border: 1px solid #7c7c7c; border-radius: 8px; gridline-color: #d0d0d0; }
-            QTableWidget::item:selected { font-weight: 400; }
+            QComboBox QAbstractItemView, QDateEdit QAbstractItemView { background: #ffffff; color: #1d1d1d; }
+            QTableWidget, QTableView { background: #ffffff; color: #1d1d1d; border: 1px solid #7c7c7c; border-radius: 8px; gridline-color: #d0d0d0; }
+            QTableWidget::item:selected, QTableView::item:selected { font-weight: 400; }
             QHeaderView::section { background: #e9e9e9; color: #1d1d1d; padding: 6px; border: 0px; }
             QHeaderView::section:selected { font-weight: 400; }
             QHeaderView::section:checked { font-weight: 400; }
@@ -231,6 +294,16 @@ class MartinGUI(QMainWindow):
             return
         QTimer.singleShot(delay, lambda: self._set_splitter_when_ready(splitter, ratio, tries - 1, delay))
 
+    def _restore_startup_focus(self):
+        for date_edit in (self.e_start, self.e_end, self.m_start, self.m_end, self.s_start, self.s_end):
+            line_edit = date_edit.lineEdit()
+            if line_edit is not None:
+                line_edit.deselect()
+        focus_widget = QApplication.focusWidget()
+        if focus_widget is not None:
+            focus_widget.clearFocus()
+        self.nb.setFocus(Qt.OtherFocusReason)
+
     # ---------- widgets ----------
     def _add_form_row(self, form: QFormLayout, label: str, widget: QWidget):
         lbl = QLabel(label)
@@ -245,6 +318,35 @@ class MartinGUI(QMainWindow):
         self._add_form_row(form, label, e)
         return e
 
+    def _build_fee_hint_label(self):
+        value = QLabel(f"Fee {DEFAULT_FEE_LABEL}")
+        value.setObjectName("feeHintLabel")
+        return value
+
+    def _default_date_range(self):
+        end_date = QDate.currentDate()
+        start_date = end_date.addYears(-2)
+        return start_date, end_date
+
+    def _add_date_edit(self, form: QFormLayout, label: str, default_date: QDate, width=140):
+        e = QDateEdit()
+        e.setCalendarPopup(True)
+        e.setDisplayFormat("yyyy/MM/dd")
+        e.setDate(default_date)
+        e.setMinimumWidth(width)
+        self._add_form_row(form, label, e)
+        return e
+
+    def _get_date_range_strings(self, start_edit: QDateEdit, end_edit: QDateEdit):
+        start_date = start_edit.date()
+        end_date = end_edit.date()
+        if start_date > end_date:
+            raise ValueError("Start 不可晚於 End")
+        return (
+            start_date.toString("yyyy-MM-dd"),
+            end_date.toString("yyyy-MM-dd"),
+        )
+
     def _add_combobox(self, form: QFormLayout, label: str, values, default=""):
         cb = QComboBox()
         cb.addItems(list(values))
@@ -258,6 +360,7 @@ class MartinGUI(QMainWindow):
     # ---------- scan tab ----------
     def _build_scan_tab(self):
         layout = QVBoxLayout(self.tab_hist_scan)
+        default_start, default_end = self._default_date_range()
 
         top = QHBoxLayout()
         layout.addLayout(top)
@@ -273,11 +376,8 @@ class MartinGUI(QMainWindow):
         form_data = QFormLayout(gb_data)
         self.e_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="SUI")
         self.e_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
-        self.e_scan_days = self._add_entry(form_data, "Scan Days:", "730")
-        self.e_start = self._add_entry(form_data, "Start (e.g.2025-07-01):", "")
-        self.e_end = self._add_entry(form_data, "End (e.g.2025-08-30):", "")
-        self.e_refresh = self._add_entry(form_data, "Cache Policy:", "auto")
-        self.e_fee = self._add_entry(form_data, "Fee rate:", "0.0005")
+        self.e_start = self._add_date_edit(form_data, "Start:", default_start)
+        self.e_end = self._add_date_edit(form_data, "End:", default_end)
         self.e_capital = self._add_entry(form_data, "Capital:", "1000")
 
         form_grid = QFormLayout(gb_grid)
@@ -304,6 +404,7 @@ class MartinGUI(QMainWindow):
         btn_row.addWidget(btn_csv)
         btn_row.addWidget(btn_clear)
         btn_row.addStretch(1)
+        btn_row.addWidget(self._build_fee_hint_label())
 
         btn_run.clicked.connect(self.run_scan)
         btn_csv.clicked.connect(self.save_scan_csv)
@@ -315,14 +416,19 @@ class MartinGUI(QMainWindow):
         # Table tab
         self.scan_tab_table = QWidget()
         table_layout = QVBoxLayout(self.scan_tab_table)
-        self.table = QTableWidget(0, 9)
+        self.table = QTableView()
+        self.scan_table_model = DataFrameTableModel(self.table)
+        self.table.setModel(self.scan_table_model)
         cols = ["add_drop", "tp", "multiplier", "max_orders", "min_buy_ratio",
                 "final_equity", "max_dd_overall", "trades", "trapped_time_ratio"]
-        self.table.setHorizontalHeaderLabels(cols)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setHighlightSections(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(False)
+        self.scan_table_model.set_frame(pd.DataFrame(columns=cols), cols)
         self.table.setWordWrap(False)
         self._autosize_scan_table_columns()
         table_layout.addWidget(self.table)
@@ -331,7 +437,7 @@ class MartinGUI(QMainWindow):
         hint.setStyleSheet("color: #6b6b6b; padding: 6px 2px;")
         table_layout.addWidget(hint)
 
-        self.table.cellDoubleClicked.connect(self.plot_selected_from_table)
+        self.table.doubleClicked.connect(self.plot_selected_from_table)
 
         # Detail tab
         self.scan_tab_detail = QWidget()
@@ -362,27 +468,12 @@ class MartinGUI(QMainWindow):
     def _autosize_scan_table_columns(self, max_col_width=280):
         if not hasattr(self, "table") or self.table is None:
             return
-        header = self.table.horizontalHeader()
-        metrics = QFontMetrics(header.font())
-        pad_px = 24
-        min_col_width = 80
-
-        for c in range(self.table.columnCount()):
-            h_item = self.table.horizontalHeaderItem(c)
-            text = h_item.text() if h_item is not None else ""
-            best = metrics.horizontalAdvance(text) + pad_px
-            for r in range(self.table.rowCount()):
-                item = self.table.item(r, c)
-                if item is None:
-                    continue
-                best = max(best, metrics.horizontalAdvance(item.text()) + pad_px)
-            self.table.setColumnWidth(c, min(max_col_width, max(min_col_width, best)))
-
-        header.setStretchLastSection(True)
+        self._autosize_table_columns(self.table, max_col_width=max_col_width)
 
     # ---------- MC scan tab ----------
     def _build_mc_scan_tab(self):
         layout = QVBoxLayout(self.tab_mc_scan)
+        default_start, default_end = self._default_date_range()
 
         top = QHBoxLayout()
         layout.addLayout(top)
@@ -400,11 +491,8 @@ class MartinGUI(QMainWindow):
         form_data = QFormLayout(gb_data)
         self.m_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="SUI")
         self.m_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
-        self.m_scan_days = self._add_entry(form_data, "Scan Days:", "730")
-        self.m_start = self._add_entry(form_data, "Start (e.g.2025-07-01):", "")
-        self.m_end = self._add_entry(form_data, "End (e.g.2025-08-30):", "")
-        self.m_refresh = self._add_entry(form_data, "Cache Policy:", "auto")
-        self.m_fee = self._add_entry(form_data, "Fee rate:", "0.0005")
+        self.m_start = self._add_date_edit(form_data, "Start:", default_start)
+        self.m_end = self._add_date_edit(form_data, "End:", default_end)
         self.m_capital = self._add_entry(form_data, "Capital:", "1000")
 
         form_grid = QFormLayout(gb_grid)
@@ -431,7 +519,7 @@ class MartinGUI(QMainWindow):
         form_mc = QFormLayout(gb_mc)
         self.m_mc_paths = self._add_entry(form_mc, "MC paths:", "300")
         self.m_mc_days = self._add_entry(form_mc, "Days/path:", "730")
-        self.m_mc_block = self._add_entry(form_mc, "Block size:", "96")
+        self.m_mc_block = self._add_entry(form_mc, "Block size:", "672")
         self.m_mc_seed = self._add_entry(form_mc, "Seed:", "42")
         self.m_mc_seed_runs = self._add_entry(form_mc, "Seed runs:", "1")
         self.m_mc_workers = self._add_entry(form_mc, "Workers (0=auto):", "0")
@@ -459,6 +547,7 @@ class MartinGUI(QMainWindow):
         btn_row.addWidget(btn_csv)
         btn_row.addWidget(btn_clear)
         btn_row.addStretch(1)
+        btn_row.addWidget(self._build_fee_hint_label())
 
         btn_run.clicked.connect(self.run_mc_scan)
         btn_csv.clicked.connect(self.save_mc_scan_csv)
@@ -469,18 +558,22 @@ class MartinGUI(QMainWindow):
 
         self.mc_tab_table = QWidget()
         mc_table_layout = QVBoxLayout(self.mc_tab_table)
-        self.mc_table = QTableWidget(0, 0)
+        self.mc_table = QTableView()
+        self.mc_table_model = DataFrameTableModel(self.mc_table)
+        self.mc_table.setModel(self.mc_table_model)
         self.mc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.mc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.mc_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.mc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.mc_table.horizontalHeader().setHighlightSections(False)
+        self.mc_table.verticalHeader().setVisible(False)
         self.mc_table.setWordWrap(False)
         mc_table_layout.addWidget(self.mc_table)
 
         mc_hint = QLabel("提示：雙擊表格繪圖，會自動切換到「Backtest Chart / Performance」。")
         mc_hint.setStyleSheet("color: #6b6b6b; padding: 6px 2px;")
         mc_table_layout.addWidget(mc_hint)
-        self.mc_table.cellDoubleClicked.connect(self.plot_selected_from_mc_table)
+        self.mc_table.doubleClicked.connect(self.plot_selected_from_mc_table)
 
         self.mc_tab_detail = QWidget()
         mc_detail_layout = QVBoxLayout(self.mc_tab_detail)
@@ -509,21 +602,25 @@ class MartinGUI(QMainWindow):
     def _autosize_mc_scan_table_columns(self, max_col_width=280):
         if not hasattr(self, "mc_table") or self.mc_table is None:
             return
-        header = self.mc_table.horizontalHeader()
+        self._autosize_table_columns(self.mc_table, max_col_width=max_col_width)
+
+    def _autosize_table_columns(self, table_view, max_col_width=280):
+        model = table_view.model()
+        if model is None:
+            return
+        header = table_view.horizontalHeader()
         metrics = QFontMetrics(header.font())
         pad_px = 24
         min_col_width = 80
 
-        for c in range(self.mc_table.columnCount()):
-            h_item = self.mc_table.horizontalHeaderItem(c)
-            text = h_item.text() if h_item is not None else ""
+        for c in range(model.columnCount()):
+            text = model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or ""
             best = metrics.horizontalAdvance(text) + pad_px
-            for r in range(self.mc_table.rowCount()):
-                item = self.mc_table.item(r, c)
-                if item is None:
-                    continue
-                best = max(best, metrics.horizontalAdvance(item.text()) + pad_px)
-            self.mc_table.setColumnWidth(c, min(max_col_width, max(min_col_width, best)))
+            for r in range(model.rowCount()):
+                idx = model.index(r, c)
+                cell_text = model.data(idx, Qt.DisplayRole) or ""
+                best = max(best, metrics.horizontalAdvance(cell_text) + pad_px)
+            table_view.setColumnWidth(c, min(max_col_width, max(min_col_width, best)))
 
         header.setStretchLastSection(True)
 
@@ -543,6 +640,7 @@ class MartinGUI(QMainWindow):
     # ---------- single tab ----------
     def _build_single_tab(self):
         layout = QVBoxLayout(self.tab_single)
+        default_start, default_end = self._default_date_range()
 
         top = QHBoxLayout()
         layout.addLayout(top)
@@ -559,11 +657,8 @@ class MartinGUI(QMainWindow):
         form_data = QFormLayout(gb_data)
         self.s_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="SUI")
         self.s_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
-        self.s_scan_days = self._add_entry(form_data, "Scan Days:", "730")
-        self.s_start = self._add_entry(form_data, "Start (e.g.2025-07-01):", "")
-        self.s_end = self._add_entry(form_data, "End (e.g.2025-08-30):", "")
-        self.s_refresh = self._add_entry(form_data, "Cache Policy:", "auto")
-        self.s_fee = self._add_entry(form_data, "Fee rate:", "0.0005")
+        self.s_start = self._add_date_edit(form_data, "Start:", default_start)
+        self.s_end = self._add_date_edit(form_data, "End:", default_end)
         self.s_capital = self._add_entry(form_data, "Capital:", "1000")
 
         form_params = QFormLayout(gb_params)
@@ -575,7 +670,7 @@ class MartinGUI(QMainWindow):
         form_mc = QFormLayout(gb_mc)
         self.s_mc_paths = self._add_entry(form_mc, "MC paths:", "1000")
         self.s_mc_days = self._add_entry(form_mc, "Days/path:", "730")
-        self.s_mc_block = self._add_entry(form_mc, "Block size:", "96")
+        self.s_mc_block = self._add_entry(form_mc, "Block size:", "672")
         self.s_mc_seed = self._add_entry(form_mc, "Random seed:", "42")
 
         btn_row = QHBoxLayout()
@@ -590,6 +685,7 @@ class MartinGUI(QMainWindow):
         btn_row.addWidget(btn_mc)
         btn_row.addWidget(btn_clear)
         btn_row.addStretch(1)
+        btn_row.addWidget(self._build_fee_hint_label())
 
         btn_run.clicked.connect(self.run_single)
         btn_mc.clicked.connect(self.run_single_mc)
@@ -644,21 +740,88 @@ class MartinGUI(QMainWindow):
             super().closeEvent(event)
 
     # ---------- data ----------
-    def _fetch_klines_if_needed(self, symbol, interval, bars, start, end, refresh_policy):
-        key = (symbol, interval, bars, start, end, refresh_policy)
+    def _fetch_klines_if_needed(self, symbol, interval, start, end, refresh_policy):
+        key = (symbol, interval, start, end, refresh_policy)
         if self.last_df is not None and self.last_df_key == key:
             return self.last_df
-        if bars:
-            df = martin.get_klines(symbol=symbol, interval=interval, bars=bars,
-                                   cache_dir=martin.DEFAULT_CACHE_DIR, use_cache=True,
-                                   refresh_policy=refresh_policy)
-        else:
-            df = martin.get_klines(symbol=symbol, interval=interval, start=start, end=end,
-                                   cache_dir=martin.DEFAULT_CACHE_DIR, use_cache=True,
-                                   refresh_policy=refresh_policy)
+        df = martin.get_klines(symbol=symbol, interval=interval, start=start, end=end,
+                               cache_dir=martin.DEFAULT_CACHE_DIR, use_cache=True,
+                               refresh_policy=refresh_policy)
         self.last_df = df
         self.last_df_key = key
         return df
+
+    def _make_backtest_cache_key(
+        self, symbol, interval, start, end, refresh_policy, fee_rate, capital, add_drop, multiplier, max_orders, tp
+    ):
+        return (
+            symbol,
+            interval,
+            start,
+            end,
+            refresh_policy,
+            float(fee_rate),
+            float(capital),
+            float(add_drop),
+            float(multiplier),
+            int(max_orders),
+            float(tp),
+        )
+
+    def _get_cached_backtest(self, key):
+        cached = self._backtest_cache.get(key)
+        if cached is None:
+            return None
+        self._backtest_cache.move_to_end(key)
+        return cached
+
+    def _store_cached_backtest(self, key, value):
+        self._backtest_cache[key] = value
+        self._backtest_cache.move_to_end(key)
+        while len(self._backtest_cache) > self.BACKTEST_CACHE_LIMIT:
+            self._backtest_cache.popitem(last=False)
+
+    def _get_plot_state(self, figure, canvas, with_mc: bool):
+        state = self._plot_states.get(canvas)
+        if state is not None and state.get("with_mc") == with_mc:
+            return state
+
+        figure.clear()
+        use_constrained = False
+        try:
+            figure.set_layout_engine("constrained")
+            use_constrained = True
+        except Exception:
+            use_constrained = False
+
+        if with_mc:
+            gs = figure.add_gridspec(2, 1, height_ratios=[2.5, 1.2])
+            ax = figure.add_subplot(gs[0, 0])
+            ax_mc = figure.add_subplot(gs[1, 0])
+        else:
+            ax = figure.add_subplot(111)
+            ax_mc = None
+
+        (strategy_line,) = ax.plot([], [], label="Strategy")
+        (bh_line,) = ax.plot([], [], label="Buy & Hold")
+        bh_line.set_visible(False)
+
+        state = {
+            "with_mc": with_mc,
+            "use_constrained": use_constrained,
+            "ax": ax,
+            "ax_mc": ax_mc,
+            "strategy_line": strategy_line,
+            "bh_line": bh_line,
+            "trap_patches": [],
+        }
+        self._plot_states[canvas] = state
+        return state
+
+    def _clear_plot(self, figure, canvas):
+        self._plot_states.pop(canvas, None)
+        figure.clear()
+        canvas.draw_idle()
 
     # ---------- scan ----------
     def run_scan(self):
@@ -669,27 +832,19 @@ class MartinGUI(QMainWindow):
         self.thread_pool.start(worker)
 
     def _collect_context_from_inputs(
-        self, symbol_cb, interval_cb, scan_days_edit, start_edit, end_edit, refresh_edit, fee_edit, capital_edit
+        self, symbol_cb, interval_cb, start_edit, end_edit, capital_edit
     ):
         symbol = symbol_cb.currentText().strip()
         interval = interval_cb.currentText().strip()
-        scan_days = safe_float(scan_days_edit.text().strip(), 0.0)
-        start = start_edit.text().strip()
-        end = end_edit.text().strip()
-        bars = 0
-        if scan_days > 0:
-            step_ms = martin._interval_ms(interval)
-            bars = int(scan_days * 86400 * 1000 / step_ms)
+        start, end = self._get_date_range_strings(start_edit, end_edit)
 
-        refresh_policy = (refresh_edit.text().strip().lower() or "auto")
-        fee_rate = safe_float(fee_edit.text().strip(), 0.0)
+        refresh_policy = DEFAULT_REFRESH_POLICY
+        fee_rate = DEFAULT_FEE_RATE
         capital = safe_float(capital_edit.text().strip(), 1000.0)
         if not symbol or not interval:
             raise ValueError("請填入 symbol 與 interval")
-        if (not bars) and (not start or not end):
-            raise ValueError("Scan Days 與 Start/End 需擇一填寫")
 
-        df = self._fetch_klines_if_needed(symbol, interval, bars, start, end, refresh_policy)
+        df = self._fetch_klines_if_needed(symbol, interval, start, end, refresh_policy)
         prices_np = df["close"].to_numpy(dtype=np.float64)
         if prices_np.size < 2:
             raise ValueError("K 線資料不足（<2 根），無法回測/掃描。")
@@ -697,7 +852,6 @@ class MartinGUI(QMainWindow):
         return {
             "symbol": symbol,
             "interval": interval,
-            "bars": bars,
             "start": start,
             "end": end,
             "refresh_policy": refresh_policy,
@@ -711,11 +865,8 @@ class MartinGUI(QMainWindow):
         return self._collect_context_from_inputs(
             self.e_symbol,
             self.e_interval,
-            self.e_scan_days,
             self.e_start,
             self.e_end,
-            self.e_refresh,
-            self.e_fee,
             self.e_capital,
         )
 
@@ -723,11 +874,8 @@ class MartinGUI(QMainWindow):
         return self._collect_context_from_inputs(
             self.m_symbol,
             self.m_interval,
-            self.m_scan_days,
             self.m_start,
             self.m_end,
-            self.m_refresh,
-            self.m_fee,
             self.m_capital,
         )
 
@@ -740,21 +888,15 @@ class MartinGUI(QMainWindow):
             raise ValueError("掃描參數不得為空（add_drop/tp/multiplier/max_orders）")
 
         AD, MUL, MO, TP = np.meshgrid(add_drop_arr, mul_arr, mo_arr, tp_arr, indexing="ij")
-        ADf = AD.ravel().astype(np.float64)
-        MULf = MUL.ravel().astype(np.float64)
-        MOf = MO.ravel().astype(np.int32)
-        TPf = TP.ravel().astype(np.float64)
-        min_buy_ratio_theory = np.maximum(0.0, (1.0 - ADf) ** (MOf.astype(np.float64) - 1.0))
-
-        fe, mdd, tr, trap = martin._grid_search_parallel(
-            prices_np, ADf, MULf, MOf, TPf, capital=float(capital), fee_rate=float(fee_rate)
+        params_df = pd.DataFrame(
+            {
+                "add_drop": AD.ravel().astype(np.float64),
+                "multiplier": MUL.ravel().astype(np.float64),
+                "max_orders": MO.ravel().astype(np.int32).astype(int),
+                "tp": TP.ravel().astype(np.float64),
+            }
         )
-        results_df = pd.DataFrame({
-            "add_drop": ADf, "multiplier": MULf, "max_orders": MOf.astype(int), "tp": TPf,
-            "capital": float(capital), "final_equity": np.round(fe, 2),
-            "max_dd_overall": np.round(mdd, 2), "trades": tr.astype(int),
-            "trapped_time_ratio": np.round(trap, 6), "min_buy_ratio": np.round(min_buy_ratio_theory, 6)
-        })
+        results_df = self._evaluate_param_candidates(params_df, prices_np, capital, fee_rate)
 
         min_trades = safe_int(self.e_min_trades.text().strip()) if self.e_min_trades.text().strip() else None
         max_dd = safe_float(self.e_max_dd.text().strip()) if self.e_max_dd.text().strip() else None
@@ -762,6 +904,63 @@ class MartinGUI(QMainWindow):
         if max_trap is not None:
             max_trap /= 100.0
         return martin.apply_filters(results_df, min_trades, max_dd, max_trap)
+
+    def _evaluate_param_candidates(self, params_df: pd.DataFrame, prices_np, capital, fee_rate) -> pd.DataFrame:
+        if params_df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "add_drop",
+                    "multiplier",
+                    "max_orders",
+                    "tp",
+                    "capital",
+                    "final_equity",
+                    "max_dd_overall",
+                    "trades",
+                    "trapped_time_ratio",
+                    "min_buy_ratio",
+                ]
+            )
+
+        unique_params = params_df.drop_duplicates(
+            subset=["add_drop", "multiplier", "max_orders", "tp"], ignore_index=True
+        )
+        add_drop = unique_params["add_drop"].to_numpy(dtype=np.float64)
+        multiplier = unique_params["multiplier"].to_numpy(dtype=np.float64)
+        max_orders = unique_params["max_orders"].to_numpy(dtype=np.int32)
+        tp = unique_params["tp"].to_numpy(dtype=np.float64)
+        min_buy_ratio = np.maximum(0.0, (1.0 - add_drop) ** (max_orders.astype(np.float64) - 1.0))
+
+        fe, mdd, tr, trap = martin._grid_search_parallel(
+            prices_np,
+            add_drop,
+            multiplier,
+            max_orders,
+            tp,
+            capital=float(capital),
+            fee_rate=float(fee_rate),
+        )
+        return pd.DataFrame(
+            {
+                "add_drop": add_drop,
+                "multiplier": multiplier,
+                "max_orders": max_orders.astype(int),
+                "tp": tp,
+                "capital": float(capital),
+                "final_equity": np.round(fe, 2),
+                "max_dd_overall": np.round(mdd, 2),
+                "trades": tr.astype(int),
+                "trapped_time_ratio": np.round(trap, 6),
+                "min_buy_ratio": np.round(min_buy_ratio, 6),
+            }
+        )
+
+    def _get_mc_hist_filter_values(self):
+        min_trades = safe_int(self.m_hist_min_trades.text().strip()) if self.m_hist_min_trades.text().strip() else None
+        max_trap = safe_float(self.m_hist_max_trap.text().strip()) if self.m_hist_max_trap.text().strip() else None
+        if max_trap is not None:
+            max_trap /= 100.0
+        return min_trades, max_trap
 
     def _compute_filtered_mc_candidates(self, prices_np, capital, fee_rate):
         add_drop_arr = parse_range(self.m_add_drop.text())
@@ -800,32 +999,9 @@ class MartinGUI(QMainWindow):
         if params_df.empty:
             return params_df
 
-        ADf = params_df["add_drop"].to_numpy(dtype=np.float64)
-        MULf = params_df["multiplier"].to_numpy(dtype=np.float64)
-        MOf = params_df["max_orders"].to_numpy(dtype=np.int32)
-        TPf = params_df["tp"].to_numpy(dtype=np.float64)
-        min_buy_ratio_theory = np.maximum(0.0, (1.0 - ADf) ** (MOf.astype(np.float64) - 1.0))
+        results_df = self._evaluate_param_candidates(params_df, prices_np, capital, fee_rate)
 
-        fe, mdd, tr, trap = martin._grid_search_parallel(
-            prices_np, ADf, MULf, MOf, TPf, capital=float(capital), fee_rate=float(fee_rate)
-        )
-        results_df = pd.DataFrame({
-            "add_drop": ADf,
-            "multiplier": MULf,
-            "max_orders": MOf.astype(int),
-            "tp": TPf,
-            "capital": float(capital),
-            "final_equity": np.round(fe, 2),
-            "max_dd_overall": np.round(mdd, 2),
-            "trades": tr.astype(int),
-            "trapped_time_ratio": np.round(trap, 6),
-            "min_buy_ratio": np.round(min_buy_ratio_theory, 6),
-        }).drop_duplicates(subset=["add_drop", "multiplier", "max_orders", "tp"], ignore_index=True)
-
-        min_trades = safe_int(self.m_hist_min_trades.text().strip()) if self.m_hist_min_trades.text().strip() else None
-        max_trap = safe_float(self.m_hist_max_trap.text().strip()) if self.m_hist_max_trap.text().strip() else None
-        if max_trap is not None:
-            max_trap /= 100.0
+        min_trades, max_trap = self._get_mc_hist_filter_values()
         filtered = martin.apply_filters(results_df, min_trades, None, max_trap)
 
         if refine_radius > 0 and refine_max_add > 0 and refine_pct > 0 and not filtered.empty:
@@ -842,31 +1018,10 @@ class MartinGUI(QMainWindow):
                 max_add=refine_max_add,
             )
             if not refine_df.empty:
-                AD2 = refine_df["add_drop"].to_numpy(dtype=np.float64)
-                MUL2 = refine_df["multiplier"].to_numpy(dtype=np.float64)
-                MO2 = refine_df["max_orders"].to_numpy(dtype=np.int32)
-                TP2 = refine_df["tp"].to_numpy(dtype=np.float64)
-                min_buy2 = np.maximum(0.0, (1.0 - AD2) ** (MO2.astype(np.float64) - 1.0))
-                fe2, mdd2, tr2, trap2 = martin._grid_search_parallel(
-                    prices_np, AD2, MUL2, MO2, TP2, capital=float(capital), fee_rate=float(fee_rate)
-                )
-                extra = pd.DataFrame({
-                    "add_drop": AD2,
-                    "multiplier": MUL2,
-                    "max_orders": MO2.astype(int),
-                    "tp": TP2,
-                    "capital": float(capital),
-                    "final_equity": np.round(fe2, 2),
-                    "max_dd_overall": np.round(mdd2, 2),
-                    "trades": tr2.astype(int),
-                    "trapped_time_ratio": np.round(trap2, 6),
-                    "min_buy_ratio": np.round(min_buy2, 6),
-                })
-                results_df = pd.concat([results_df, extra], ignore_index=True).drop_duplicates(
-                    subset=["add_drop", "multiplier", "max_orders", "tp"],
-                    ignore_index=True,
-                )
-                filtered = martin.apply_filters(results_df, min_trades, None, max_trap)
+                extra = self._evaluate_param_candidates(refine_df, prices_np, capital, fee_rate)
+                filtered_extra = martin.apply_filters(extra, min_trades, None, max_trap)
+                if not filtered_extra.empty:
+                    filtered = pd.concat([filtered, filtered_extra], ignore_index=True)
 
         return filtered.copy()
 
@@ -933,30 +1088,18 @@ class MartinGUI(QMainWindow):
         return top_df
 
     def _populate_scan_table(self, disp: pd.DataFrame, cols):
-        self.table.setColumnCount(len(cols))
-        self.table.setHorizontalHeaderLabels(list(cols))
-        self.table.setRowCount(0)
-        for _, row in disp[cols].iterrows():
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            for c, col in enumerate(cols):
-                item = QTableWidgetItem(str(row[col]))
-                item.setTextAlignment(Qt.AlignCenter)
-                self.table.setItem(r, c, item)
+        self.table.setUpdatesEnabled(False)
+        self.scan_table_model.set_frame(disp, cols)
         self._autosize_scan_table_columns()
+        self.table.setUpdatesEnabled(True)
+        self.table.viewport().update()
 
     def _populate_mc_scan_table(self, disp: pd.DataFrame, cols):
-        self.mc_table.setColumnCount(len(cols))
-        self.mc_table.setHorizontalHeaderLabels(list(cols))
-        self.mc_table.setRowCount(0)
-        for _, row in disp[cols].iterrows():
-            r = self.mc_table.rowCount()
-            self.mc_table.insertRow(r)
-            for c, col in enumerate(cols):
-                item = QTableWidgetItem(str(row[col]))
-                item.setTextAlignment(Qt.AlignCenter)
-                self.mc_table.setItem(r, c, item)
+        self.mc_table.setUpdatesEnabled(False)
+        self.mc_table_model.set_frame(disp, cols)
         self._autosize_mc_scan_table_columns()
+        self.mc_table.setUpdatesEnabled(True)
+        self.mc_table.viewport().update()
 
     @Slot(object)
     def _scan_update_ui(self, top_df: pd.DataFrame):
@@ -1080,13 +1223,11 @@ class MartinGUI(QMainWindow):
             QMessageBox.critical(self, "Save Failed", f"{e}")
 
     def clear_mc_scan_results(self):
-        self.mc_table.setRowCount(0)
-        self.mc_table.setColumnCount(0)
+        self.mc_table_model.clear()
         if hasattr(self, "mc_metrics_text") and self.mc_metrics_text:
             self.mc_metrics_text.clear()
         if hasattr(self, "figure_mc_scan") and self.figure_mc_scan:
-            self.figure_mc_scan.clf()
-            self.canvas_mc_scan.draw()
+            self._clear_plot(self.figure_mc_scan, self.canvas_mc_scan)
         self.mc_scan_df = None
         self._set_status("Scan results cleared.")
 
@@ -1106,12 +1247,11 @@ class MartinGUI(QMainWindow):
             QMessageBox.critical(self, "儲存失敗", f"{e}")
 
     def clear_scan_results(self):
-        self.table.setRowCount(0)
+        self.scan_table_model.clear()
         if self.scan_metrics_text:
             self.scan_metrics_text.clear()
         if self.figure_scan:
-            self.figure_scan.clf()
-            self.canvas_scan.draw()
+            self._clear_plot(self.figure_scan, self.canvas_scan)
         self.scan_df = None
         self._set_status("Scan results cleared.")
 
@@ -1130,22 +1270,17 @@ class MartinGUI(QMainWindow):
         params = self.scan_df.iloc[idx]
         self._set_status("載入詳細回測…")
 
-        scan_days = safe_float(self.e_scan_days.text().strip(), 0.0)
         interval_str = self.e_interval.currentText().strip()
-        bars = 0
-        if scan_days > 0 and interval_str:
-            step_ms = martin._interval_ms(interval_str)
-            bars = int(scan_days * 86400 * 1000 / step_ms)
+        start, end = self._get_date_range_strings(self.e_start, self.e_end)
 
         worker = Worker(
             self._compute_backtest,
             self.e_symbol.currentText().strip(),
             interval_str,
-            bars,
-            self.e_start.text().strip(),
-            self.e_end.text().strip(),
-            (self.e_refresh.text().strip() or "auto"),
-            safe_float(self.e_fee.text().strip(), 0.0),
+            start,
+            end,
+            DEFAULT_REFRESH_POLICY,
+            DEFAULT_FEE_RATE,
             safe_float(self.e_capital.text().strip(), 1000.0),
             float(params["add_drop"]),
             float(params["multiplier"]),
@@ -1171,22 +1306,17 @@ class MartinGUI(QMainWindow):
         params = self.mc_scan_df.iloc[idx]
         self._set_status("載入候選參數詳細回測…")
 
-        scan_days = safe_float(self.m_scan_days.text().strip(), 0.0)
         interval_str = self.m_interval.currentText().strip()
-        bars = 0
-        if scan_days > 0 and interval_str:
-            step_ms = martin._interval_ms(interval_str)
-            bars = int(scan_days * 86400 * 1000 / step_ms)
+        start, end = self._get_date_range_strings(self.m_start, self.m_end)
 
         worker = Worker(
             self._compute_backtest,
             self.m_symbol.currentText().strip(),
             interval_str,
-            bars,
-            self.m_start.text().strip(),
-            self.m_end.text().strip(),
-            (self.m_refresh.text().strip() or "auto"),
-            safe_float(self.m_fee.text().strip(), 0.0),
+            start,
+            end,
+            DEFAULT_REFRESH_POLICY,
+            DEFAULT_FEE_RATE,
             safe_float(self.m_capital.text().strip(), 1000.0),
             float(params["add_drop"]),
             float(params["multiplier"]),
@@ -1232,15 +1362,9 @@ class MartinGUI(QMainWindow):
     def _run_single_compute(self):
         symbol = self.s_symbol.currentText().strip()
         interval = self.s_interval.currentText().strip()
-        scan_days = safe_float(self.s_scan_days.text().strip(), 0.0)
-        bars = 0
-        if scan_days > 0:
-            step_ms = martin._interval_ms(interval)
-            bars = int(scan_days * 86400 * 1000 / step_ms)
-        start = self.s_start.text().strip()
-        end = self.s_end.text().strip()
-        refresh = (self.s_refresh.text().strip().lower() or "auto")
-        fee_rate = safe_float(self.s_fee.text().strip(), 0.0)
+        start, end = self._get_date_range_strings(self.s_start, self.s_end)
+        refresh = DEFAULT_REFRESH_POLICY
+        fee_rate = DEFAULT_FEE_RATE
         capital = safe_float(self.s_capital.text().strip(), 1000.0)
 
         add_drop = safe_float(self.s_add_drop.text().strip(), None)
@@ -1252,10 +1376,8 @@ class MartinGUI(QMainWindow):
             raise ValueError("請完整填入策略參數（add_drop, tp, multiplier, max_orders）")
         if not symbol or not interval:
             raise ValueError("請填入 symbol 與 interval")
-        if (not bars) and (not start or not end):
-            raise ValueError("Scan Days 與 Start/End 需擇一填寫")
 
-        df, res, perf = self._compute_backtest(symbol, interval, bars, start, end, refresh, fee_rate, capital,
+        df, res, perf = self._compute_backtest(symbol, interval, start, end, refresh, fee_rate, capital,
                                                add_drop, multiplier, max_orders, tp)
         return df, res, perf
 
@@ -1281,8 +1403,7 @@ class MartinGUI(QMainWindow):
         if self.metrics_text:
             self.metrics_text.clear()
         if self.figure_single:
-            self.figure_single.clf()
-            self.canvas_single.draw()
+            self._clear_plot(self.figure_single, self.canvas_single)
         self._set_status("Single backtest results cleared.")
 
     def _interval_bars_per_year(self, interval: str) -> float:
@@ -1317,7 +1438,7 @@ class MartinGUI(QMainWindow):
         max_orders = int(res["_max_orders"])
         tp = float(res["_tp"])
         capital = float(res["capital"])
-        fee_rate = safe_float(self.s_fee.text().strip(), 0.0)
+        fee_rate = DEFAULT_FEE_RATE
         bars_per_year = self._interval_bars_per_year(interval)
         years_per_path = mc_bars / bars_per_year if bars_per_year > 0 else np.nan
 
@@ -1402,9 +1523,16 @@ class MartinGUI(QMainWindow):
         self._set_splitter_when_ready(self.single_splitter, self.INIT_SPLIT)
 
     # ---------- compute ----------
-    def _compute_backtest(self, symbol, interval, bars, start, end, refresh_policy,
+    def _compute_backtest(self, symbol, interval, start, end, refresh_policy,
                           fee_rate, capital, add_drop, multiplier, max_orders, tp):
-        df = self._fetch_klines_if_needed(symbol, interval, bars, start, end, refresh_policy)
+        cache_key = self._make_backtest_cache_key(
+            symbol, interval, start, end, refresh_policy, fee_rate, capital, add_drop, multiplier, max_orders, tp
+        )
+        cached = self._get_cached_backtest(cache_key)
+        if cached is not None:
+            return cached
+
+        df = self._fetch_klines_if_needed(symbol, interval, start, end, refresh_policy)
         prices_np = df["close"].to_numpy(dtype=np.float64)
         if prices_np.size < 2:
             raise ValueError("K 線資料不足（<2 根）。")
@@ -1430,7 +1558,9 @@ class MartinGUI(QMainWindow):
         res["_multiplier"] = float(multiplier)
         res["_max_orders"] = int(max_orders)
         res["_tp"] = float(tp)
-        return df, res, perf
+        payload = (df, res, perf)
+        self._store_cached_backtest(cache_key, payload)
+        return payload
 
     def _render_plot_and_metrics(self, df, res, perf, add_drop, multiplier, max_orders, tp,
                                  figure, canvas, metrics_widget,
@@ -1439,30 +1569,30 @@ class MartinGUI(QMainWindow):
         time_index = res["time_index"]
         trapped_intervals = res.get("trapped_intervals", [])
         bh_curve = res.get("bh_curve", None)
+        state = self._get_plot_state(figure, canvas, with_mc=(mc_terminal is not None))
+        ax = state["ax"]
+        ax_mc = state["ax_mc"]
+        strategy_line = state["strategy_line"]
+        bh_line = state["bh_line"]
 
-        figure.clf()
-        use_constrained = False
-        try:
-            figure.set_layout_engine("constrained")
-            use_constrained = True
-        except Exception:
-            use_constrained = False
-
-        if mc_terminal is not None:
-            gs = figure.add_gridspec(2, 1, height_ratios=[2.5, 1.2])
-            ax = figure.add_subplot(gs[0, 0])
-            ax_mc = figure.add_subplot(gs[1, 0])
-        else:
-            ax = figure.add_subplot(111)
-            ax_mc = None
-
-        ax.plot(time_index, equity_curve, label="Strategy")
+        strategy_line.set_data(time_index, equity_curve)
         if bh_curve is not None:
-            ax.plot(df["time"], bh_curve, label="Buy & Hold")
+            bh_line.set_data(df["time"], bh_curve)
+            bh_line.set_visible(True)
+        else:
+            bh_line.set_visible(False)
+
+        for patch in state["trap_patches"]:
+            try:
+                patch.remove()
+            except Exception:
+                pass
+        state["trap_patches"] = []
         for s_i, e_i in trapped_intervals:
             if s_i is None or e_i is None:
                 continue
-            ax.axvspan(s_i, e_i, alpha=0.1, color="red")
+            state["trap_patches"].append(ax.axvspan(s_i, e_i, alpha=0.1, color="red"))
+
         sym = df.attrs.get("symbol", "UNKNOWN")
         market_code = df.attrs.get("market", "spot")
         market_label = "Spot" if str(market_code).startswith("spot") else ("USDT Perp" if "usdt_perp" in str(market_code) else str(market_code))
@@ -1476,9 +1606,12 @@ class MartinGUI(QMainWindow):
         )
         ax.set_xlabel("" if ax_mc is not None else "Time (Taipei)")
         ax.set_ylabel("Equity (USDT)")
+        ax.relim()
+        ax.autoscale_view()
         ax.legend(loc="upper left")
 
         if ax_mc is not None:
+            ax_mc.clear()
             safe_terminal = np.maximum(np.asarray(mc_terminal, dtype=np.float64), 0.0)
             ax_mc.hist(safe_terminal, bins=45, color="#35507a", alpha=0.75)
             ax_mc.axvline(np.median(safe_terminal), color="#8a2d3a", linestyle="--", linewidth=1.5, label="Median")
@@ -1486,12 +1619,12 @@ class MartinGUI(QMainWindow):
             ax_mc.set_xlabel("Terminal Equity (USDT)")
             ax_mc.set_ylabel("Count")
             ax_mc.legend(loc="best")
-        if not use_constrained:
+        if not state["use_constrained"]:
             if ax_mc is not None:
                 figure.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.10, hspace=0.38)
             else:
                 figure.subplots_adjust(left=0.08, right=0.98, top=0.93, bottom=0.12)
-        canvas.draw()
+        canvas.draw_idle()
 
         trap_ratio = None
         total_secs = None

@@ -194,8 +194,12 @@ def _mc_eval_chunk_worker(payload: dict) -> dict:
 
     n = add_drop.shape[0]
     terminals = np.empty((n, total_paths), dtype=np.float64)
-    mdds = np.empty((n, total_paths), dtype=np.float64)
-    traps = np.empty((n, total_paths), dtype=np.float64)
+    terminal_sum = np.zeros(n, dtype=np.float64)
+    mdd_sum = np.zeros(n, dtype=np.float64)
+    trap_sum = np.zeros(n, dtype=np.float64)
+    loss_count = np.zeros(n, dtype=np.int64)
+    severe_count = np.zeros(n, dtype=np.int64)
+    dd50_count = np.zeros(n, dtype=np.int64)
 
     # Common random numbers: same simulated path for every candidate.
     rng = np.random.default_rng(base_seed)
@@ -214,24 +218,35 @@ def _mc_eval_chunk_worker(payload: dict) -> dict:
                 capital,
                 fee_rate,
             )
-            terminals[j, p] = float(fe_i)
-            mdds[j, p] = float(mdd_i)
-            traps[j, p] = float(trap_i)
+            terminal = float(fe_i)
+            mdd = float(mdd_i)
+            trap = float(trap_i)
 
-    p_loss = np.mean(terminals < capital, axis=1)
-    p_severe = np.mean(terminals < (0.5 * capital), axis=1)
-    p_dd50 = np.mean(mdds > 50.0, axis=1)
+            terminals[j, p] = terminal
+            terminal_sum[j] += terminal
+            mdd_sum[j] += mdd
+            trap_sum[j] += trap
+            if terminal < capital:
+                loss_count[j] += 1
+            if terminal < (0.5 * capital):
+                severe_count[j] += 1
+            if mdd > 50.0:
+                dd50_count[j] += 1
+
+    p_loss = loss_count / float(total_paths)
+    p_severe = severe_count / float(total_paths)
+    p_dd50 = dd50_count / float(total_paths)
     feasible = (p_loss <= max_loss) & (p_severe <= max_severe) & (p_dd50 <= max_dd50)
 
     return {
-        "terminal_mean": np.mean(terminals, axis=1),
+        "terminal_mean": terminal_sum / float(total_paths),
         "terminal_median": np.median(terminals, axis=1),
         "terminal_p5": np.percentile(terminals, 5, axis=1),
         "p_loss": p_loss,
         "p_severe": p_severe,
         "p_dd50": p_dd50,
-        "mdd_mean": np.mean(mdds, axis=1),
-        "trapped_mean": np.mean(traps, axis=1),
+        "mdd_mean": mdd_sum / float(total_paths),
+        "trapped_mean": trap_sum / float(total_paths),
         "feasible": feasible,
     }
 
