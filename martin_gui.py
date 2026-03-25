@@ -45,8 +45,8 @@ CRYPTO_SYMBOLS = ["PUMP", "ASTER", "BONK", "ENA", "PEPE", "WLD", "WLFI", "ZEC", 
                   "BNB", "TRX", "BCH", "BTC"]
 CRYPTO_INTERVALS = ["15m", "1h", "4h", "1d"]
 DEFAULT_REFRESH_POLICY = "auto"
-DEFAULT_FEE_RATE = 0.005
-DEFAULT_FEE_LABEL = "0.5%"
+DEFAULT_FEE_RATE = 0.0005
+DEFAULT_FEE_LABEL = "0.05%"
 
 
 def parse_range(s: str, is_int=False):

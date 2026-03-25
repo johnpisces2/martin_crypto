@@ -515,18 +515,33 @@ def _trade_streaks(pnls: list[float]):
 
 def compute_performance_metrics(equity_curve, time_index, trades_log, capital, bh_curve=None):
     ec = pd.Series(equity_curve, index=pd.to_datetime(time_index))
-    af = _annualization_factor_from_times(ec.index.tolist())
-    rets = ec.pct_change().dropna()
-    total_return = ec.iloc[-1] / ec.iloc[0] - 1.0
-    years = _years_between(ec.index[0], ec.index[-1]) if len(ec) >= 2 else np.nan
-    cagr = (ec.iloc[-1] / ec.iloc[0]) ** (1.0 / years) - 1.0 if (pd.notna(years) and years > 0) else np.nan
+    if ec.empty:
+        raise ValueError("equity_curve must contain at least 1 point")
+
+    ec_stats = ec
+    if capital > 0 and not np.isclose(float(ec.iloc[0]), float(capital)):
+        first_ts = ec.index[0]
+        if len(ec.index) >= 2:
+            inferred_step = ec.index[1] - ec.index[0]
+            if inferred_step <= pd.Timedelta(0):
+                inferred_step = pd.Timedelta(seconds=1)
+        else:
+            inferred_step = pd.Timedelta(seconds=1)
+        baseline_ts = first_ts - inferred_step
+        ec_stats = pd.concat([pd.Series([float(capital)], index=[baseline_ts]), ec])
+
+    af = _annualization_factor_from_times(ec_stats.index.tolist())
+    rets = ec_stats.pct_change().dropna()
+    total_return = ec_stats.iloc[-1] / ec_stats.iloc[0] - 1.0
+    years = _years_between(ec_stats.index[0], ec_stats.index[-1]) if len(ec_stats) >= 2 else np.nan
+    cagr = (ec_stats.iloc[-1] / ec_stats.iloc[0]) ** (1.0 / years) - 1.0 if (pd.notna(years) and years > 0) else np.nan
     mu = rets.mean() * af if len(rets) > 0 else np.nan
     ann_vol = rets.std() * math.sqrt(af) if len(rets) > 1 else np.nan
     sharpe = (mu / ann_vol) if (pd.notna(mu) and ann_vol and ann_vol > 0) else np.nan
     downside = rets[rets < 0]
     ddv = downside.std() * math.sqrt(af) if len(downside) > 0 else np.nan
     sortino = (mu / ddv) if (pd.notna(mu) and ddv and ddv > 0) else np.nan
-    max_dd_pct, peak_t, trough_t, recover_t, max_uw_days, avg_uw_days = _max_drawdown_with_timing(ec)
+    max_dd_pct, peak_t, trough_t, recover_t, max_uw_days, avg_uw_days = _max_drawdown_with_timing(ec_stats)
     calmar = (cagr / (max_dd_pct/100.0)) if (pd.notna(cagr) and max_dd_pct > 0) else np.nan
     max_dd_days = ((trough_t - peak_t).total_seconds() / 86400.0) if (pd.notna(peak_t) and pd.notna(trough_t)) else None
     recov_days  = ((recover_t - trough_t).total_seconds() / 86400.0) if (pd.notna(recover_t) and pd.notna(trough_t)) else None
@@ -542,7 +557,12 @@ def compute_performance_metrics(equity_curve, time_index, trades_log, capital, b
     win_rate = wins / (wins + losses) if (wins + losses) > 0 else np.nan
     avg_win = np.mean(win_pnls) if wins > 0 else np.nan
     avg_loss = np.mean(loss_pnls) if losses > 0 else np.nan
-    profit_factor = (sum(win_pnls) / abs(sum(loss_pnls))) if losses > 0 else np.inf
+    if wins == 0 and losses == 0:
+        profit_factor = np.nan
+    elif losses == 0:
+        profit_factor = np.inf
+    else:
+        profit_factor = sum(win_pnls) / abs(sum(loss_pnls))
     max_consec_w, max_consec_l = _trade_streaks(pnls=pnl_list)
     rtn_list = [t["rtn"] for t in closed]
     avg_trade_rtn = np.mean(rtn_list) if rtn_list else np.nan
@@ -654,28 +674,7 @@ def martingale_backtest(
     is_trapped_prev = False
 
     for idx, price in enumerate(prices):
-        equity = cash + qty * price  # 未平倉不扣賣出費，買入費已在 cash 反映
-        if equity > peak_equity_overall:
-            peak_equity_overall = equity
-        if peak_equity_overall > 0:
-            dd_overall = (equity - peak_equity_overall) / peak_equity_overall
-            if dd_overall < max_drawdown_overall:
-                max_drawdown_overall = dd_overall
-
-        if return_curve:
-            equity_curve.append(equity)
-            time_curve.append(times[idx] if times is not None else idx)
-
-        # 套牢判定（同原邏輯）
-        avg_cost = cost / qty if qty > 0 else float('inf')
-        is_trapped = (order_count == max_orders and qty > 0 and price < avg_cost)
         current_time = times[idx] if times is not None else idx
-        if is_trapped and not is_trapped_prev:
-            start_trapped = current_time
-        elif not is_trapped and is_trapped_prev and start_trapped is not None:
-            trapped_intervals.append((start_trapped, current_time))
-            start_trapped = None
-        is_trapped_prev = is_trapped
 
         # 開倉（設定固定樓梯基準）
         if qty == 0.0 and cash > 0:
@@ -695,82 +694,97 @@ def martingale_backtest(
                 order_count = 1
                 round_cost_sum = alloc
                 bars_held_this_round = 0
-            continue
+        elif qty > 0.0:
+            bars_held_this_round += 1
 
-        if qty == 0.0:
-            continue
-
-        bars_held_this_round += 1
-
-        # 止盈（以含費 PnL 達標為準）
-        prospective_proceeds = qty * price * (1.0 - fee_rate)
-        prospective_pnl = prospective_proceeds - round_cost_sum - round_fee_sum
-        target_pnl = round_cost_sum * tp
-        if prospective_pnl >= target_pnl:
-            cash += prospective_proceeds
-            pnl = prospective_pnl
-            rtn = pnl / round_cost_sum if round_cost_sum > 0 else np.nan
-            exit_time = times[idx] if times is not None else idx
-            trades_log.append({
-                "entry_time": entry_time,
-                "exit_time": exit_time,
-                "pnl": float(pnl),
-                "rtn": float(rtn),
-                "bars_held": int(bars_held_this_round)
-            })
-            qty = 0.0
-            cost = 0.0
-            anchor_price = None
-            trades += 1
-            order_count = 0
-            init_order_round = None
-            round_cost_sum = 0.0
-            round_fee_sum = 0.0
-            bars_held_this_round = 0
-            base_price = None
-            next_level_idx = 1
-            continue
-
-
-        # 固定樓梯加倉（O(1)層級計算）：
-        # 直接用當前價位相對 base_price 的比值，推回理論應觸發的最高層級 k*
-        if qty > 0.0 and order_count < max_orders and cash > 0.0 and base_price is not None:
-            r = (1.0 - add_drop)
-            if r > 0.0 and price <= base_price:
-                ratio = price / base_price if base_price > 0 else 0.0
-                if ratio <= 0.0:
-                    k_star = max_orders - 1
-                else:
-                    # 注意 log(r)<0，因此 floor(log(ratio)/log(r)) 為非負整數
-                    k_star = int(math.floor(math.log(ratio) / math.log(r)))
-                    if k_star < 0:
-                        k_star = 0
-                    elif k_star > (max_orders - 1):
-                        k_star = max_orders - 1
-                # 需要新增的層數
-                if k_star >= next_level_idx:
-                    to_add = min(k_star - next_level_idx + 1, max_orders - order_count)
-                    for _ in range(to_add):
-                        next_idx = order_count + 1  # 第幾筆訂單（含首單）
-                        if next_idx <= 2 or multiplier == 1:
-                            factor = 1.0
+            # 止盈（以含費 PnL 達標為準）
+            prospective_proceeds = qty * price * (1.0 - fee_rate)
+            prospective_pnl = prospective_proceeds - round_cost_sum - round_fee_sum
+            target_pnl = round_cost_sum * tp
+            if prospective_pnl >= target_pnl:
+                cash += prospective_proceeds
+                pnl = prospective_pnl
+                rtn = pnl / round_cost_sum if round_cost_sum > 0 else np.nan
+                exit_time = times[idx] if times is not None else idx
+                trades_log.append({
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "pnl": float(pnl),
+                    "rtn": float(rtn),
+                    "bars_held": int(bars_held_this_round)
+                })
+                qty = 0.0
+                cost = 0.0
+                anchor_price = None
+                trades += 1
+                order_count = 0
+                init_order_round = None
+                round_cost_sum = 0.0
+                round_fee_sum = 0.0
+                bars_held_this_round = 0
+                base_price = None
+                next_level_idx = 1
+            else:
+                # 固定樓梯加倉（O(1)層級計算）：
+                # 直接用當前價位相對 base_price 的比值，推回理論應觸發的最高層級 k*
+                if order_count < max_orders and cash > 0.0 and base_price is not None:
+                    r = (1.0 - add_drop)
+                    if r > 0.0 and price <= base_price:
+                        ratio = price / base_price if base_price > 0 else 0.0
+                        if ratio <= 0.0:
+                            k_star = max_orders - 1
                         else:
-                            factor = multiplier ** (next_idx - 2)
-                        target_alloc = init_order_round * factor
-                        max_afford = cash / (1.0 + fee_rate)
-                        alloc = target_alloc if target_alloc < max_afford else max_afford
-                        if alloc <= 0.0:
-                            break
-                        add_qty = alloc / price
-                        qty += add_qty
-                        cost += alloc
-                        fee = alloc * fee_rate
-                        cash -= (alloc + fee)
-                        round_cost_sum += alloc
-                        round_fee_sum += fee
-                        order_count += 1
-                        next_level_idx += 1
-            # 固定樓梯：不重設 anchor/base
+                            # 注意 log(r)<0，因此 floor(log(ratio)/log(r)) 為非負整數
+                            k_star = int(math.floor(math.log(ratio) / math.log(r)))
+                            if k_star < 0:
+                                k_star = 0
+                            elif k_star > (max_orders - 1):
+                                k_star = max_orders - 1
+                        # 需要新增的層數
+                        if k_star >= next_level_idx:
+                            to_add = min(k_star - next_level_idx + 1, max_orders - order_count)
+                            for _ in range(to_add):
+                                next_idx = order_count + 1  # 第幾筆訂單（含首單）
+                                if next_idx <= 2 or multiplier == 1:
+                                    factor = 1.0
+                                else:
+                                    factor = multiplier ** (next_idx - 2)
+                                target_alloc = init_order_round * factor
+                                max_afford = cash / (1.0 + fee_rate)
+                                alloc = target_alloc if target_alloc < max_afford else max_afford
+                                if alloc <= 0.0:
+                                    break
+                                add_qty = alloc / price
+                                qty += add_qty
+                                cost += alloc
+                                fee = alloc * fee_rate
+                                cash -= (alloc + fee)
+                                round_cost_sum += alloc
+                                round_fee_sum += fee
+                                order_count += 1
+                                next_level_idx += 1
+
+        equity = cash + qty * price  # 未平倉不扣賣出費，買入費已在 cash 反映
+        if equity > peak_equity_overall:
+            peak_equity_overall = equity
+        if peak_equity_overall > 0:
+            dd_overall = (equity - peak_equity_overall) / peak_equity_overall
+            if dd_overall < max_drawdown_overall:
+                max_drawdown_overall = dd_overall
+
+        if return_curve:
+            equity_curve.append(equity)
+            time_curve.append(current_time)
+
+        # 套牢判定改為 bar 結束狀態，避免把同一根已解套/剛加滿的 bar 算錯。
+        avg_cost = cost / qty if qty > 0 else float('inf')
+        is_trapped = (order_count == max_orders and qty > 0 and price < avg_cost)
+        if is_trapped and not is_trapped_prev:
+            start_trapped = current_time
+        elif not is_trapped and is_trapped_prev and start_trapped is not None:
+            trapped_intervals.append((start_trapped, current_time))
+            start_trapped = None
+        is_trapped_prev = is_trapped
 
     # 期末：若最後仍在套牢，記錄到結束
     if start_trapped is not None:
@@ -836,17 +850,6 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
 
     for i in range(prices.shape[0]):
         price = prices[i]
-        equity = cash + qty * price
-        if equity > peak_equity_overall:
-            peak_equity_overall = equity
-        dd = (equity - peak_equity_overall) / peak_equity_overall
-        # trapped 條件：
-        avg_cost = (cost / qty) if qty > 0.0 else 1e18
-        is_trapped = (order_count == max_orders) and (qty > 0.0) and (price < avg_cost)
-        if is_trapped:
-            trapped_bars += 1
-        if dd < max_drawdown_overall:
-            max_drawdown_overall = dd
 
         # 開倉
         if (qty == 0.0) and (cash > 0.0):
@@ -866,34 +869,26 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
                 order_count = 1
                 round_cost_sum = alloc
                 round_fee_sum = fee
-            continue
 
-        if qty == 0.0:
-            continue
-
-        # 止盈（以含費 PnL 達標）
-        prospective_proceeds = qty * price * (1.0 - fee_rate)
-        prospective_pnl = prospective_proceeds - round_cost_sum - round_fee_sum
-        target_pnl = round_cost_sum * tp
-        if prospective_pnl >= target_pnl:
-            cash += prospective_proceeds
-            qty = 0.0
-            cost = 0.0
-            anchor_price = 0.0
-            trades += 1
-            order_count = 0
-            init_order_round = 0.0
-            round_cost_sum = 0.0
-            round_fee_sum = 0.0
-            base_price = 0.0
-            next_level_idx = 1
-            continue
-
-        # 固定樓梯加倉
-        if (qty > 0.0) and (order_count < max_orders) and (cash > 0.0) and (base_price > 0.0):
-
-            # O(1) 計層：由當前價位計算應觸發到的最高層級 k*
-            if (order_count < max_orders) and (cash > 0.0) and (base_price > 0.0) and (price <= base_price):
+        elif qty > 0.0:
+            # 止盈（以含費 PnL 達標）
+            prospective_proceeds = qty * price * (1.0 - fee_rate)
+            prospective_pnl = prospective_proceeds - round_cost_sum - round_fee_sum
+            target_pnl = round_cost_sum * tp
+            if prospective_pnl >= target_pnl:
+                cash += prospective_proceeds
+                qty = 0.0
+                cost = 0.0
+                anchor_price = 0.0
+                trades += 1
+                order_count = 0
+                init_order_round = 0.0
+                round_cost_sum = 0.0
+                round_fee_sum = 0.0
+                base_price = 0.0
+                next_level_idx = 1
+            elif (order_count < max_orders) and (cash > 0.0) and (base_price > 0.0) and (price <= base_price):
+                # O(1) 計層：由當前價位計算應觸發到的最高層級 k*
                 r = (1.0 - add_drop)
                 if r > 0.0:
                     ratio = price / base_price
@@ -926,7 +921,18 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
                             round_cost_sum += alloc
                             round_fee_sum += fee
                             next_level_idx += 1
-            # 固定樓梯：不重設 anchor/base
+
+        equity = cash + qty * price
+        if equity > peak_equity_overall:
+            peak_equity_overall = equity
+        dd = (equity - peak_equity_overall) / peak_equity_overall
+        if dd < max_drawdown_overall:
+            max_drawdown_overall = dd
+
+        avg_cost = (cost / qty) if qty > 0.0 else 1e18
+        is_trapped = (order_count == max_orders) and (qty > 0.0) and (price < avg_cost)
+        if is_trapped:
+            trapped_bars += 1
 
 
     final_equity = cash + qty * prices[-1]
