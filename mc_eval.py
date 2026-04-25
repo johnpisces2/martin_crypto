@@ -82,121 +82,8 @@ def _plan_kind_code(plan_kind: str) -> int:
 
 
 if _NUMBA_LOCAL:
-    @njit(cache=True)
-    def _calc_init_order_local(capital, multiplier, max_orders):
-        if max_orders <= 0 or multiplier <= 0.0:
-            return 0.0
-        if (abs(multiplier - 1.0) < 1e-12) or (max_orders <= 2):
-            total_factor = float(max_orders)
-        else:
-            k = max_orders - 2
-            tail_sum = (multiplier**(k + 1) - multiplier) / (multiplier - 1.0)
-            total_factor = 2.0 + tail_sum
-        return capital / total_factor
-
-
-    @njit(cache=True)
-    def _backtest_core_numba_local(prices, add_drop, multiplier, max_orders, tp, capital, fee_rate):
-        trapped_bars = 0
-        total_bars = prices.shape[0]
-        if total_bars == 0:
-            return np.nan, np.nan, 0, 0.0
-
-        cash = capital
-        qty = 0.0
-        cost = 0.0
-        order_count = 0
-        init_order_round = 0.0
-        base_price = 0.0
-        next_level_idx = 1
-
-        peak_equity_overall = capital
-        max_drawdown_overall = 0.0
-        trades = 0
-        round_cost_sum = 0.0
-        round_fee_sum = 0.0
-
-        for i in range(prices.shape[0]):
-            price = prices[i]
-            if (qty == 0.0) and (cash > 0.0):
-                init_order_round = _calc_init_order_local(cash, multiplier, max_orders)
-                alloc = init_order_round
-                max_afford = cash / (1.0 + fee_rate)
-                if alloc > max_afford:
-                    alloc = max_afford
-                if alloc > 0.0:
-                    qty += alloc / price
-                    cost += alloc
-                    fee = alloc * fee_rate
-                    cash -= (alloc + fee)
-                    base_price = price
-                    next_level_idx = 1
-                    order_count = 1
-                    round_cost_sum = alloc
-                    round_fee_sum = fee
-            elif qty > 0.0:
-                prospective_proceeds = qty * price * (1.0 - fee_rate)
-                prospective_pnl = prospective_proceeds - round_cost_sum - round_fee_sum
-                target_pnl = round_cost_sum * tp
-                if prospective_pnl >= target_pnl:
-                    cash += prospective_proceeds
-                    qty = 0.0
-                    cost = 0.0
-                    trades += 1
-                    order_count = 0
-                    init_order_round = 0.0
-                    round_cost_sum = 0.0
-                    round_fee_sum = 0.0
-                    base_price = 0.0
-                    next_level_idx = 1
-                elif order_count < max_orders and cash > 0.0 and base_price > 0.0:
-                    r = (1.0 - add_drop)
-                    if r > 0.0 and price <= base_price:
-                        ratio = price / base_price if base_price > 0 else 0.0
-                        if ratio <= 0.0:
-                            k_star = max_orders - 1
-                        else:
-                            k_star = int(math.floor(math.log(ratio) / math.log(r)))
-                            if k_star < 0:
-                                k_star = 0
-                            elif k_star > (max_orders - 1):
-                                k_star = max_orders - 1
-                        if k_star >= next_level_idx:
-                            to_add = min(k_star - next_level_idx + 1, max_orders - order_count)
-                            for _ in range(to_add):
-                                next_idx = order_count + 1
-                                if next_idx <= 2 or multiplier == 1:
-                                    factor = 1.0
-                                else:
-                                    factor = multiplier ** (next_idx - 2)
-                                target_alloc = init_order_round * factor
-                                max_afford = cash / (1.0 + fee_rate)
-                                alloc = target_alloc if target_alloc < max_afford else max_afford
-                                if alloc <= 0.0:
-                                    break
-                                qty += alloc / price
-                                cost += alloc
-                                fee = alloc * fee_rate
-                                cash -= (alloc + fee)
-                                round_cost_sum += alloc
-                                round_fee_sum += fee
-                                order_count += 1
-                                next_level_idx += 1
-
-            equity = cash + qty * price
-            if equity > peak_equity_overall:
-                peak_equity_overall = equity
-            dd = (equity - peak_equity_overall) / peak_equity_overall
-            avg_cost = (cost / qty) if qty > 0.0 else 1e18
-            is_trapped = (order_count == max_orders) and (qty > 0.0) and (price < avg_cost)
-            if is_trapped:
-                trapped_bars += 1
-            if dd < max_drawdown_overall:
-                max_drawdown_overall = dd
-
-        final_equity = cash + qty * prices[-1]
-        trapped_ratio = (trapped_bars / total_bars) if total_bars > 0 else 0.0
-        return final_equity, abs(max_drawdown_overall * 100.0), trades, trapped_ratio
+    # Single source of truth for strategy mechanics; MC shares martin.py's grid core.
+    _backtest_core_numba_local = martin._backtest_core
 
 
     @njit(cache=True)
@@ -229,11 +116,33 @@ if _NUMBA_LOCAL:
 
 
     @njit(cache=True)
-    def _mc_eval_metrics_numba(
+    def _quantile_from_prefix(values, count, q):
+        if count <= 0:
+            return np.nan
+        tmp = np.empty(count, dtype=np.float64)
+        for i in range(count):
+            tmp[i] = values[i]
+        tmp.sort()
+        if count == 1:
+            return tmp[0]
+        pos = q * float(count - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return tmp[lo]
+        weight = pos - float(lo)
+        return tmp[lo] * (1.0 - weight) + tmp[hi] * weight
+
+
+    @njit(cache=True)
+    def _mc_eval_metrics_onepass_numba(
         hist_rets,
         start_price,
         capital,
         fee_rate,
+        max_loss,
+        max_severe,
+        max_dd50,
         mc_bars,
         block_size,
         total_paths,
@@ -245,26 +154,39 @@ if _NUMBA_LOCAL:
         path_plan,
     ):
         n = add_drop.shape[0]
-        terminals = np.empty((n, total_paths), dtype=np.float64)
-        terminal_sum = np.zeros(n, dtype=np.float64)
-        mdd_sum = np.zeros(n, dtype=np.float64)
-        trap_sum = np.zeros(n, dtype=np.float64)
-        loss_count = np.zeros(n, dtype=np.int64)
-        severe_count = np.zeros(n, dtype=np.int64)
-        dd50_count = np.zeros(n, dtype=np.int64)
+        terminal_mean = np.empty(n, dtype=np.float64)
+        terminal_median = np.empty(n, dtype=np.float64)
+        terminal_p5 = np.empty(n, dtype=np.float64)
+        p_loss = np.empty(n, dtype=np.float64)
+        p_severe = np.empty(n, dtype=np.float64)
+        p_dd50 = np.empty(n, dtype=np.float64)
+        mdd_mean = np.empty(n, dtype=np.float64)
+        trapped_mean = np.empty(n, dtype=np.float64)
+        feasible = np.empty(n, dtype=np.bool_)
+        paths_evaluated = np.empty(n, dtype=np.int64)
+        early_rejected = np.zeros(n, dtype=np.bool_)
 
         one_ret = np.empty(mc_bars, dtype=np.float64)
         one_path_prices = np.empty(mc_bars + 1, dtype=np.float64)
+        terminal_samples = np.empty(total_paths, dtype=np.float64)
 
-        for p in range(total_paths):
-            plan_row = path_plan[p]
-            if plan_code == 0:
-                _fill_returns_from_indices(hist_rets, plan_row, one_ret)
-            else:
-                _fill_returns_from_blocks(hist_rets, plan_row, block_size, one_ret)
-            _returns_to_prices(start_price, one_ret, one_path_prices)
+        for j in range(n):
+            terminal_sum = 0.0
+            mdd_sum = 0.0
+            trap_sum = 0.0
+            loss_count = 0
+            severe_count = 0
+            dd50_count = 0
+            done = 0
 
-            for j in range(n):
+            for p in range(total_paths):
+                plan_row = path_plan[p]
+                if plan_code == 0:
+                    _fill_returns_from_indices(hist_rets, plan_row, one_ret)
+                else:
+                    _fill_returns_from_blocks(hist_rets, plan_row, block_size, one_ret)
+                _returns_to_prices(start_price, one_ret, one_path_prices)
+
                 fe_i, mdd_i, _, trap_i = _backtest_core_numba_local(
                     one_path_prices,
                     float(add_drop[j]),
@@ -278,7 +200,131 @@ if _NUMBA_LOCAL:
                 mdd = float(mdd_i)
                 trap = float(trap_i)
 
-                terminals[j, p] = terminal
+                terminal_samples[p] = terminal
+                terminal_sum += terminal
+                mdd_sum += mdd
+                trap_sum += trap
+                if terminal < capital:
+                    loss_count += 1
+                if terminal < (0.5 * capital):
+                    severe_count += 1
+                if mdd > 50.0:
+                    dd50_count += 1
+
+                done = p + 1
+                if (
+                    (float(loss_count) / float(total_paths) > max_loss)
+                    or (float(severe_count) / float(total_paths) > max_severe)
+                    or (float(dd50_count) / float(total_paths) > max_dd50)
+                ):
+                    early_rejected[j] = True
+                    break
+
+            paths_evaluated[j] = done
+            terminal_mean[j] = terminal_sum / float(done)
+            terminal_median[j] = _quantile_from_prefix(terminal_samples, done, 0.5)
+            terminal_p5[j] = _quantile_from_prefix(terminal_samples, done, 0.05)
+            p_loss[j] = float(loss_count) / float(total_paths)
+            p_severe[j] = float(severe_count) / float(total_paths)
+            p_dd50[j] = float(dd50_count) / float(total_paths)
+            mdd_mean[j] = mdd_sum / float(done)
+            trapped_mean[j] = trap_sum / float(done)
+            feasible[j] = (
+                (not early_rejected[j])
+                and (p_loss[j] <= max_loss)
+                and (p_severe[j] <= max_severe)
+                and (p_dd50[j] <= max_dd50)
+            )
+
+        return (
+            terminal_mean,
+            terminal_median,
+            terminal_p5,
+            p_loss,
+            p_severe,
+            p_dd50,
+            mdd_mean,
+            trapped_mean,
+            feasible,
+            paths_evaluated,
+            early_rejected,
+        )
+
+
+    @njit(cache=True)
+    def _mc_eval_metrics_numba(
+        hist_rets,
+        start_price,
+        capital,
+        fee_rate,
+        max_loss,
+        max_severe,
+        max_dd50,
+        mc_bars,
+        block_size,
+        total_paths,
+        add_drop,
+        multiplier,
+        max_orders,
+        tp,
+        plan_code,
+        path_plan,
+    ):
+        n = add_drop.shape[0]
+        terminal_mean = np.empty(n, dtype=np.float64)
+        terminal_median = np.empty(n, dtype=np.float64)
+        terminal_p5 = np.empty(n, dtype=np.float64)
+        p_loss = np.empty(n, dtype=np.float64)
+        p_severe = np.empty(n, dtype=np.float64)
+        p_dd50 = np.empty(n, dtype=np.float64)
+        mdd_mean = np.empty(n, dtype=np.float64)
+        trapped_mean = np.empty(n, dtype=np.float64)
+        feasible = np.empty(n, dtype=np.bool_)
+        paths_evaluated = np.empty(n, dtype=np.int64)
+        early_rejected = np.zeros(n, dtype=np.bool_)
+
+        terminal_sum = np.zeros(n, dtype=np.float64)
+        mdd_sum = np.zeros(n, dtype=np.float64)
+        trap_sum = np.zeros(n, dtype=np.float64)
+        loss_count = np.zeros(n, dtype=np.int64)
+        severe_count = np.zeros(n, dtype=np.int64)
+        dd50_count = np.zeros(n, dtype=np.int64)
+        active = np.ones(n, dtype=np.bool_)
+        active_count = n
+
+        one_ret = np.empty(mc_bars, dtype=np.float64)
+        one_path_prices = np.empty(mc_bars + 1, dtype=np.float64)
+
+        # First pass: build each MC path once and screen all active candidates.
+        for p in range(total_paths):
+            if active_count <= 0:
+                break
+
+            plan_row = path_plan[p]
+            if plan_code == 0:
+                _fill_returns_from_indices(hist_rets, plan_row, one_ret)
+            else:
+                _fill_returns_from_blocks(hist_rets, plan_row, block_size, one_ret)
+            _returns_to_prices(start_price, one_ret, one_path_prices)
+
+            done = p + 1
+            for j in range(n):
+                if not active[j]:
+                    continue
+
+                fe_i, mdd_i, _, trap_i = _backtest_core_numba_local(
+                    one_path_prices,
+                    float(add_drop[j]),
+                    float(multiplier[j]),
+                    int(max_orders[j]),
+                    float(tp[j]),
+                    capital,
+                    fee_rate,
+                )
+                terminal = float(fe_i)
+                mdd = float(mdd_i)
+                trap = float(trap_i)
+
                 terminal_sum[j] += terminal
                 mdd_sum[j] += mdd
                 trap_sum[j] += trap
@@ -289,7 +335,96 @@ if _NUMBA_LOCAL:
                 if mdd > 50.0:
                     dd50_count[j] += 1
 
-        return terminals, terminal_sum, mdd_sum, trap_sum, loss_count, severe_count, dd50_count
+                paths_evaluated[j] = done
+                if (
+                    (float(loss_count[j]) / float(total_paths) > max_loss)
+                    or (float(severe_count[j]) / float(total_paths) > max_severe)
+                    or (float(dd50_count[j]) / float(total_paths) > max_dd50)
+                ):
+                    active[j] = False
+                    early_rejected[j] = True
+                    active_count -= 1
+
+        survivor_count = 0
+        for j in range(n):
+            done = paths_evaluated[j]
+            if done <= 0:
+                done = total_paths
+                paths_evaluated[j] = done
+            denom_done = float(done)
+            terminal_mean[j] = terminal_sum[j] / denom_done
+            mdd_mean[j] = mdd_sum[j] / denom_done
+            trapped_mean[j] = trap_sum[j] / denom_done
+            p_loss[j] = float(loss_count[j]) / float(total_paths)
+            p_severe[j] = float(severe_count[j]) / float(total_paths)
+            p_dd50[j] = float(dd50_count[j]) / float(total_paths)
+            feasible[j] = (
+                active[j]
+                and (p_loss[j] <= max_loss)
+                and (p_severe[j] <= max_severe)
+                and (p_dd50[j] <= max_dd50)
+            )
+            if feasible[j]:
+                survivor_count += 1
+            elif early_rejected[j]:
+                terminal_mean[j] = np.nan
+                terminal_median[j] = np.nan
+                terminal_p5[j] = np.nan
+                mdd_mean[j] = np.nan
+                trapped_mean[j] = np.nan
+            else:
+                terminal_median[j] = terminal_mean[j]
+                terminal_p5[j] = terminal_mean[j]
+
+        # Second pass: compute exact terminal quantiles only for survivors.
+        if survivor_count > 0:
+            survivor_idx = np.empty(survivor_count, dtype=np.int64)
+            s = 0
+            for j in range(n):
+                if feasible[j]:
+                    survivor_idx[s] = j
+                    s += 1
+
+            survivor_terminals = np.empty((survivor_count, total_paths), dtype=np.float64)
+            for p in range(total_paths):
+                plan_row = path_plan[p]
+                if plan_code == 0:
+                    _fill_returns_from_indices(hist_rets, plan_row, one_ret)
+                else:
+                    _fill_returns_from_blocks(hist_rets, plan_row, block_size, one_ret)
+                _returns_to_prices(start_price, one_ret, one_path_prices)
+
+                for s in range(survivor_count):
+                    j = survivor_idx[s]
+                    fe_i, _, _, _ = _backtest_core_numba_local(
+                        one_path_prices,
+                        float(add_drop[j]),
+                        float(multiplier[j]),
+                        int(max_orders[j]),
+                        float(tp[j]),
+                        capital,
+                        fee_rate,
+                    )
+                    survivor_terminals[s, p] = float(fe_i)
+
+            for s in range(survivor_count):
+                j = survivor_idx[s]
+                terminal_median[j] = _quantile_from_prefix(survivor_terminals[s], total_paths, 0.5)
+                terminal_p5[j] = _quantile_from_prefix(survivor_terminals[s], total_paths, 0.05)
+
+        return (
+            terminal_mean,
+            terminal_median,
+            terminal_p5,
+            p_loss,
+            p_severe,
+            p_dd50,
+            mdd_mean,
+            trapped_mean,
+            feasible,
+            paths_evaluated,
+            early_rejected,
+        )
 else:
     def _backtest_core_numba_local(prices, add_drop, multiplier, max_orders, tp, capital, fee_rate):
         return martin._backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_rate)
@@ -317,6 +452,9 @@ else:
         start_price,
         capital,
         fee_rate,
+        max_loss,
+        max_severe,
+        max_dd50,
         mc_bars,
         block_size,
         total_paths,
@@ -328,26 +466,40 @@ else:
         path_plan,
     ):
         n = add_drop.shape[0]
-        terminals = np.empty((n, total_paths), dtype=np.float64)
-        terminal_sum = np.zeros(n, dtype=np.float64)
-        mdd_sum = np.zeros(n, dtype=np.float64)
-        trap_sum = np.zeros(n, dtype=np.float64)
-        loss_count = np.zeros(n, dtype=np.int64)
-        severe_count = np.zeros(n, dtype=np.int64)
-        dd50_count = np.zeros(n, dtype=np.int64)
+        terminal_mean = np.empty(n, dtype=np.float64)
+        terminal_median = np.empty(n, dtype=np.float64)
+        terminal_p5 = np.empty(n, dtype=np.float64)
+        p_loss = np.empty(n, dtype=np.float64)
+        p_severe = np.empty(n, dtype=np.float64)
+        p_dd50 = np.empty(n, dtype=np.float64)
+        mdd_mean = np.empty(n, dtype=np.float64)
+        trapped_mean = np.empty(n, dtype=np.float64)
+        feasible = np.empty(n, dtype=bool)
+        paths_evaluated = np.empty(n, dtype=np.int64)
+        early_rejected = np.zeros(n, dtype=bool)
 
         one_ret = np.empty(mc_bars, dtype=np.float64)
         one_path_prices = np.empty(mc_bars + 1, dtype=np.float64)
+        # Reused per candidate; avoids holding candidates x paths terminal values.
+        terminal_samples = np.empty(total_paths, dtype=np.float64)
 
-        for p in range(total_paths):
-            plan_row = path_plan[p]
-            if plan_code == 0:
-                _fill_returns_from_indices(hist_rets, plan_row, one_ret)
-            else:
-                _fill_returns_from_blocks(hist_rets, plan_row, block_size, one_ret)
-            _returns_to_prices(start_price, one_ret, one_path_prices)
+        for j in range(n):
+            terminal_sum = 0.0
+            mdd_sum = 0.0
+            trap_sum = 0.0
+            loss_count = 0
+            severe_count = 0
+            dd50_count = 0
+            done = 0
 
-            for j in range(n):
+            for p in range(total_paths):
+                plan_row = path_plan[p]
+                if plan_code == 0:
+                    _fill_returns_from_indices(hist_rets, plan_row, one_ret)
+                else:
+                    _fill_returns_from_blocks(hist_rets, plan_row, block_size, one_ret)
+                _returns_to_prices(start_price, one_ret, one_path_prices)
+
                 fe_i, mdd_i, _, trap_i = _backtest_core_numba_local(
                     one_path_prices,
                     float(add_drop[j]),
@@ -361,18 +513,61 @@ else:
                 mdd = float(mdd_i)
                 trap = float(trap_i)
 
-                terminals[j, p] = terminal
-                terminal_sum[j] += terminal
-                mdd_sum[j] += mdd
-                trap_sum[j] += trap
+                terminal_samples[p] = terminal
+                terminal_sum += terminal
+                mdd_sum += mdd
+                trap_sum += trap
                 if terminal < capital:
-                    loss_count[j] += 1
+                    loss_count += 1
                 if terminal < (0.5 * capital):
-                    severe_count[j] += 1
+                    severe_count += 1
                 if mdd > 50.0:
-                    dd50_count[j] += 1
+                    dd50_count += 1
 
-        return terminals, terminal_sum, mdd_sum, trap_sum, loss_count, severe_count, dd50_count
+                done = p + 1
+                if (
+                    (loss_count / float(total_paths) > max_loss)
+                    or (severe_count / float(total_paths) > max_severe)
+                    or (dd50_count / float(total_paths) > max_dd50)
+                ):
+                    early_rejected[j] = True
+                    break
+
+            paths_evaluated[j] = done
+            terminal_mean[j] = terminal_sum / float(done)
+            terminal_median[j] = float(np.percentile(terminal_samples[:done], 50))
+            terminal_p5[j] = float(np.percentile(terminal_samples[:done], 5))
+            p_loss[j] = loss_count / float(total_paths)
+            p_severe[j] = severe_count / float(total_paths)
+            p_dd50[j] = dd50_count / float(total_paths)
+            mdd_mean[j] = mdd_sum / float(done)
+            trapped_mean[j] = trap_sum / float(done)
+            feasible[j] = (
+                (not early_rejected[j])
+                and (p_loss[j] <= max_loss)
+                and (p_severe[j] <= max_severe)
+                and (p_dd50[j] <= max_dd50)
+            )
+            if early_rejected[j]:
+                terminal_mean[j] = np.nan
+                terminal_median[j] = np.nan
+                terminal_p5[j] = np.nan
+                mdd_mean[j] = np.nan
+                trapped_mean[j] = np.nan
+
+        return (
+            terminal_mean,
+            terminal_median,
+            terminal_p5,
+            p_loss,
+            p_severe,
+            p_dd50,
+            mdd_mean,
+            trapped_mean,
+            feasible,
+            paths_evaluated,
+            early_rejected,
+        )
 
 
 def _mc_eval_chunk_worker(payload: dict) -> dict:
@@ -393,12 +588,30 @@ def _mc_eval_chunk_worker(payload: dict) -> dict:
     tp = payload["tp"]
     plan_code = int(payload["plan_code"])
     path_plan = payload["path_plan"]
+    metrics_fn = _mc_eval_metrics_numba
+    if _NUMBA_LOCAL and max_loss >= 1.0 and max_severe >= 1.0 and max_dd50 >= 1.0:
+        metrics_fn = _mc_eval_metrics_onepass_numba
 
-    terminals, terminal_sum, mdd_sum, trap_sum, loss_count, severe_count, dd50_count = _mc_eval_metrics_numba(
+    (
+        terminal_mean,
+        terminal_median,
+        terminal_p5,
+        p_loss,
+        p_severe,
+        p_dd50,
+        mdd_mean,
+        trapped_mean,
+        feasible,
+        paths_evaluated,
+        early_rejected,
+    ) = metrics_fn(
         np.asarray(hist_rets, dtype=np.float64),
         start_price,
         capital,
         fee_rate,
+        max_loss,
+        max_severe,
+        max_dd50,
         mc_bars,
         block_size,
         total_paths,
@@ -410,21 +623,18 @@ def _mc_eval_chunk_worker(payload: dict) -> dict:
         np.asarray(path_plan, dtype=np.int32),
     )
 
-    p_loss = loss_count / float(total_paths)
-    p_severe = severe_count / float(total_paths)
-    p_dd50 = dd50_count / float(total_paths)
-    feasible = (p_loss <= max_loss) & (p_severe <= max_severe) & (p_dd50 <= max_dd50)
-
     return {
-        "terminal_mean": terminal_sum / float(total_paths),
-        "terminal_median": np.median(terminals, axis=1),
-        "terminal_p5": np.percentile(terminals, 5, axis=1),
+        "terminal_mean": terminal_mean,
+        "terminal_median": terminal_median,
+        "terminal_p5": terminal_p5,
         "p_loss": p_loss,
         "p_severe": p_severe,
         "p_dd50": p_dd50,
-        "mdd_mean": mdd_sum / float(total_paths),
-        "trapped_mean": trap_sum / float(total_paths),
+        "mdd_mean": mdd_mean,
+        "trapped_mean": trapped_mean,
         "feasible": feasible,
+        "paths_evaluated": paths_evaluated,
+        "early_rejected": early_rejected,
     }
 
 
@@ -477,6 +687,8 @@ def eval_candidates_parallel(
     ):
         out[col] = np.nan
     out["feasible"] = False
+    out["mc_paths_evaluated"] = 0
+    out["mc_early_rejected"] = False
 
     own_executor = False
     ex = executor
@@ -521,6 +733,8 @@ def eval_candidates_parallel(
             out.loc[idxs, "mc_mdd_mean"] = r["mdd_mean"]
             out.loc[idxs, "mc_trapped_mean"] = r["trapped_mean"]
             out.loc[idxs, "feasible"] = r["feasible"]
+            out.loc[idxs, "mc_paths_evaluated"] = r["paths_evaluated"]
+            out.loc[idxs, "mc_early_rejected"] = r["early_rejected"]
     finally:
         if own_executor and ex is not None:
             ex.shutdown(wait=True, cancel_futures=False)

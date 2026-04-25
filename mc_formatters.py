@@ -46,14 +46,17 @@ def format_mc_scan_display(df: pd.DataFrame, pct_str_fn, human_pct_fn):
     disp["trapped_time_ratio"] = disp["trapped_time_ratio"].apply(lambda v: pct_str_fn(v, 2))
     for col in ("final_equity", "max_dd_overall", "mc_terminal_median", "mc_terminal_p5", "mc_mdd_mean", "mc_trapped_mean"):
         if col in disp.columns:
-            disp[col] = disp[col].map(lambda v: f"{float(v):.2f}")
+            disp[col] = disp[col].map(lambda v: "N/A" if pd.isna(v) else f"{float(v):.2f}")
     disp["mc_p_loss"] = disp["mc_p_loss"].apply(lambda v: human_pct_fn(v, 2))
     disp["mc_p_severe"] = disp["mc_p_severe"].apply(lambda v: human_pct_fn(v, 2))
     disp["mc_p_dd50"] = disp["mc_p_dd50"].apply(lambda v: human_pct_fn(v, 2))
     disp["feasible"] = disp["feasible"].apply(lambda v: "Y" if bool(v) else "N")
+    if "mc_early_rejected" in disp.columns:
+        disp["mc_early_rejected"] = disp["mc_early_rejected"].apply(lambda v: "Y" if bool(v) else "N")
 
     cols = [
-        "feasible", "add_drop", "tp", "multiplier", "max_orders",
+        "feasible", "mc_early_rejected", "mc_paths_evaluated",
+        "add_drop", "tp", "multiplier", "max_orders",
         "final_equity", "max_dd_overall", "trades", "trapped_time_ratio",
         "mc_terminal_median", "mc_terminal_p5",
         "mc_p_loss", "mc_p_severe", "mc_p_dd50", "mc_mdd_mean",

@@ -374,7 +374,7 @@ class MartinGUI(QMainWindow):
         top.addWidget(gb_filter)
 
         form_data = QFormLayout(gb_data)
-        self.e_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="SUI")
+        self.e_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="XRP")
         self.e_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
         self.e_start = self._add_date_edit(form_data, "Start:", default_start)
         self.e_end = self._add_date_edit(form_data, "End:", default_end)
@@ -489,7 +489,7 @@ class MartinGUI(QMainWindow):
         top.addWidget(gb_risk)
 
         form_data = QFormLayout(gb_data)
-        self.m_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="SUI")
+        self.m_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="XRP")
         self.m_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
         self.m_start = self._add_date_edit(form_data, "Start:", default_start)
         self.m_end = self._add_date_edit(form_data, "End:", default_end)
@@ -655,7 +655,7 @@ class MartinGUI(QMainWindow):
         top.addStretch(1)
 
         form_data = QFormLayout(gb_data)
-        self.s_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="SUI")
+        self.s_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="XRP")
         self.s_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
         self.s_start = self._add_date_edit(form_data, "Start:", default_start)
         self.s_end = self._add_date_edit(form_data, "End:", default_end)

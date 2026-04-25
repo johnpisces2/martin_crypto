@@ -841,6 +841,7 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
     # 固定樓梯狀態
     base_price = 0.0
     next_level_idx = 1
+    next_order_factor = 1.0
 
     peak_equity_overall = capital
     max_drawdown_overall = 0.0
@@ -848,14 +849,28 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
     round_cost_sum = 0.0   # 累計買入本金
     round_fee_sum = 0.0    # 累計買入費
 
+    inv_one_plus_fee = 1.0 / (1.0 + fee_rate)
+    sell_fee_mult = 1.0 - fee_rate
+    r = 1.0 - add_drop
+    log_r = math.log(r) if r > 0.0 else 0.0
+    multiplier_is_one = multiplier == 1.0
+    if max_orders <= 0 or multiplier <= 0.0:
+        total_factor = 0.0
+    elif (abs(multiplier - 1.0) < 1e-12) or (max_orders <= 2):
+        total_factor = float(max_orders)
+    else:
+        k = max_orders - 2
+        tail_sum = (multiplier**(k + 1) - multiplier) / (multiplier - 1.0)
+        total_factor = 2.0 + tail_sum
+
     for i in range(prices.shape[0]):
         price = prices[i]
 
         # 開倉
         if (qty == 0.0) and (cash > 0.0):
-            init_order_round = _calc_init_order_numba(cash, multiplier, max_orders)
+            init_order_round = cash / total_factor if total_factor > 0.0 else 0.0
             alloc = init_order_round
-            max_afford = cash / (1.0 + fee_rate)
+            max_afford = cash * inv_one_plus_fee
             if alloc > max_afford:
                 alloc = max_afford
             if alloc > 0.0:
@@ -866,13 +881,14 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
                 anchor_price = price
                 base_price = price
                 next_level_idx = 1
+                next_order_factor = 1.0
                 order_count = 1
                 round_cost_sum = alloc
                 round_fee_sum = fee
 
         elif qty > 0.0:
             # 止盈（以含費 PnL 達標）
-            prospective_proceeds = qty * price * (1.0 - fee_rate)
+            prospective_proceeds = qty * price * sell_fee_mult
             prospective_pnl = prospective_proceeds - round_cost_sum - round_fee_sum
             target_pnl = round_cost_sum * tp
             if prospective_pnl >= target_pnl:
@@ -887,15 +903,15 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
                 round_fee_sum = 0.0
                 base_price = 0.0
                 next_level_idx = 1
+                next_order_factor = 1.0
             elif (order_count < max_orders) and (cash > 0.0) and (base_price > 0.0) and (price <= base_price):
                 # O(1) 計層：由當前價位計算應觸發到的最高層級 k*
-                r = (1.0 - add_drop)
                 if r > 0.0:
                     ratio = price / base_price
                     if ratio <= 0.0:
                         k_star = max_orders - 1
                     else:
-                        k_star = int(math.floor(math.log(ratio) / math.log(r)))
+                        k_star = int(math.floor(math.log(ratio) / log_r))
                         if k_star < 0:
                             k_star = 0
                         elif k_star > (max_orders - 1):
@@ -903,13 +919,8 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
                     if k_star >= next_level_idx:
                         to_add = min(k_star - next_level_idx + 1, max_orders - order_count)
                         for _ in range(to_add):
-                            next_idx = order_count + 1
-                            if next_idx <= 2 or multiplier == 1:
-                                factor = 1.0
-                            else:
-                                factor = multiplier ** (next_idx - 2)
-                            target_alloc = init_order_round * factor
-                            max_afford = cash / (1.0 + fee_rate)
+                            target_alloc = init_order_round * next_order_factor
+                            max_afford = cash * inv_one_plus_fee
                             alloc = target_alloc if target_alloc < max_afford else max_afford
                             if alloc <= 0.0:
                                 break
@@ -921,6 +932,8 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
                             round_cost_sum += alloc
                             round_fee_sum += fee
                             next_level_idx += 1
+                            if (not multiplier_is_one) and order_count >= 2:
+                                next_order_factor *= multiplier
 
         equity = cash + qty * price
         if equity > peak_equity_overall:
