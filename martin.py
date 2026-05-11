@@ -733,6 +733,8 @@ def martingale_backtest(
                         ratio = price / base_price if base_price > 0 else 0.0
                         if ratio <= 0.0:
                             k_star = max_orders - 1
+                        elif r <= 0.0:
+                            k_star = 0
                         else:
                             # 注意 log(r)<0，因此 floor(log(ratio)/log(r)) 為非負整數
                             k_star = int(math.floor(math.log(ratio) / math.log(r)))
@@ -825,7 +827,7 @@ def _calc_init_order_numba(capital, multiplier, max_orders):
 
 @njit(cache=True)
 def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_rate):
-    """Numba 版單次模擬（固定樓梯加倉）。"""
+    """Numba 版單次模擬（固定樓梯加倉） - 極速優化版。"""
     trapped_bars = 0
     total_bars = prices.shape[0]
     if total_bars == 0:
@@ -840,14 +842,17 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
 
     # 固定樓梯狀態
     base_price = 0.0
+    inv_base_price = 0.0
     next_level_idx = 1
     next_order_factor = 1.0
 
     peak_equity_overall = capital
+    inv_peak_equity = 1.0 / capital if capital > 0.0 else 1.0
     max_drawdown_overall = 0.0
     trades = 0
     round_cost_sum = 0.0   # 累計買入本金
     round_fee_sum = 0.0    # 累計買入費
+    target_proceeds = 0.0  # 預先計算好的目標賣出總額
 
     inv_one_plus_fee = 1.0 / (1.0 + fee_rate)
     sell_fee_mult = 1.0 - fee_rate
@@ -880,18 +885,18 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
                 cash -= (alloc + fee)
                 anchor_price = price
                 base_price = price
+                inv_base_price = 1.0 / price if price > 0.0 else 0.0
                 next_level_idx = 1
                 next_order_factor = 1.0
                 order_count = 1
                 round_cost_sum = alloc
                 round_fee_sum = fee
+                target_proceeds = round_cost_sum + round_fee_sum + (round_cost_sum * tp)
 
         elif qty > 0.0:
             # 止盈（以含費 PnL 達標）
             prospective_proceeds = qty * price * sell_fee_mult
-            prospective_pnl = prospective_proceeds - round_cost_sum - round_fee_sum
-            target_pnl = round_cost_sum * tp
-            if prospective_pnl >= target_pnl:
+            if prospective_proceeds >= target_proceeds:
                 cash += prospective_proceeds
                 qty = 0.0
                 cost = 0.0
@@ -902,14 +907,17 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
                 round_cost_sum = 0.0
                 round_fee_sum = 0.0
                 base_price = 0.0
+                inv_base_price = 0.0
                 next_level_idx = 1
                 next_order_factor = 1.0
             elif (order_count < max_orders) and (cash > 0.0) and (base_price > 0.0) and (price <= base_price):
                 # O(1) 計層：由當前價位計算應觸發到的最高層級 k*
                 if r > 0.0:
-                    ratio = price / base_price
+                    ratio = price * inv_base_price
                     if ratio <= 0.0:
                         k_star = max_orders - 1
+                    elif log_r == 0.0:
+                        k_star = 0
                     else:
                         k_star = int(math.floor(math.log(ratio) / log_r))
                         if k_star < 0:
@@ -934,19 +942,20 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
                             next_level_idx += 1
                             if (not multiplier_is_one) and order_count >= 2:
                                 next_order_factor *= multiplier
+                        if to_add > 0:
+                            target_proceeds = round_cost_sum + round_fee_sum + (round_cost_sum * tp)
 
         equity = cash + qty * price
         if equity > peak_equity_overall:
             peak_equity_overall = equity
-        dd = (equity - peak_equity_overall) / peak_equity_overall
-        if dd < max_drawdown_overall:
-            max_drawdown_overall = dd
+            inv_peak_equity = 1.0 / equity
+        else:
+            dd = (equity * inv_peak_equity) - 1.0
+            if dd < max_drawdown_overall:
+                max_drawdown_overall = dd
 
-        avg_cost = (cost / qty) if qty > 0.0 else 1e18
-        is_trapped = (order_count == max_orders) and (qty > 0.0) and (price < avg_cost)
-        if is_trapped:
+        if (order_count == max_orders) and ((price * qty) < cost):
             trapped_bars += 1
-
 
     final_equity = cash + qty * prices[-1]
     mdd_overall_pct = -max_drawdown_overall * 100.0
