@@ -174,6 +174,32 @@ class DataFrameTableModel(QAbstractTableModel):
             return None
         return str(section + 1)
 
+    def sort(self, column, order):
+        if not self._headers or self._frame.empty:
+            return
+        
+        self.layoutAboutToBeChanged.emit()
+        col_name = self._headers[column]
+        ascending = order == Qt.AscendingOrder
+        
+        # Create a temporary sorting series by cleaning strings
+        series = self._frame[col_name].copy()
+        if series.dtype == object or series.dtype == str:
+            # Clean common formatted strings (e.g., '10.5%', 'N/A', 'Y', 'N', commas)
+            cleaned = series.astype(str).str.replace(r'[%$ ,]', '', regex=True)
+            # Map 'Y' to 1 and 'N' to 0 for feasible columns
+            cleaned = cleaned.replace({'Y': '1', 'N': '0', 'N/A': '-inf'})
+            numeric_series = pd.to_numeric(cleaned, errors='coerce')
+            
+            # If at least some values were successfully converted to numbers
+            if not numeric_series.isna().all():
+                series = numeric_series
+                
+        # Sort frame using the temporary series
+        sorted_indices = series.sort_values(ascending=ascending, kind='mergesort', na_position='first' if ascending else 'last').index
+        self._frame = self._frame.loc[sorted_indices]
+        self.layoutChanged.emit()
+
 
 class MartinGUI(QMainWindow):
     INIT_SPLIT = 0.70
@@ -430,6 +456,7 @@ class MartinGUI(QMainWindow):
         self.table.setAlternatingRowColors(False)
         self.scan_table_model.set_frame(pd.DataFrame(columns=cols), cols)
         self.table.setWordWrap(False)
+        self.table.setSortingEnabled(True)
         self._autosize_scan_table_columns()
         table_layout.addWidget(self.table)
 
@@ -568,6 +595,7 @@ class MartinGUI(QMainWindow):
         self.mc_table.horizontalHeader().setHighlightSections(False)
         self.mc_table.verticalHeader().setVisible(False)
         self.mc_table.setWordWrap(False)
+        self.mc_table.setSortingEnabled(True)
         mc_table_layout.addWidget(self.mc_table)
 
         mc_hint = QLabel("提示：雙擊表格繪圖，會自動切換到「Backtest Chart / Performance」。")
@@ -1267,7 +1295,8 @@ class MartinGUI(QMainWindow):
         if idx >= len(self.scan_df):
             QMessageBox.critical(self, "錯誤", "選擇索引超出範圍。")
             return
-        params = self.scan_df.iloc[idx]
+        original_idx = self.scan_table_model.frame.index[idx]
+        params = self.scan_df.loc[original_idx]
         self._set_status("載入詳細回測…")
 
         interval_str = self.e_interval.currentText().strip()
@@ -1303,7 +1332,8 @@ class MartinGUI(QMainWindow):
         if idx >= len(self.mc_scan_df):
             QMessageBox.critical(self, "錯誤", "選擇索引超出範圍。")
             return
-        params = self.mc_scan_df.iloc[idx]
+        original_idx = self.mc_table_model.frame.index[idx]
+        params = self.mc_scan_df.loc[original_idx]
         self._set_status("載入候選參數詳細回測…")
 
         interval_str = self.m_interval.currentText().strip()
