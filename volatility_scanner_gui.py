@@ -277,7 +277,7 @@ class VolatilityScannerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("volatility_scanner_gui")
-        self.resize(900, 820)
+        self.resize(1050, 820)
 
         self.thread_pool = QThreadPool.globalInstance()
         self.stop_event = threading.Event()
@@ -291,8 +291,8 @@ class VolatilityScannerGUI(QMainWindow):
         self._ticker_cache = {}
         self._mc_rank_cache = {"ts": 0.0, "limit": 0, "mapping": {}}
         self.cols = [
-            "Symbol", "Price", "Avg_Vol(M)", "RV(Ann)%", "ATR(Month)%",
-            "Max_DD(%)", "Change(%)", "MC Rank",
+            "Symbol", "Price", "Vol(M)", "RV(A)%", "ATR(M)%",
+            "MaxDD%", "Chg%", "ER", "MaxRed", "MC Rank",
         ]
 
         self._build_ui()
@@ -542,8 +542,8 @@ class VolatilityScannerGUI(QMainWindow):
             return
         header = self.table.horizontalHeader()
         metrics = QFontMetrics(header.font())
-        pad_px = 24
-        min_col_width = 80
+        pad_px = 12
+        min_col_width = 60
         sample_rows = min(model.rowCount(), 24)
         for c in range(model.columnCount()):
             text = model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or ""
@@ -932,6 +932,25 @@ class VolatilityScannerGUI(QMainWindow):
             dd = (closes - roll_max) / roll_max
             max_dd = dd.min()
 
+            # Efficiency Ratio (ER)
+            abs_net_change = abs(closes.iloc[-1] - closes.iloc[0])
+            sum_abs_changes = np.sum(np.abs(np.diff(closes)))
+            er = abs_net_change / sum_abs_changes if sum_abs_changes > 0 else 1.0
+
+            # Max Consecutive Red Bars
+            diffs = np.diff(closes)
+            is_red = diffs < 0
+            max_consec_red = 0
+            if len(is_red) > 0:
+                consec_red = 0
+                for v in is_red:
+                    if v:
+                        consec_red += 1
+                        if consec_red > max_consec_red:
+                            max_consec_red = consec_red
+                    else:
+                        consec_red = 0
+
             quote_vols = df['volume'] * df['close']
             total_quote_vol = quote_vols.sum()
 
@@ -950,13 +969,15 @@ class VolatilityScannerGUI(QMainWindow):
             return {
                 "Symbol": sym,
                 "Price": closes.iloc[-1],
-                "Avg_Vol(M)": avg_daily_vol / 1_000_000,
-                "RV(Ann)%": rv_annual * 100,
+                "Vol(M)": avg_daily_vol / 1_000_000,
+                "RV(A)%": rv_annual * 100,
                 "ATR(Day)%": atr_daily_est * 100,
-                "ATR(Month)%": atr_monthly_est * 100,
+                "ATR(M)%": atr_monthly_est * 100,
                 "BBW(%)": bbw_p * 100,
-                "Max_DD(%)": max_dd * 100,
-                "Change(%)": change * 100,
+                "MaxDD%": max_dd * 100,
+                "Chg%": change * 100,
+                "ER": er,
+                "MaxRed": int(max_consec_red),
                 "MC Rank": cand.get('mc_rank', -1),
             }
         except Exception:
@@ -975,16 +996,16 @@ class VolatilityScannerGUI(QMainWindow):
             work_df["_mc_sort"] = np.where(mc_rank > 0, mc_rank, np.inf)
             sort_cols = ["_mc_sort"]
             sort_asc = [True]
-            if "RV(Ann)%" in work_df.columns:
-                sort_cols.append("RV(Ann)%")
+            if "RV(A)%" in work_df.columns:
+                sort_cols.append("RV(A)%")
                 sort_asc.append(False)
             work_df.sort_values(sort_cols, ascending=sort_asc, inplace=True)
             self.scan_results = work_df.drop(columns=["_mc_sort"])
             self._sort_col = "MC Rank"
             self._sort_asc = True
-        elif "RV(Ann)%" in self.scan_results.columns:
-            self.scan_results.sort_values("RV(Ann)%", ascending=False, inplace=True)
-            self._sort_col = "RV(Ann)%"
+        elif "RV(A)%" in self.scan_results.columns:
+            self.scan_results.sort_values("RV(A)%", ascending=False, inplace=True)
+            self._sort_col = "RV(A)%"
             self._sort_asc = False
 
         quote_asset = DEFAULT_QUOTE_ASSET
@@ -1008,11 +1029,13 @@ class VolatilityScannerGUI(QMainWindow):
         disp = pd.DataFrame({
             "Symbol": df["Symbol"],
             "Price": df["Price"].map(lambda v: f"{float(v):.8f}" if float(v) < 0.01 else f"{float(v):.4f}"),
-            "Avg_Vol(M)": df["Avg_Vol(M)"].map(lambda v: f"{float(v):.2f}"),
-            "RV(Ann)%": df["RV(Ann)%"].map(lambda v: f"{float(v):.2f}"),
-            "ATR(Month)%": df["ATR(Month)%"].map(lambda v: f"{float(v):.2f}"),
-            "Max_DD(%)": df["Max_DD(%)"].map(lambda v: f"{float(v):.2f}"),
-            "Change(%)": df["Change(%)"].map(lambda v: f"{float(v):.2f}"),
+            "Vol(M)": df["Vol(M)"].map(lambda v: f"{float(v):.2f}"),
+            "RV(A)%": df["RV(A)%"].map(lambda v: f"{float(v):.2f}"),
+            "ATR(M)%": df["ATR(M)%"].map(lambda v: f"{float(v):.2f}"),
+            "MaxDD%": df["MaxDD%"].map(lambda v: f"{float(v):.2f}"),
+            "Chg%": df["Chg%"].map(lambda v: f"{float(v):.2f}"),
+            "ER": df["ER"].map(lambda v: f"{float(v):.3f}"),
+            "MaxRed": df["MaxRed"].map(lambda v: f"{int(v)}"),
             "MC Rank": df["MC Rank"].map(lambda v: f"{int(v)}" if pd.notna(v) and float(v) > 0 else "-"),
         })
         self.table_model.set_dataframe(disp)
@@ -1031,6 +1054,11 @@ class VolatilityScannerGUI(QMainWindow):
 
         if col in ["Symbol"]:
             self.scan_results.sort_values(col, ascending=ascending, inplace=True)
+        elif col == "MC Rank":
+            def sort_mc_rank(s):
+                n = pd.to_numeric(s, errors="coerce")
+                return np.where(n > 0, n, np.inf if ascending else -np.inf)
+            self.scan_results.sort_values(col, ascending=ascending, inplace=True, key=sort_mc_rank)
         else:
             self.scan_results.sort_values(col, ascending=ascending, inplace=True, key=lambda s: pd.to_numeric(s, errors="coerce"))
         self._render_table(self.scan_results)
