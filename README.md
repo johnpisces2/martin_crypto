@@ -202,11 +202,65 @@ MC scan 已做以下優化：
 目前支援的指標包含：
 
 - realized volatility
-- ATR%
+- ATR% / true range
 - Bollinger Band width
-- volume / market filters
+- Efficiency Ratio
+- Max consecutive red bars
+- OHLC-based max drawdown
+- volume / market cap filters
+
+Scanner 會要求非手動標的具備足夠歷史資料覆蓋率。若掃描區間超過 30 天，實際 K 線跨度至少需達請求區間的約 `80%`，避免只有短歷史的新幣與長歷史標的直接混排。
 
 掃描結果可搭配主 GUI 的 `Historical Scan` 與 `MC Scan` 使用。
+
+### 馬丁策略選幣指南
+
+`martingale / grid averaging` 策略的核心獲利來源是價格來回震盪，而不是單邊趨勢。
+
+- 適合的行情：上下洗盤頻繁，雖然區間淨漲跌不大，但中途波動能持續觸發補倉與止盈。
+- 危險的行情：一去不回頭的單邊趨勢，特別是緩慢陰跌，容易讓加倉層數被打滿並造成長時間套牢。
+
+因此選幣時，應優先尋找「高波動、低趨勢、流動性足夠、下跌過程仍有反彈彈性」的標的。
+
+#### 核心指標解讀
+
+震盪洗盤力道，通常越高越適合馬丁研究：
+
+- `ATR(M)%`：最近約 30 天的平均 true range 百分比，優先使用 `high / low / previous close` 計算；若資料來源缺少 OHLC，才退回 close-to-close 近似。ATR 越高，網格越容易被觸發，也越容易在反彈時止盈。
+- `RV(A)%`：年化已實現波動率，代表幣種整體活躍程度。數值越高，價格行為通常越劇烈。
+
+趨勢與震盪型態，通常越低越好：
+
+- `ER`：Efficiency Ratio，衡量價格走勢偏向震盪或單邊趨勢。`ER` 越接近 `0`，代表越偏向原地震盪；越接近 `1`，代表越偏向單邊趨勢。
+- `Chg%`：掃描區間內的淨漲跌幅。若目標是震盪型標的，可優先觀察約 `-30%` 到 `+30%` 之間的幣種。
+
+套牢與極端下跌風險，通常越低越好：
+
+- `MaxRed`：最大連續收黑 K 線數。連跌次數越高，代表下跌過程越缺乏反彈彈性，馬丁倉位越容易被一路打滿。
+- `MaxDD%`：最大回撤，優先使用 OHLC 的歷史高點到後續低點估算，以反映盤中插針風險；若資料缺少 OHLC，才退回 close-to-close。應避開歷史上動輒下跌 `80%` 到 `90%` 以上的標的，這類標的容易在 regime shift 中讓策略失效。
+
+流動性與防雷條件：
+
+- `MC Rank`：市值排名。建議優先觀察 `Top 50` 內的主流幣，降低深度不足與被單一資金操控的風險。
+- `Vol(M)`：日均成交量。建議至少高於 `20M` 美元，確保進出場與回測假設較接近真實交易環境。
+
+#### 四步選幣流程
+
+1. 先找高波動：在 `volatility_scanner_gui.py` 跑完掃描後，點擊 `ATR(M)%` 或 `RV(A)%` 欄位，由大到小排序，先抓出前 `20` 到 `30` 名高波動標的。
+2. 再篩低趨勢：從高波動名單中，優先保留 `ER < 0.15` 的幣種。這代表它雖然波動大，但更偏向來回震盪，而不是單邊趨勢。
+3. 剔除陰跌標的：檢查 `MaxRed`，避開最大連跌超過 `15` 根 K 線的標的。這類標的在下跌時可能缺少足夠反彈讓倉位解套。
+4. 做最後安全檢查：確認 `MC Rank` 不要過低、`Vol(M)` 足夠、`MaxDD%` 不要深到接近歸零。通過後再丟進主 GUI 做 `Historical Scan` 與 `MC Scan`。
+
+#### 範例對比
+
+| 幣種狀態 | `ATR(M)%` | `ER` | `MaxRed` | 解讀 |
+| --- | --- | --- | --- | --- |
+| 理想震盪標的 | 高，例如 `12%` | 低，例如 `0.05` | 低，例如 `8` | 高波動且低趨勢，適合進一步回測與 MC 壓力測試。 |
+| 單邊趨勢標的 | 高，例如 `10%` | 高，例如 `0.45` | 中等，例如 `10` | 雖然波動大，但方向性太強，逆勢加倉風險高。 |
+| 低效率標的 | 低，例如 `3%` | 低，例如 `0.02` | 中等，例如 `12` | 雖然不是單邊趨勢，但波動不足，資金效率較差。 |
+| 陰跌高風險標的 | 中高，例如 `8%` | 中等，例如 `0.20` | 高，例如 `22` | 下跌時缺少反彈，容易長時間套牢或觸發極端虧損。 |
+
+> 風險提醒：上述指標都是歷史資料統計，無法保證未來仍維持相同行為。實際使用時仍需設定 `max_orders`、總資金風險上限與停損規則，避免無限制扛單。
 
 ---
 
@@ -238,23 +292,16 @@ python martin_gui.py
 python volatility_scanner_gui.py
 ```
 
-執行 CLI smoke test：
-
-```bash
-python test_strategy.py
-```
-
 ---
 
 ## 檔案結構
 
-- `martin.py`：資料抓取、cache、策略回測、Numba grid core、績效指標
+- `martin.py`：資料抓取、OHLCV cache、策略回測、Numba grid core、績效指標
 - `martin_gui.py`：主 GUI，包含 `Historical Scan`、`MC Scan`、`Single Backtest`
 - `mc_sampling.py`：MC 參數抽樣與 refine neighbors
 - `mc_eval.py`：MC path generation、early rejection、two-pass survivor quantile
 - `mc_formatters.py`：MC / historical scan 顯示格式化
 - `volatility_scanner_gui.py`：波動率篩選 GUI
-- `test_strategy.py`：CLI smoke test
 - `requirements.txt`：依賴套件
 - `cache/`：K 線 cache 目錄
 

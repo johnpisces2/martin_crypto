@@ -2,3 +2,4 @@ cache
 __pycache__
 test_*.py
 .vscode
+.DS_Store

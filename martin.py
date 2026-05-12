@@ -89,7 +89,10 @@ def _load_cached_klines(cache_dir: str, base: str, interval: str):
             if k in df.columns and pd.notna(df[k]).any():
                 attrs[k] = str(df[k].dropna().iloc[0])
 
-        ret = df[["time", "close", "volume"]].copy()
+        price_cols = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
+        if "close" not in price_cols:
+            return None
+        ret = df[["time", *price_cols]].copy()
         if attrs:
             ret.attrs = attrs.copy()
         return ret
@@ -158,14 +161,15 @@ def _align_to_interval_end(now_ms: int, step_ms: int) -> int:
 
 
 def _ohlcv_to_taipei_df(ohlcv):
-    """把 ccxt OHLCV 轉成 df[['time','close']] 並轉到 Asia/Taipei；同時去重/排序"""
+    """把 ccxt OHLCV 轉成 Taipei 時區 DataFrame；同時去重/排序。"""
     if not ohlcv:
         return None
     df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
-    df["close"] = df["close"].astype(float)
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = df[col].astype(float)
     df["time"]  = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("Asia/Taipei")
     df = df.drop_duplicates(subset="time").sort_values("time")
-    return df[["time","close","volume"]].copy()
+    return df[["time","open","high","low","close","volume"]].copy()
 
 
 def _find_market_symbol(markets: dict, base: str, prefer_spot=True):
@@ -316,7 +320,11 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
                                 df_new = _ohlcv_to_taipei_df(ohlcv_new)
                                 tmp = pd.concat([cached_df, df_new], ignore_index=True)
                                 tmp = tmp.drop_duplicates(subset="time").sort_values("time")
-                                cached_df = tmp[["time","close","volume"]].copy()
+                                price_cols = [
+                                    c for c in ("open", "high", "low", "close", "volume")
+                                    if c in tmp.columns
+                                ]
+                                cached_df = tmp[["time", *price_cols]].copy()
 
                                 attrs = {
                                     "exchange": name,

@@ -46,6 +46,7 @@ DEFAULT_QUOTE_ASSET = "USDT"
 CHART_CACHE_LIMIT = 12
 COINGECKO_CACHE_TTL = 600
 TICKER_CACHE_TTL = 30
+MIN_HISTORY_COVERAGE_RATIO = 0.80
 
 
 # ===================== 指標計算 (From scan_vol_rank.py) =====================
@@ -64,9 +65,10 @@ def true_atr_pct(df: pd.DataFrame, n: int = 14) -> float:
     req = {"high", "low", "close"}
     if not req.issubset(df.columns):
         return float("nan")
-    h = df["high"].to_numpy(dtype=float)
-    l = df["low"].to_numpy(dtype=float)
-    c = df["close"].to_numpy(dtype=float)
+    ohlc = df[["high", "low", "close"]].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    h = ohlc["high"].to_numpy(dtype=float)
+    l = ohlc["low"].to_numpy(dtype=float)
+    c = ohlc["close"].to_numpy(dtype=float)
     if c.size < n or c[-1] <= 0:
         return float("nan")
     prev_c = np.roll(c, 1)
@@ -78,11 +80,25 @@ def true_atr_pct(df: pd.DataFrame, n: int = 14) -> float:
 
 def approx_atr_pct_from_close(closes: pd.Series, n: int = 14) -> float:
     c = closes.to_numpy(dtype=float)
+    c = c[np.isfinite(c) & (c > 0)]
     if c.size < n + 1 or c[-1] <= 0:
         return float("nan")
     tr = np.abs(np.diff(c))
     atr_last = tr[-n:].mean()
     return float(atr_last / c[-1])
+
+
+def max_drawdown_pct_from_ohlc(df: pd.DataFrame, closes: pd.Series) -> float:
+    if {"high", "low"}.issubset(df.columns):
+        hl = df[["high", "low"]].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+        hl = hl[(hl["high"] > 0) & (hl["low"] > 0)]
+        if not hl.empty:
+            roll_peak = hl["high"].cummax()
+            dd = (hl["low"] - roll_peak) / roll_peak
+            return float(dd.min())
+    roll_max = closes.cummax()
+    dd = (closes - roll_max) / roll_max
+    return float(dd.min())
 
 
 def bb_width_pct(closes: pd.Series, n: int = 20, k: float = 2.0) -> float:
@@ -906,6 +922,21 @@ class VolatilityScannerGUI(QMainWindow):
                 exch_list=[exch_name],
                 refresh_policy="auto",
             )
+            has_complete_ohlc = (
+                df is not None
+                and not df.empty
+                and {"high", "low", "close"}.issubset(df.columns)
+                and not df[["high", "low", "close"]].isna().any().any()
+            )
+            if df is not None and not df.empty and not has_complete_ohlc:
+                df = martin.get_klines(
+                    symbol=base,
+                    interval=interval,
+                    start=start_str,
+                    end=end_str,
+                    exch_list=[exch_name],
+                    refresh_policy="force",
+                )
 
             if df is None or df.empty or len(df) < 50:
                 return None
@@ -918,19 +949,19 @@ class VolatilityScannerGUI(QMainWindow):
             bars_per_year = (365.25 * 24 * 3600) / (step_ms / 1000.0)
             rv_annual = realized_vol_annual_from_closes(closes, bars_per_year)
 
-            atr_p = true_atr_pct(df, n=14)
-            if not np.isfinite(atr_p):
-                atr_p = approx_atr_pct_from_close(closes, n=14)
-
             bars_per_day = 24 * 3600 * 1000 / step_ms
-            atr_daily_est = atr_p * np.sqrt(bars_per_day)
-            atr_monthly_est = atr_daily_est * np.sqrt(30)
+            atr_day_window = max(1, min(len(df), int(round(bars_per_day))))
+            atr_month_window = max(1, min(len(df), int(round(bars_per_day * 30))))
+            atr_daily_est = true_atr_pct(df, n=atr_day_window)
+            if not np.isfinite(atr_daily_est):
+                atr_daily_est = approx_atr_pct_from_close(closes, n=atr_day_window)
+            atr_monthly_est = true_atr_pct(df, n=atr_month_window)
+            if not np.isfinite(atr_monthly_est):
+                atr_monthly_est = approx_atr_pct_from_close(closes, n=atr_month_window)
 
             bbw_p = bb_width_pct(closes, n=20, k=2.0)
 
-            roll_max = closes.cummax()
-            dd = (closes - roll_max) / roll_max
-            max_dd = dd.min()
+            max_dd = max_drawdown_pct_from_ohlc(df, closes)
 
             # Efficiency Ratio (ER)
             abs_net_change = abs(closes.iloc[-1] - closes.iloc[0])
@@ -956,7 +987,10 @@ class VolatilityScannerGUI(QMainWindow):
 
             time_span_days = (df['time'].iloc[-1] - df['time'].iloc[0]).total_seconds() / 86400.0
 
-            if time_span_days < (requested_days - 1) and time_span_days < 30 and not is_manual:
+            required_days = max(1.0, (requested_days - 1) * MIN_HISTORY_COVERAGE_RATIO)
+            if requested_days > 30:
+                required_days = max(30.0, required_days)
+            if time_span_days < required_days and not is_manual:
                 return None
 
             if time_span_days < 0.5:

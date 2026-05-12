@@ -92,6 +92,24 @@ def safe_int(s, default=None):
         return default
 
 
+def validate_strategy_param_arrays(add_drop, tp, multiplier, max_orders):
+    add_drop = np.asarray(add_drop, dtype=np.float64)
+    tp = np.asarray(tp, dtype=np.float64)
+    multiplier = np.asarray(multiplier, dtype=np.float64)
+    max_orders = np.asarray(max_orders, dtype=np.int64)
+    if (
+        np.any(~np.isfinite(add_drop))
+        or np.any(~np.isfinite(tp))
+        or np.any(~np.isfinite(multiplier))
+        or np.any(add_drop <= 0.0)
+        or np.any(add_drop >= 1.0)
+        or np.any(tp <= 0.0)
+        or np.any(multiplier <= 0.0)
+        or np.any(max_orders < 1)
+    ):
+        raise ValueError("策略參數需滿足：0 < add_drop < 1、tp > 0、multiplier > 0、max_orders >= 1")
+
+
 def human_pct(x, digits=2):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return "NaN"
@@ -871,6 +889,8 @@ class MartinGUI(QMainWindow):
         capital = safe_float(capital_edit.text().strip(), 1000.0)
         if not symbol or not interval:
             raise ValueError("請填入 symbol 與 interval")
+        if capital is None or not np.isfinite(capital) or capital <= 0:
+            raise ValueError("capital 必須為正數")
 
         df = self._fetch_klines_if_needed(symbol, interval, start, end, refresh_policy)
         prices_np = df["close"].to_numpy(dtype=np.float64)
@@ -914,6 +934,7 @@ class MartinGUI(QMainWindow):
         mo_arr = parse_range(self.e_max_orders.text(), is_int=True)
         if any(x.size == 0 for x in (add_drop_arr, tp_arr, mul_arr, mo_arr)):
             raise ValueError("掃描參數不得為空（add_drop/tp/multiplier/max_orders）")
+        validate_strategy_param_arrays(add_drop_arr, tp_arr, mul_arr, mo_arr)
 
         AD, MUL, MO, TP = np.meshgrid(add_drop_arr, mul_arr, mo_arr, tp_arr, indexing="ij")
         params_df = pd.DataFrame(
@@ -957,6 +978,7 @@ class MartinGUI(QMainWindow):
         multiplier = unique_params["multiplier"].to_numpy(dtype=np.float64)
         max_orders = unique_params["max_orders"].to_numpy(dtype=np.int32)
         tp = unique_params["tp"].to_numpy(dtype=np.float64)
+        validate_strategy_param_arrays(add_drop, tp, multiplier, max_orders)
         min_buy_ratio = np.maximum(0.0, (1.0 - add_drop) ** (max_orders.astype(np.float64) - 1.0))
 
         fe, mdd, tr, trap = martin._grid_search_parallel(
@@ -997,6 +1019,7 @@ class MartinGUI(QMainWindow):
         mo_arr = parse_range(self.m_max_orders.text(), is_int=True)
         if any(x.size == 0 for x in (add_drop_arr, tp_arr, mul_arr, mo_arr)):
             raise ValueError("掃描參數不得為空（add_drop/tp/multiplier/max_orders）")
+        validate_strategy_param_arrays(add_drop_arr, tp_arr, mul_arr, mo_arr)
 
         mode_text = self.m_sampling_mode.currentText().strip().lower()
         mode = "lhs"
