@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 import matplotlib
 matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 
 # 嘗試匯入 martin.py 以重用 get_klines
@@ -1126,13 +1127,35 @@ class VolatilityScannerGUI(QMainWindow):
         self.thread_pool.start(worker)
 
     def plot_chart(self, df, title):
-        self._chart_line.set_data(df['time'], df['close'])
+        times = pd.to_datetime(df["time"])
+        if getattr(times.dt, "tz", None) is not None:
+            times = times.dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
+        prices = df["close"].astype(float)
+
+        self._chart_line.set_data(times, prices)
         self.ax.relim()
         self.ax.autoscale_view()
+        if len(times) > 0:
+            self.ax.set_xlim(times.iloc[0], times.iloc[-1])
+
+        locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+        if len(times) >= 2:
+            span_days = (times.iloc[-1] - times.iloc[0]).total_seconds() / 86400.0
+        else:
+            span_days = 0.0
+        if span_days <= 3:
+            date_fmt = "%m-%d %H:%M"
+        elif span_days <= 180:
+            date_fmt = "%Y-%m-%d"
+        else:
+            date_fmt = "%Y-%m"
+        self.ax.xaxis.set_major_locator(locator)
+        self.ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt))
         self.ax.set_title(f"{title} - {self.cb_interval.currentText()}")
-        self.ax.set_xlabel("Time")
+        self.ax.set_xlabel("Date")
         self.ax.set_ylabel("Price")
         self.ax.grid(True, alpha=0.3)
+        self.fig.autofmt_xdate(rotation=30, ha="right")
         self.canvas.draw_idle()
 
     def resizeEvent(self, event):
