@@ -46,6 +46,8 @@ except Exception as e:
 DEFAULT_QUOTE_ASSET = "USDT"
 CHART_CACHE_LIMIT = 12
 COINGECKO_CACHE_TTL = 600
+COINGECKO_PAGE_SIZE = 250
+COINGECKO_RANK_LOOKUP_LIMIT = 1000
 TICKER_CACHE_TTL = 30
 MIN_HISTORY_COVERAGE_RATIO = 0.80
 
@@ -119,36 +121,41 @@ def fetch_top_mc_coins(limit=250):
     Fetch top N coins by market cap from CoinGecko.
     Returns a dict: { symbol_lowercase: rank }
     """
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": min(limit, 250),
-        "page": 1,
-        "sparkline": "false",
-    }
+    limit = max(0, int(limit))
+    if limit == 0:
+        return {}
 
+    url = "https://api.coingecko.com/api/v3/coins/markets"
     mapping = {}
     try:
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            for item in data:
-                sym = item['symbol'].lower()
-                if sym not in mapping:
-                    mapping[sym] = item['market_cap_rank']
-
-        if limit > 250:
-            params["page"] = 2
-            params["per_page"] = limit - 250
-            time.sleep(1.0)
+        total_pages = math.ceil(limit / COINGECKO_PAGE_SIZE)
+        for page in range(1, total_pages + 1):
+            remaining = limit - ((page - 1) * COINGECKO_PAGE_SIZE)
+            params = {
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": min(remaining, COINGECKO_PAGE_SIZE),
+                "page": page,
+                "sparkline": "false",
+            }
             resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                for item in data:
-                    sym = item['symbol'].lower()
-                    if sym not in mapping:
-                        mapping[sym] = item['market_cap_rank']
+            if resp.status_code != 200:
+                break
+
+            data = resp.json()
+            if not data:
+                break
+
+            for item in data:
+                sym = str(item.get('symbol') or "").lower()
+                rank = item.get('market_cap_rank')
+                if sym and rank and sym not in mapping:
+                    mapping[sym] = int(rank)
+
+            if len(data) < params["per_page"]:
+                break
+            if page < total_pages:
+                time.sleep(1.0)
 
         return mapping
     except Exception as e:
@@ -762,11 +769,14 @@ class VolatilityScannerGUI(QMainWindow):
         max_rank = int(self.e_max_rank.text())
 
         mc_mapping = {}
-        if use_mc_filter:
-            signals.log.emit("Fetching Market Cap Rank from CoinGecko...")
-            mc_mapping = self._get_cached_mc_mapping(limit=max(max_rank, 250))
-            if not mc_mapping:
+        rank_lookup_limit = max(max_rank, COINGECKO_RANK_LOOKUP_LIMIT)
+        signals.log.emit("Fetching Market Cap Rank from CoinGecko...")
+        mc_mapping = self._get_cached_mc_mapping(limit=rank_lookup_limit)
+        if not mc_mapping:
+            if use_mc_filter:
                 signals.log.emit("Warning: CoinGecko fetch failed. MC filter ignored.")
+            else:
+                signals.log.emit("Warning: CoinGecko fetch failed. MC Rank will show '-'.")
 
         signals.log.emit(f"Fetching tickers from {exch_name}...")
 
@@ -797,25 +807,19 @@ class VolatilityScannerGUI(QMainWindow):
                 if symbol == f"{base}/{quote_asset}":
                     manual_pairs_found.add(symbol)
 
+            rank = -1
+            if mc_mapping:
+                base_lower = base.lower()
+                if base_lower in mc_mapping:
+                    rank = mc_mapping[base_lower]
+
             if not is_manual:
                 if is_stablecoin_base(base):
                     continue
 
-                rank = -1
-                if mc_mapping:
-                    base_lower = base.lower()
-                    if base_lower in mc_mapping:
-                        rank = mc_mapping[base_lower]
-                        if rank > max_rank:
-                            continue
-                    else:
+                if use_mc_filter and mc_mapping:
+                    if rank <= 0 or rank > max_rank:
                         continue
-            else:
-                rank = -1
-                if mc_mapping:
-                    base_lower = base.lower()
-                    if base_lower in mc_mapping:
-                        rank = mc_mapping[base_lower]
 
             vol = ticker.get('quoteVolume') or 0
             if not is_manual and vol < min_vol_pre:
