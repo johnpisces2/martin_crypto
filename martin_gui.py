@@ -4,6 +4,7 @@
 
 import traceback
 import os
+import threading
 from collections import OrderedDict
 
 import numpy as np
@@ -12,7 +13,7 @@ import pandas as pd
 os.environ.setdefault("QT_API", "pyside6")
 
 from PySide6.QtCore import Qt, QDate, QAbstractTableModel, QModelIndex, QThreadPool, QRunnable, QObject, Signal, Slot, QTimer
-from PySide6.QtGui import QFont, QFontMetrics
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPalette
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLineEdit, QComboBox, QPushButton, QLabel, QSplitter, QTextEdit,
@@ -36,14 +37,28 @@ except Exception as e:
     _import_error = e
 
 from mc_sampling import sample_parameter_grid, refine_neighbors
-from mc_eval import eval_candidates_parallel, bootstrap_path_from_returns
+from mc_eval import (
+    eval_candidates_parallel,
+    bootstrap_ohlc_path_from_ratios,
+    ohlc_ratios_from_history,
+)
 from mc_formatters import format_hist_scan_display, format_hist_scan_csv, format_mc_scan_display
+from market_data import pionex, universe
 
 
-CRYPTO_SYMBOLS = ["PUMP", "ASTER", "BONK", "ENA", "PEPE", "WLD", "WLFI", "ZEC", "TRUMP", "TAO", "SUI", "HBAR", "UNI",
-                  "NEAR", "FIL", "APT", "ARB", "DOGE", "SHIB", "ADA", "AVAX", "LINK", "XRP", "SOL", "LTC", "ETH",
-                  "BNB", "TRX", "BCH", "BTC"]
+PIONEX_STOCK_SYMBOLS_FALLBACK = [
+    "AAPLX", "AMZNX", "BMNRX", "CRCLX", "GOOGLX", "METAX", "NVDAX",
+    "QQQX", "SLVX", "SPYX", "TSLAX", "USOX",
+]
+CRYPTO_SYMBOLS = [
+    "ASTER", "BONK", "ENA", "PEPE", "WLD", "ZEC", "TAO", "SUI", "HBAR",
+    "UNI", "NEAR", "FIL", "APT", "ARB",
+    "DOGE", "SHIB", "ADA", "AVAX", "LINK", "XRP", "SOL", "LTC", "ETH",
+    "BNB", "TRX", "BCH", "BTC",
+]
+DEFAULT_SYMBOLS = PIONEX_STOCK_SYMBOLS_FALLBACK + CRYPTO_SYMBOLS
 CRYPTO_INTERVALS = ["15m", "1h", "4h", "1d"]
+DATA_SOURCES = ["auto", "binance", "pionex"]
 DEFAULT_REFRESH_POLICY = "auto"
 DEFAULT_FEE_RATE = 0.0005
 DEFAULT_FEE_LABEL = "0.05%"
@@ -64,6 +79,8 @@ def parse_range(s: str, is_int=False):
     c = (int(c) if is_int else float(c))
     if c == 0:
         raise ValueError("step 不可為 0")
+    if (b - a) * c < 0:
+        raise ValueError("step 方向必須能由 start 走到 end")
     if is_int:
         return np.arange(a, b + (1 if c > 0 else -1), c, dtype=int)
     vals = []
@@ -72,9 +89,13 @@ def parse_range(s: str, is_int=False):
     if forward:
         while x <= b + 1e-12:
             vals.append(x); x += c
+            if len(vals) > 2_000_000:
+                raise ValueError("單一參數範圍超過 2,000,000 個值")
     else:
         while x >= b - 1e-12:
             vals.append(x); x += c
+            if len(vals) > 2_000_000:
+                raise ValueError("單一參數範圍超過 2,000,000 個值")
     return np.array(vals, dtype=float)
 
 
@@ -108,12 +129,15 @@ def validate_strategy_param_arrays(add_drop, tp, multiplier, max_orders):
         or np.any(max_orders < 1)
     ):
         raise ValueError("策略參數需滿足：0 < add_drop < 1、tp > 0、multiplier > 0、max_orders >= 1")
+    for mul in np.unique(multiplier):
+        for mo in np.unique(max_orders):
+            martin._order_factor_sum(float(mul), int(mo))
 
 
 def human_pct(x, digits=2):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
+    if x is None or pd.isna(x):
         return "NaN"
-    if isinstance(x, float) and np.isinf(x):
+    if np.isinf(float(x)):
         return "∞"
     return f"{x * 100:.{digits}f}%"
 
@@ -136,9 +160,16 @@ class Worker(QRunnable):
     def run(self):
         try:
             result = self.fn(*self.args, **self.kwargs)
-            self.signals.finished.emit(result)
         except Exception:
-            self.signals.error.emit(traceback.format_exc())
+            try:
+                self.signals.error.emit(traceback.format_exc())
+            except RuntimeError:
+                pass  # Window/signals may have been deleted during shutdown.
+        else:
+            try:
+                self.signals.finished.emit(result)
+            except RuntimeError:
+                pass  # Window/signals may have been deleted during shutdown.
 
 
 class DataFrameTableModel(QAbstractTableModel):
@@ -204,7 +235,7 @@ class DataFrameTableModel(QAbstractTableModel):
         series = self._frame[col_name].copy()
         if series.dtype == object or series.dtype == str:
             # Clean common formatted strings (e.g., '10.5%', 'N/A', 'Y', 'N', commas)
-            cleaned = series.astype(str).str.replace(r'[%$ ,]', '', regex=True)
+            cleaned = series.astype(str).str.replace(r'[≥%$ ,]', '', regex=True)
             # Map 'Y' to 1 and 'N' to 0 for feasible columns
             cleaned = cleaned.replace({'Y': '1', 'N': '0', 'N/A': '-inf'})
             numeric_series = pd.to_numeric(cleaned, errors='coerce')
@@ -222,11 +253,12 @@ class DataFrameTableModel(QAbstractTableModel):
 class MartinGUI(QMainWindow):
     INIT_SPLIT = 0.70
     BACKTEST_CACHE_LIMIT = 24
+    DATA_CACHE_LIMIT = 8
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("martin_gui")
-        self.resize(1030, 920)
+        self.resize(1280, 920)
 
         self.thread_pool = QThreadPool.globalInstance()
 
@@ -245,22 +277,27 @@ class MartinGUI(QMainWindow):
         self.nb.addTab(self.tab_single, "Single Backtest")
 
         # shared cache
-        self.last_df = None
-        self.last_df_key = None
+        self._cache_lock = threading.RLock()
+        self._data_cache = OrderedDict()
         self.scan_df = None
         self.mc_scan_df = None
         self._mc_executor = None
         self._mc_executor_workers = 0
         self._backtest_cache = OrderedDict()
         self._plot_states = {}
+        self._pionex_stock_symbols = list(PIONEX_STOCK_SYMBOLS_FALLBACK)
+        self._pionex_symbols_loading = False
+        self._pionex_symbols_loaded = False
 
         self._build_scan_tab()
         self._build_mc_scan_tab()
         self._build_single_tab()
+        self._connect_source_symbol_lists()
 
         self.nb.currentChanged.connect(self._on_main_tab_changed)
 
         self._apply_style()
+        QTimer.singleShot(0, self._fit_initial_window_to_screen)
         QTimer.singleShot(0, self._autosize_scan_table_columns)
         QTimer.singleShot(0, self._autosize_mc_scan_table_columns)
 
@@ -287,8 +324,16 @@ class MartinGUI(QMainWindow):
             QLabel#feeHintLabel { color: #d6d6d6; font-size: 10.5pt; padding: 0 6px; }
             QLineEdit, QComboBox, QTextEdit, QDateEdit {
                 background: #ffffff; color: #1d1d1d; border: 1px solid #b9b9b9; border-radius: 6px; padding: 4px 6px;
+                selection-background-color: #2d6a7a; selection-color: #ffffff;
             }
+            QDateEdit:disabled { background: #e8e8e8; color: #555555; }
+            QDateEdit::drop-down { background: #f2f2f2; border-left: 1px solid #c5c5c5; width: 24px; }
             QComboBox QAbstractItemView, QDateEdit QAbstractItemView { background: #ffffff; color: #1d1d1d; }
+            QCalendarWidget QWidget { background: #ffffff; color: #1d1d1d; }
+            QCalendarWidget QAbstractItemView:enabled {
+                background: #ffffff; color: #1d1d1d;
+                selection-background-color: #2d6a7a; selection-color: #ffffff;
+            }
             QTableWidget, QTableView { background: #ffffff; color: #1d1d1d; border: 1px solid #7c7c7c; border-radius: 8px; gridline-color: #d0d0d0; }
             QTableWidget::item:selected, QTableView::item:selected { font-weight: 400; }
             QHeaderView::section { background: #e9e9e9; color: #1d1d1d; padding: 6px; border: 0px; }
@@ -372,12 +417,42 @@ class MartinGUI(QMainWindow):
         start_date = end_date.addYears(-2)
         return start_date, end_date
 
+    def _fit_initial_window_to_screen(self):
+        """Use available WSL display space while keeping forms readable."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        min_width = min(1180, max(800, available.width() - 40))
+        min_height = min(720, max(580, available.height() - 60))
+        target_width = min(1550, max(min_width, int(available.width() * 0.92)))
+        target_height = min(980, max(min_height, int(available.height() * 0.92)))
+        self.setMinimumSize(min_width, min_height)
+        self.resize(target_width, target_height)
+
+    @staticmethod
+    def _apply_date_edit_palette(date_edit: QDateEdit):
+        """Keep date text readable under WSL/Linux dark Qt themes."""
+        palette = date_edit.palette()
+        palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#1d1d1d"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#f2f2f2"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#1d1d1d"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#2d6a7a"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(
+            QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#555555")
+        )
+        date_edit.setPalette(palette)
+
     def _add_date_edit(self, form: QFormLayout, label: str, default_date: QDate, width=140):
         e = QDateEdit()
         e.setCalendarPopup(True)
         e.setDisplayFormat("yyyy/MM/dd")
         e.setDate(default_date)
-        e.setMinimumWidth(width)
+        date_text_width = e.fontMetrics().horizontalAdvance("0000/00/00")
+        e.setMinimumWidth(max(width, date_text_width + 52))
+        self._apply_date_edit_palette(e)
         self._add_form_row(form, label, e)
         return e
 
@@ -401,6 +476,137 @@ class MartinGUI(QMainWindow):
         self._add_form_row(form, label, cb)
         return cb
 
+    @staticmethod
+    def _replace_combobox_items(combo: QComboBox, values):
+        """Replace suggestions without discarding editable/manual input."""
+        current = combo.currentText().strip()
+        unique_values = list(dict.fromkeys(str(value).strip().upper() for value in values if value))
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItems(unique_values)
+            if current:
+                combo.setCurrentText(current)
+        finally:
+            combo.blockSignals(False)
+
+    def _connect_source_symbol_lists(self):
+        self._source_symbol_pairs = [
+            (self.e_source, self.e_symbol),
+            (self.m_source, self.m_symbol),
+            (self.s_source, self.s_symbol),
+        ]
+        for source_combo, symbol_combo in self._source_symbol_pairs:
+            source_combo.currentTextChanged.connect(
+                lambda text, combo=symbol_combo: self._on_source_changed(text, combo)
+            )
+            self._on_source_changed(source_combo.currentText(), symbol_combo)
+
+        self._source_range_controls = [
+            (self.e_source, self.e_interval, self.e_start, self.e_end),
+            (self.m_source, self.m_interval, self.m_start, self.m_end),
+            (self.s_source, self.s_interval, self.s_start, self.s_end),
+        ]
+        for source_combo, interval_combo, start_edit, end_edit in self._source_range_controls:
+            source_combo.currentTextChanged.connect(
+                lambda _text, s=source_combo, i=interval_combo, a=start_edit, b=end_edit:
+                    self._shorten_pionex_date_range(s, i, a, b)
+            )
+            interval_combo.currentTextChanged.connect(
+                lambda _text, s=source_combo, i=interval_combo, a=start_edit, b=end_edit:
+                    self._shorten_pionex_date_range(s, i, a, b)
+            )
+            end_edit.dateChanged.connect(
+                lambda _date, s=source_combo, i=interval_combo, a=start_edit, b=end_edit:
+                    self._shorten_pionex_date_range(s, i, a, b)
+            )
+            self._shorten_pionex_date_range(
+                source_combo, interval_combo, start_edit, end_edit
+            )
+
+    def _shorten_pionex_date_range(
+        self, source_combo, interval_combo, start_edit, end_edit
+    ):
+        """Keep explicit Pionex requests within its 10,000-candle window."""
+        if source_combo.currentText().strip().lower() != "pionex":
+            start_edit.setToolTip("")
+            return
+        step_ms = martin._interval_ms(interval_combo.currentText().strip())
+        # Date inputs include both Start and End calendar days. Reserve one day
+        # from the raw bar span so even a completed historical End date remains
+        # within the inclusive 10,000-candle request.
+        max_span_days = max(
+            1,
+            int((pionex.PIONEX_MAX_KLINES * step_ms) // 86_400_000) - 1,
+        )
+        end_date = end_edit.date()
+        earliest = end_date.addDays(-max_span_days)
+        if start_edit.date() < earliest:
+            start_edit.setDate(earliest)
+            self._set_status(
+                f"Pionex {interval_combo.currentText()} 公開歷史上限為 "
+                f"{pionex.PIONEX_MAX_KLINES:,} 根；Start 已縮短至 "
+                f"{earliest.toString('yyyy/MM/dd')}。"
+            )
+        start_edit.setToolTip(
+            "Pionex 公開 K 線最多 10,000 根；若商品上市較晚，會使用實際可取得的部分資料。"
+        )
+
+    def _on_source_changed(self, source_name: str, symbol_combo: QComboBox):
+        source = str(source_name or "").strip().lower()
+        if source == "pionex":
+            self._replace_combobox_items(
+                symbol_combo, self._pionex_stock_symbols + CRYPTO_SYMBOLS
+            )
+            symbol_combo.setToolTip(
+                "Pionex 股票／ETF／RWA 代幣會從公開市場清單自動更新；亦可手動輸入。"
+            )
+            self._request_pionex_stock_symbols()
+        else:
+            suggestions = DEFAULT_SYMBOLS if source == "auto" else CRYPTO_SYMBOLS
+            self._replace_combobox_items(symbol_combo, suggestions)
+            symbol_combo.setToolTip("可從清單選擇，亦可手動輸入交易對 base symbol。")
+
+    def _request_pionex_stock_symbols(self):
+        if self._pionex_symbols_loaded or self._pionex_symbols_loading:
+            return
+        self._pionex_symbols_loading = True
+        self._set_status("Loading Pionex stock/RWA symbols…")
+        worker = Worker(self._fetch_pionex_stock_symbols)
+        worker.signals.finished.connect(self._on_pionex_stock_symbols_loaded)
+        worker.signals.error.connect(self._on_pionex_stock_symbols_error)
+        self.thread_pool.start(worker)
+
+    @staticmethod
+    def _fetch_pionex_stock_symbols():
+        client = pionex.PionexPublicClient()
+        try:
+            markets = client.load_markets()
+            return universe.listed_stock_token_bases(markets)
+        finally:
+            client.close()
+
+    @Slot(object)
+    def _on_pionex_stock_symbols_loaded(self, symbols):
+        self._pionex_symbols_loading = False
+        loaded = list(symbols or [])
+        if not loaded:
+            self._set_status("Pionex stock list is empty; using built-in fallback list.")
+            return
+        self._pionex_symbols_loaded = True
+        self._pionex_stock_symbols = loaded
+        for source_combo, symbol_combo in self._source_symbol_pairs:
+            if source_combo.currentText().strip().lower() == "pionex":
+                self._replace_combobox_items(
+                    symbol_combo, self._pionex_stock_symbols + CRYPTO_SYMBOLS
+                )
+        self._set_status(f"Loaded {len(loaded)} Pionex stock/RWA symbols.")
+
+    @Slot(str)
+    def _on_pionex_stock_symbols_error(self, _traceback_text):
+        self._pionex_symbols_loading = False
+        self._set_status("Pionex stock list unavailable; using built-in fallback list.")
+
     # ---------- scan tab ----------
     def _build_scan_tab(self):
         layout = QVBoxLayout(self.tab_hist_scan)
@@ -418,7 +624,9 @@ class MartinGUI(QMainWindow):
         top.addWidget(gb_filter)
 
         form_data = QFormLayout(gb_data)
-        self.e_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="XRP")
+        self.e_source = self._add_combobox(form_data, "Source:", DATA_SOURCES, default="auto")
+        self.e_symbol = self._add_combobox(form_data, "Symbol:", DEFAULT_SYMBOLS, default="XRP")
+        self.e_symbol.setEditable(True)
         self.e_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
         self.e_start = self._add_date_edit(form_data, "Start:", default_start)
         self.e_end = self._add_date_edit(form_data, "End:", default_end)
@@ -428,7 +636,7 @@ class MartinGUI(QMainWindow):
         self.e_add_drop = self._add_entry(form_grid, "add_drop:", "0.010:0.080:0.001")
         self.e_tp = self._add_entry(form_grid, "tp:", "0.010:0.080:0.001")
         self.e_multiplier = self._add_entry(form_grid, "multiplier:", "1.5:2.0:0.1")
-        self.e_max_orders = self._add_entry(form_grid, "max_orders:", "5:10:1")
+        self.e_max_orders = self._add_entry(form_grid, "max_orders:", "5:12:1")
 
         form_filter = QFormLayout(gb_filter)
         self.e_min_trades = self._add_entry(form_filter, "min_trades:", "104")
@@ -439,6 +647,7 @@ class MartinGUI(QMainWindow):
         btn_row = QHBoxLayout()
         layout.addLayout(btn_row)
         btn_run = QPushButton("Run Scan")
+        self.btn_hist_run = btn_run
         btn_run.setObjectName("btnPrimary")
         btn_csv = QPushButton("Save Result as CSV")
         btn_csv.setObjectName("btnInfo")
@@ -534,7 +743,9 @@ class MartinGUI(QMainWindow):
         top.addWidget(gb_risk)
 
         form_data = QFormLayout(gb_data)
-        self.m_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="XRP")
+        self.m_source = self._add_combobox(form_data, "Source:", DATA_SOURCES, default="auto")
+        self.m_symbol = self._add_combobox(form_data, "Symbol:", DEFAULT_SYMBOLS, default="XRP")
+        self.m_symbol.setEditable(True)
         self.m_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
         self.m_start = self._add_date_edit(form_data, "Start:", default_start)
         self.m_end = self._add_date_edit(form_data, "End:", default_end)
@@ -544,7 +755,7 @@ class MartinGUI(QMainWindow):
         self.m_add_drop = self._add_entry(form_grid, "add_drop:", "0.010:0.080:0.001")
         self.m_tp = self._add_entry(form_grid, "tp:", "0.010:0.080:0.001")
         self.m_multiplier = self._add_entry(form_grid, "multiplier:", "1.5:2.0:0.1")
-        self.m_max_orders = self._add_entry(form_grid, "max_orders:", "5:10:1")
+        self.m_max_orders = self._add_entry(form_grid, "max_orders:", "5:12:1")
         self.m_sampling_mode = self._add_combobox(
             form_grid,
             "Sampling:",
@@ -567,6 +778,7 @@ class MartinGUI(QMainWindow):
         self.m_mc_block = self._add_entry(form_mc, "Block size:", "672")
         self.m_mc_seed = self._add_entry(form_mc, "Seed:", "42")
         self.m_mc_seed_runs = self._add_entry(form_mc, "Seed runs:", "1")
+        self.m_mc_holdout = self._add_entry(form_mc, "MC holdout(%):", "30")
         self.m_mc_workers = self._add_entry(form_mc, "Workers (0=auto):", "0")
         self.m_rank_by = self._add_combobox(
             form_mc,
@@ -576,13 +788,14 @@ class MartinGUI(QMainWindow):
         )
 
         form_risk = QFormLayout(gb_risk)
-        self.m_max_loss = self._add_entry(form_risk, "Max P(loss)%:", "100")
-        self.m_max_severe = self._add_entry(form_risk, "Max P(severe)%:", "100")
-        self.m_max_dd50 = self._add_entry(form_risk, "Max P(DD>50)%:", "100")
+        self.m_max_loss = self._add_entry(form_risk, "Max P(loss)%:", "30")
+        self.m_max_severe = self._add_entry(form_risk, "Max P(severe)%:", "10")
+        self.m_max_dd50 = self._add_entry(form_risk, "Max P(DD>50)%:", "20")
 
         btn_row = QHBoxLayout()
         layout.addLayout(btn_row)
         btn_run = QPushButton("Run Scan")
+        self.btn_mc_run = btn_run
         btn_run.setObjectName("btnPrimary")
         btn_csv = QPushButton("Save Result as CSV")
         btn_csv.setObjectName("btnInfo")
@@ -701,7 +914,9 @@ class MartinGUI(QMainWindow):
         top.addStretch(1)
 
         form_data = QFormLayout(gb_data)
-        self.s_symbol = self._add_combobox(form_data, "Symbol:", CRYPTO_SYMBOLS, default="XRP")
+        self.s_source = self._add_combobox(form_data, "Source:", DATA_SOURCES, default="auto")
+        self.s_symbol = self._add_combobox(form_data, "Symbol:", DEFAULT_SYMBOLS, default="XRP")
+        self.s_symbol.setEditable(True)
         self.s_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
         self.s_start = self._add_date_edit(form_data, "Start:", default_start)
         self.s_end = self._add_date_edit(form_data, "End:", default_end)
@@ -722,8 +937,10 @@ class MartinGUI(QMainWindow):
         btn_row = QHBoxLayout()
         layout.addLayout(btn_row)
         btn_run = QPushButton("Execute Single Backtest and Plot")
+        self.btn_single_run = btn_run
         btn_run.setObjectName("btnPrimary")
         btn_mc = QPushButton("Run Monte Carlo")
+        self.btn_single_mc = btn_mc
         btn_mc.setObjectName("btnInfo")
         btn_clear = QPushButton("Clear Results")
         btn_clear.setObjectName("btnDanger")
@@ -779,26 +996,52 @@ class MartinGUI(QMainWindow):
     def closeEvent(self, event):
         try:
             if self._mc_executor is not None:
-                self._mc_executor.shutdown(wait=False, cancel_futures=False)
+                self._mc_executor.shutdown(wait=False, cancel_futures=True)
                 self._mc_executor = None
                 self._mc_executor_workers = 0
         finally:
             super().closeEvent(event)
 
     # ---------- data ----------
-    def _fetch_klines_if_needed(self, symbol, interval, start, end, refresh_policy):
-        key = (symbol, interval, start, end, refresh_policy)
-        if self.last_df is not None and self.last_df_key == key:
-            return self.last_df
-        df = martin.get_klines(symbol=symbol, interval=interval, start=start, end=end,
-                               cache_dir=martin.DEFAULT_CACHE_DIR, use_cache=True,
-                               refresh_policy=refresh_policy)
-        self.last_df = df
-        self.last_df_key = key
+    def _refresh_generation(self, interval, refresh_policy):
+        if str(refresh_policy).lower() != "auto":
+            return None
+        now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+        return martin._align_to_interval_end(now_ms, martin._interval_ms(interval))
+
+    def _fetch_klines_if_needed(self, symbol, interval, start, end, refresh_policy, source="auto"):
+        source = str(source or "auto").strip().lower()
+        key = (
+            symbol, interval, start, end, refresh_policy, source,
+            self._refresh_generation(interval, refresh_policy),
+        )
+        with self._cache_lock:
+            cached = self._data_cache.get(key)
+            if cached is not None:
+                self._data_cache.move_to_end(key)
+                return cached
+            # Serialize cache misses so two tabs cannot concurrently overwrite
+            # the same parquet file or pair one request key with another frame.
+            df = martin.get_klines(
+                symbol=symbol,
+                interval=interval,
+                start=start,
+                end=end,
+                cache_dir=martin.DEFAULT_CACHE_DIR,
+                use_cache=True,
+                refresh_policy=refresh_policy,
+                exch_list=None if source == "auto" else [source],
+                allow_partial_sources=("pionex",),
+            )
+            self._data_cache[key] = df
+            self._data_cache.move_to_end(key)
+            while len(self._data_cache) > self.DATA_CACHE_LIMIT:
+                self._data_cache.popitem(last=False)
         return df
 
     def _make_backtest_cache_key(
-        self, symbol, interval, start, end, refresh_policy, fee_rate, capital, add_drop, multiplier, max_orders, tp
+        self, symbol, interval, start, end, refresh_policy, fee_rate, capital,
+        add_drop, multiplier, max_orders, tp, source="auto",
     ):
         return (
             symbol,
@@ -812,20 +1055,24 @@ class MartinGUI(QMainWindow):
             float(multiplier),
             int(max_orders),
             float(tp),
+            str(source or "auto").lower(),
+            self._refresh_generation(interval, refresh_policy),
         )
 
     def _get_cached_backtest(self, key):
-        cached = self._backtest_cache.get(key)
-        if cached is None:
-            return None
-        self._backtest_cache.move_to_end(key)
-        return cached
+        with self._cache_lock:
+            cached = self._backtest_cache.get(key)
+            if cached is None:
+                return None
+            self._backtest_cache.move_to_end(key)
+            return cached
 
     def _store_cached_backtest(self, key, value):
-        self._backtest_cache[key] = value
-        self._backtest_cache.move_to_end(key)
-        while len(self._backtest_cache) > self.BACKTEST_CACHE_LIMIT:
-            self._backtest_cache.popitem(last=False)
+        with self._cache_lock:
+            self._backtest_cache[key] = value
+            self._backtest_cache.move_to_end(key)
+            while len(self._backtest_cache) > self.BACKTEST_CACHE_LIMIT:
+                self._backtest_cache.popitem(last=False)
 
     def _get_plot_state(self, figure, canvas, with_mc: bool):
         state = self._plot_states.get(canvas)
@@ -871,11 +1118,105 @@ class MartinGUI(QMainWindow):
 
     # ---------- scan ----------
     def run_scan(self):
+        try:
+            config = self._capture_scan_config()
+        except Exception:
+            self._show_error(traceback.format_exc())
+            return
         self._set_status("Scanning…（首次可能較慢，numba 正在編譯）")
-        worker = Worker(self._scan_compute)
+        self.btn_hist_run.setEnabled(False)
+        worker = Worker(self._scan_compute, config)
         worker.signals.finished.connect(self._scan_update_ui)
         worker.signals.error.connect(self._show_error)
         self.thread_pool.start(worker)
+
+    def _capture_data_config(
+        self, symbol_cb, source_cb, interval_cb, start_edit, end_edit, capital_edit
+    ):
+        start, end = self._get_date_range_strings(start_edit, end_edit)
+        return {
+            "symbol": symbol_cb.currentText().strip(),
+            "source": source_cb.currentText().strip().lower(),
+            "interval": interval_cb.currentText().strip(),
+            "start": start,
+            "end": end,
+            "refresh_policy": DEFAULT_REFRESH_POLICY,
+            "fee_rate": DEFAULT_FEE_RATE,
+            "capital": safe_float(capital_edit.text().strip(), None),
+        }
+
+    def _capture_scan_config(self):
+        config = self._capture_data_config(
+            self.e_symbol, self.e_source, self.e_interval, self.e_start, self.e_end, self.e_capital
+        )
+        config.update({
+            "add_drop_range": self.e_add_drop.text(),
+            "tp_range": self.e_tp.text(),
+            "multiplier_range": self.e_multiplier.text(),
+            "max_orders_range": self.e_max_orders.text(),
+            "min_trades": self.e_min_trades.text(),
+            "max_dd": self.e_max_dd.text(),
+            "max_trap": self.e_max_trap.text(),
+            "topn": self.e_topn.text(),
+        })
+        return config
+
+    def _capture_mc_scan_config(self):
+        config = self._capture_data_config(
+            self.m_symbol, self.m_source, self.m_interval, self.m_start, self.m_end, self.m_capital
+        )
+        config.update({
+            "add_drop_range": self.m_add_drop.text(),
+            "tp_range": self.m_tp.text(),
+            "multiplier_range": self.m_multiplier.text(),
+            "max_orders_range": self.m_max_orders.text(),
+            "sampling_mode": self.m_sampling_mode.currentText(),
+            "sample_size": self.m_sample_size.text(),
+            "refine_pct": self.m_refine_pct.text(),
+            "max_combos": self.m_max_combos.text(),
+            "hist_min_trades": self.m_hist_min_trades.text(),
+            "hist_max_trap": self.m_hist_max_trap.text(),
+            "show_topn": self.m_show_topn.text(),
+            "mc_paths": self.m_mc_paths.text(),
+            "mc_days": self.m_mc_days.text(),
+            "mc_block": self.m_mc_block.text(),
+            "mc_seed": self.m_mc_seed.text(),
+            "seed_runs": self.m_mc_seed_runs.text(),
+            "holdout_pct": self.m_mc_holdout.text(),
+            "workers": self.m_mc_workers.text(),
+            "max_loss": self.m_max_loss.text(),
+            "max_severe": self.m_max_severe.text(),
+            "max_dd50": self.m_max_dd50.text(),
+            "rank_mode": self.m_rank_by.currentText(),
+        })
+        return config
+
+    def _collect_context_from_config(self, config):
+        symbol = str(config["symbol"]).strip()
+        interval = str(config["interval"]).strip()
+        capital = config.get("capital")
+        if not symbol or not interval:
+            raise ValueError("請填入 symbol 與 interval")
+        if capital is None or not np.isfinite(capital) or capital <= 0:
+            raise ValueError("capital 必須為正數")
+        df = self._fetch_klines_if_needed(
+            symbol, interval, config["start"], config["end"], config["refresh_policy"],
+            config.get("source", "auto"),
+        )
+        prices_np = df["close"].to_numpy(dtype=np.float64)
+        required = {"open", "high", "low", "close"}
+        if prices_np.size < 2 or not required.issubset(df.columns):
+            raise ValueError("需要至少 2 根完整 OHLC K 線")
+        return {
+            **config,
+            "capital": float(capital),
+            "fee_rate": float(config["fee_rate"]),
+            "df": df,
+            "prices_np": prices_np,
+            "opens_np": df["open"].to_numpy(dtype=np.float64),
+            "highs_np": df["high"].to_numpy(dtype=np.float64),
+            "lows_np": df["low"].to_numpy(dtype=np.float64),
+        }
 
     def _collect_context_from_inputs(
         self, symbol_cb, interval_cb, start_edit, end_edit, capital_edit
@@ -896,6 +1237,9 @@ class MartinGUI(QMainWindow):
         prices_np = df["close"].to_numpy(dtype=np.float64)
         if prices_np.size < 2:
             raise ValueError("K 線資料不足（<2 根），無法回測/掃描。")
+        required = {"open", "high", "low", "close"}
+        if not required.issubset(df.columns):
+            raise ValueError("歷史回測需要完整 OHLC，請重新抓取資料。")
 
         return {
             "symbol": symbol,
@@ -907,6 +1251,9 @@ class MartinGUI(QMainWindow):
             "capital": float(capital),
             "df": df,
             "prices_np": prices_np,
+            "opens_np": df["open"].to_numpy(dtype=np.float64),
+            "highs_np": df["high"].to_numpy(dtype=np.float64),
+            "lows_np": df["low"].to_numpy(dtype=np.float64),
         }
 
     def _collect_scan_context(self):
@@ -927,34 +1274,45 @@ class MartinGUI(QMainWindow):
             self.m_capital,
         )
 
-    def _compute_filtered_scan_results(self, prices_np, capital, fee_rate):
-        add_drop_arr = parse_range(self.e_add_drop.text())
-        tp_arr = parse_range(self.e_tp.text())
-        mul_arr = parse_range(self.e_multiplier.text())
-        mo_arr = parse_range(self.e_max_orders.text(), is_int=True)
+    def _compute_filtered_scan_results(self, ctx):
+        add_drop_arr = parse_range(ctx["add_drop_range"])
+        tp_arr = parse_range(ctx["tp_range"])
+        mul_arr = parse_range(ctx["multiplier_range"])
+        mo_arr = parse_range(ctx["max_orders_range"], is_int=True)
         if any(x.size == 0 for x in (add_drop_arr, tp_arr, mul_arr, mo_arr)):
             raise ValueError("掃描參數不得為空（add_drop/tp/multiplier/max_orders）")
         validate_strategy_param_arrays(add_drop_arr, tp_arr, mul_arr, mo_arr)
 
-        AD, MUL, MO, TP = np.meshgrid(add_drop_arr, mul_arr, mo_arr, tp_arr, indexing="ij")
-        params_df = pd.DataFrame(
-            {
-                "add_drop": AD.ravel().astype(np.float64),
-                "multiplier": MUL.ravel().astype(np.float64),
-                "max_orders": MO.ravel().astype(np.int32).astype(int),
-                "tp": TP.ravel().astype(np.float64),
-            }
+        params_df = sample_parameter_grid(
+            add_drop_arr=add_drop_arr,
+            tp_arr=tp_arr,
+            mul_arr=mul_arr,
+            mo_arr=mo_arr,
+            mode="full grid",
+            sample_size=1,
+            max_combos=0,
+            seed=0,
         )
-        results_df = self._evaluate_param_candidates(params_df, prices_np, capital, fee_rate)
+        results_df = self._evaluate_param_candidates(
+            params_df,
+            ctx["prices_np"],
+            ctx["capital"],
+            ctx["fee_rate"],
+            opens=ctx["opens_np"],
+            highs=ctx["highs_np"],
+            lows=ctx["lows_np"],
+        )
 
-        min_trades = safe_int(self.e_min_trades.text().strip()) if self.e_min_trades.text().strip() else None
-        max_dd = safe_float(self.e_max_dd.text().strip()) if self.e_max_dd.text().strip() else None
-        max_trap = safe_float(self.e_max_trap.text().strip()) if self.e_max_trap.text().strip() else None
+        min_trades = safe_int(ctx["min_trades"].strip()) if ctx["min_trades"].strip() else None
+        max_dd = safe_float(ctx["max_dd"].strip()) if ctx["max_dd"].strip() else None
+        max_trap = safe_float(ctx["max_trap"].strip()) if ctx["max_trap"].strip() else None
         if max_trap is not None:
             max_trap /= 100.0
         return martin.apply_filters(results_df, min_trades, max_dd, max_trap)
 
-    def _evaluate_param_candidates(self, params_df: pd.DataFrame, prices_np, capital, fee_rate) -> pd.DataFrame:
+    def _evaluate_param_candidates(
+        self, params_df: pd.DataFrame, prices_np, capital, fee_rate, *, opens=None, highs=None, lows=None
+    ) -> pd.DataFrame:
         if params_df.empty:
             return pd.DataFrame(
                 columns=[
@@ -981,15 +1339,29 @@ class MartinGUI(QMainWindow):
         validate_strategy_param_arrays(add_drop, tp, multiplier, max_orders)
         min_buy_ratio = np.maximum(0.0, (1.0 - add_drop) ** (max_orders.astype(np.float64) - 1.0))
 
-        fe, mdd, tr, trap = martin._grid_search_parallel(
-            prices_np,
-            add_drop,
-            multiplier,
-            max_orders,
-            tp,
-            capital=float(capital),
-            fee_rate=float(fee_rate),
-        )
+        if opens is not None and highs is not None and lows is not None:
+            fe, mdd, tr, trap = martin._grid_search_parallel_ohlc(
+                np.asarray(opens, dtype=np.float64),
+                np.asarray(highs, dtype=np.float64),
+                np.asarray(lows, dtype=np.float64),
+                np.asarray(prices_np, dtype=np.float64),
+                add_drop,
+                multiplier,
+                max_orders,
+                tp,
+                capital=float(capital),
+                fee_rate=float(fee_rate),
+            )
+        else:
+            fe, mdd, tr, trap = martin._grid_search_parallel(
+                prices_np,
+                add_drop,
+                multiplier,
+                max_orders,
+                tp,
+                capital=float(capital),
+                fee_rate=float(fee_rate),
+            )
         return pd.DataFrame(
             {
                 "add_drop": add_drop,
@@ -1005,33 +1377,33 @@ class MartinGUI(QMainWindow):
             }
         )
 
-    def _get_mc_hist_filter_values(self):
-        min_trades = safe_int(self.m_hist_min_trades.text().strip()) if self.m_hist_min_trades.text().strip() else None
-        max_trap = safe_float(self.m_hist_max_trap.text().strip()) if self.m_hist_max_trap.text().strip() else None
+    def _get_mc_hist_filter_values(self, config):
+        min_trades = safe_int(config["hist_min_trades"].strip()) if config["hist_min_trades"].strip() else None
+        max_trap = safe_float(config["hist_max_trap"].strip()) if config["hist_max_trap"].strip() else None
         if max_trap is not None:
             max_trap /= 100.0
         return min_trades, max_trap
 
-    def _compute_filtered_mc_candidates(self, prices_np, capital, fee_rate):
-        add_drop_arr = parse_range(self.m_add_drop.text())
-        tp_arr = parse_range(self.m_tp.text())
-        mul_arr = parse_range(self.m_multiplier.text())
-        mo_arr = parse_range(self.m_max_orders.text(), is_int=True)
+    def _compute_filtered_mc_candidates(self, ctx):
+        add_drop_arr = parse_range(ctx["add_drop_range"])
+        tp_arr = parse_range(ctx["tp_range"])
+        mul_arr = parse_range(ctx["multiplier_range"])
+        mo_arr = parse_range(ctx["max_orders_range"], is_int=True)
         if any(x.size == 0 for x in (add_drop_arr, tp_arr, mul_arr, mo_arr)):
             raise ValueError("掃描參數不得為空（add_drop/tp/multiplier/max_orders）")
         validate_strategy_param_arrays(add_drop_arr, tp_arr, mul_arr, mo_arr)
 
-        mode_text = self.m_sampling_mode.currentText().strip().lower()
+        mode_text = ctx["sampling_mode"].strip().lower()
         mode = "lhs"
         if mode_text.startswith("random"):
             mode = "random"
         elif mode_text.startswith("full grid"):
             mode = "full grid"
 
-        seed = safe_int(self.m_mc_seed.text().strip(), 42)
-        sample_size = max(1, safe_int(self.m_sample_size.text().strip(), 5000))
-        max_combos = safe_int(self.m_max_combos.text().strip(), 0)
-        refine_pct = max(0.0, safe_float(self.m_refine_pct.text().strip(), 5.0))
+        seed = safe_int(ctx["mc_seed"].strip(), 42)
+        sample_size = max(1, safe_int(ctx["sample_size"].strip(), 5000))
+        max_combos = safe_int(ctx["max_combos"].strip(), 0)
+        refine_pct = max(0.0, safe_float(ctx["refine_pct"].strip(), 5.0))
         refine_radius = 1
         refine_max_add = max(0, min(3000, sample_size))
         if mode == "full grid":
@@ -1050,9 +1422,17 @@ class MartinGUI(QMainWindow):
         if params_df.empty:
             return params_df
 
-        results_df = self._evaluate_param_candidates(params_df, prices_np, capital, fee_rate)
+        results_df = self._evaluate_param_candidates(
+            params_df,
+            ctx["prices_np"],
+            ctx["capital"],
+            ctx["fee_rate"],
+            opens=ctx["opens_np"],
+            highs=ctx["highs_np"],
+            lows=ctx["lows_np"],
+        )
 
-        min_trades, max_trap = self._get_mc_hist_filter_values()
+        min_trades, max_trap = self._get_mc_hist_filter_values(ctx)
         filtered = martin.apply_filters(results_df, min_trades, None, max_trap)
 
         if refine_radius > 0 and refine_max_add > 0 and refine_pct > 0 and not filtered.empty:
@@ -1069,7 +1449,15 @@ class MartinGUI(QMainWindow):
                 max_add=refine_max_add,
             )
             if not refine_df.empty:
-                extra = self._evaluate_param_candidates(refine_df, prices_np, capital, fee_rate)
+                extra = self._evaluate_param_candidates(
+                    refine_df,
+                    ctx["prices_np"],
+                    ctx["capital"],
+                    ctx["fee_rate"],
+                    opens=ctx["opens_np"],
+                    highs=ctx["highs_np"],
+                    lows=ctx["lows_np"],
+                )
                 filtered_extra = martin.apply_filters(extra, min_trades, None, max_trap)
                 if not filtered_extra.empty:
                     filtered = pd.concat([filtered, filtered_extra], ignore_index=True)
@@ -1092,8 +1480,11 @@ class MartinGUI(QMainWindow):
             return self._mc_executor
         if self._mc_executor is not None:
             self._mc_executor.shutdown(wait=True, cancel_futures=False)
+        import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
-        self._mc_executor = ProcessPoolExecutor(max_workers=workers)
+        self._mc_executor = ProcessPoolExecutor(
+            max_workers=workers, mp_context=mp.get_context("spawn")
+        )
         self._mc_executor_workers = workers
         return self._mc_executor
 
@@ -1101,6 +1492,7 @@ class MartinGUI(QMainWindow):
         self,
         candidates: pd.DataFrame,
         hist_rets: np.ndarray,
+        hist_ohlc_ratios: np.ndarray,
         start_price: float,
         capital: float,
         fee_rate: float,
@@ -1117,6 +1509,7 @@ class MartinGUI(QMainWindow):
         return eval_candidates_parallel(
             candidates=candidates,
             hist_rets=hist_rets,
+            hist_ohlc_ratios=hist_ohlc_ratios,
             start_price=float(start_price),
             capital=float(capital),
             fee_rate=float(fee_rate),
@@ -1131,10 +1524,12 @@ class MartinGUI(QMainWindow):
             executor=ex,
         )
 
-    def _scan_compute(self):
-        ctx = self._collect_scan_context()
-        filtered = self._compute_filtered_scan_results(ctx["prices_np"], ctx["capital"], ctx["fee_rate"])
-        topn = safe_int(self.e_topn.text().strip(), 20)
+    def _scan_compute(self, config):
+        ctx = self._collect_context_from_config(config)
+        filtered = self._compute_filtered_scan_results(ctx)
+        topn = safe_int(ctx["topn"].strip(), 20)
+        if topn <= 0:
+            raise ValueError("Show Top N 必須 > 0")
         top_df = filtered.nlargest(topn, "final_equity").copy()
         return top_df
 
@@ -1154,6 +1549,7 @@ class MartinGUI(QMainWindow):
 
     @Slot(object)
     def _scan_update_ui(self, top_df: pd.DataFrame):
+        self.btn_hist_run.setEnabled(True)
         disp, cols = self._format_hist_scan_display(top_df)
         self._populate_scan_table(disp, cols)
 
@@ -1167,67 +1563,158 @@ class MartinGUI(QMainWindow):
 
     # ---------- MC scan ----------
     def run_mc_scan(self):
+        try:
+            config = self._capture_mc_scan_config()
+        except Exception:
+            self._show_error(traceback.format_exc())
+            return
         sampling = (self.m_sampling_mode.currentText() or "").strip()
         sampling_short = sampling.split("(", 1)[0].strip() if sampling else "Unknown"
         self._set_status(f"Scan中…（{sampling_short} + 風險約束，可能較久）")
-        worker = Worker(self._mc_scan_compute)
+        self.btn_mc_run.setEnabled(False)
+        worker = Worker(self._mc_scan_compute, config)
         worker.signals.finished.connect(self._mc_scan_update_ui)
         worker.signals.error.connect(self._show_error)
         self.thread_pool.start(worker)
 
-    def _mc_scan_compute(self):
-        ctx = self._collect_mc_scan_context()
-        candidates = self._compute_filtered_mc_candidates(ctx["prices_np"], ctx["capital"], ctx["fee_rate"])
-        n_cand = len(candidates)
-        if candidates.empty:
-            return pd.DataFrame(), 0, 0
-
-        mc_paths = safe_int(self.m_mc_paths.text().strip(), None)
-        mc_days = safe_float(self.m_mc_days.text().strip(), None)
-        mc_block = safe_int(self.m_mc_block.text().strip(), None)
-        mc_seed = safe_int(self.m_mc_seed.text().strip(), 42)
-        seed_runs = safe_int(self.m_mc_seed_runs.text().strip(), 1)
-        workers = safe_int(self.m_mc_workers.text().strip(), 0)
+    def _mc_scan_compute(self, config):
+        ctx = self._collect_context_from_config(config)
+        mc_paths = safe_int(ctx["mc_paths"].strip(), None)
+        mc_days = safe_float(ctx["mc_days"].strip(), None)
+        mc_block = safe_int(ctx["mc_block"].strip(), None)
+        mc_seed = safe_int(ctx["mc_seed"].strip(), 42)
+        seed_runs = safe_int(ctx["seed_runs"].strip(), 1)
+        holdout_pct = safe_float(ctx["holdout_pct"].strip(), 30.0)
+        workers = safe_int(ctx["workers"].strip(), 0)
         if None in (mc_paths, mc_days, mc_block):
             raise ValueError("請完整填入參數（paths/days/block）")
         if mc_paths <= 0 or mc_days <= 0 or mc_block <= 0 or seed_runs <= 0:
             raise ValueError("參數需滿足：paths>0、days>0、block>0、seed runs>0")
+        if seed_runs > 100:
+            raise ValueError("Seed runs 不可超過 100")
+        if not np.isfinite(holdout_pct) or not (5.0 <= holdout_pct <= 50.0):
+            raise ValueError("MC holdout 必須介於 5% 到 50%")
+        if len(ctx["prices_np"]) < 10:
+            raise ValueError("MC holdout 至少需要 10 根歷史 K 線")
+
+        split_idx = int(np.floor(len(ctx["prices_np"]) * (1.0 - holdout_pct / 100.0)))
+        split_idx = max(2, min(split_idx, len(ctx["prices_np"]) - 3))
+        train_ctx = dict(ctx)
+        for key in ("prices_np", "opens_np", "highs_np", "lows_np"):
+            train_ctx[key] = ctx[key][:split_idx]
+        train_ctx["df"] = ctx["df"].iloc[:split_idx].copy()
+
+        candidates = self._compute_filtered_mc_candidates(train_ctx)
+        n_cand = len(candidates)
+        if candidates.empty:
+            return pd.DataFrame(), 0, 0
         if workers <= 0:
             workers = max(1, min(os.cpu_count() or 1, 8))
         workers = min(int(workers), max(1, int(n_cand)))
 
-        max_loss = safe_float(self.m_max_loss.text().strip(), 30.0) / 100.0
-        max_severe = safe_float(self.m_max_severe.text().strip(), 10.0) / 100.0
-        max_dd50 = safe_float(self.m_max_dd50.text().strip(), 20.0) / 100.0
+        max_loss = safe_float(ctx["max_loss"].strip(), 30.0) / 100.0
+        max_severe = safe_float(ctx["max_severe"].strip(), 10.0) / 100.0
+        max_dd50 = safe_float(ctx["max_dd50"].strip(), 20.0) / 100.0
+        if any((not np.isfinite(x)) or x < 0.0 or x > 1.0 for x in (max_loss, max_severe, max_dd50)):
+            raise ValueError("MC 風險門檻必須介於 0% 到 100%")
 
-        prices_np = ctx["prices_np"]
-        hist_rets = prices_np[1:] / prices_np[:-1] - 1.0
-        start_price = float(prices_np[-1])
-        mc_bars = self._days_to_bars(mc_days, ctx["interval"])
-        total_paths = int(mc_paths * seed_runs)
-        out = self._eval_mc_candidates_parallel(
-            candidates=candidates,
-            hist_rets=hist_rets,
-            start_price=start_price,
-            capital=float(ctx["capital"]),
-            fee_rate=float(ctx["fee_rate"]),
-            mc_bars=int(mc_bars),
-            block_size=int(mc_block),
-            total_paths=int(total_paths),
-            base_seed=int(mc_seed),
-            max_loss=float(max_loss),
-            max_severe=float(max_severe),
-            max_dd50=float(max_dd50),
-            workers=int(workers),
+        holdout_prices = ctx["prices_np"][split_idx - 1:]
+        hist_rets = holdout_prices[1:] / holdout_prices[:-1] - 1.0
+        hist_ohlc_ratios = ohlc_ratios_from_history(
+            ctx["opens_np"][split_idx - 1:],
+            ctx["highs_np"][split_idx - 1:],
+            ctx["lows_np"][split_idx - 1:],
+            holdout_prices,
         )
+        if mc_block > len(hist_rets):
+            raise ValueError(
+                f"MC block size ({mc_block}) 大於 holdout 報酬樣本數 ({len(hist_rets)})；"
+                "請縮小 block 或 holdout。"
+            )
+        start_price = float(ctx["prices_np"][-1])
+        mc_bars = self._days_to_bars(mc_days, ctx["interval"])
+        seed_children = np.random.SeedSequence(int(mc_seed)).spawn(int(seed_runs))
+        run_outputs = []
+        for child in seed_children:
+            run_seed = int(child.generate_state(1, dtype=np.uint64)[0])
+            run_outputs.append(self._eval_mc_candidates_parallel(
+                candidates=candidates,
+                hist_rets=hist_rets,
+                hist_ohlc_ratios=hist_ohlc_ratios,
+                start_price=start_price,
+                capital=float(ctx["capital"]),
+                fee_rate=float(ctx["fee_rate"]),
+                mc_bars=int(mc_bars),
+                block_size=int(mc_block),
+                total_paths=int(mc_paths),
+                base_seed=run_seed,
+                max_loss=float(max_loss),
+                max_severe=float(max_severe),
+                max_dd50=float(max_dd50),
+                workers=int(workers),
+            ))
+
+        out = run_outputs[0].copy()
+        def _nan_reduce(arrays, mode):
+            stack = np.vstack(arrays)
+            valid = np.isfinite(stack)
+            count = valid.sum(axis=0)
+            if mode == "mean":
+                values = np.divide(
+                    np.where(valid, stack, 0.0).sum(axis=0), count,
+                    out=np.full(stack.shape[1], np.nan), where=count > 0,
+                )
+            elif mode == "min":
+                values = np.where(valid, stack, np.inf).min(axis=0)
+                values[count == 0] = np.nan
+            else:
+                values = np.where(valid, stack, -np.inf).max(axis=0)
+                values[count == 0] = np.nan
+            return values
+
+        mean_cols = ("mc_terminal_mean", "mc_terminal_median")
+        conservative_min_cols = ("mc_terminal_p5",)
+        conservative_max_cols = (
+            "mc_p_loss", "mc_p_severe", "mc_p_dd50", "mc_mdd_mean", "mc_trapped_mean",
+        )
+        for col in mean_cols:
+            out[col] = _nan_reduce([r[col].to_numpy(float) for r in run_outputs], "mean")
+        for col in conservative_min_cols:
+            out[col] = _nan_reduce([r[col].to_numpy(float) for r in run_outputs], "min")
+        for col in conservative_max_cols:
+            out[col] = _nan_reduce([r[col].to_numpy(float) for r in run_outputs], "max")
+        median_stack = np.vstack([r["mc_terminal_median"].to_numpy(float) for r in run_outputs])
+        median_mean = _nan_reduce([r["mc_terminal_median"].to_numpy(float) for r in run_outputs], "mean")
+        median_valid = np.isfinite(median_stack)
+        median_count = median_valid.sum(axis=0)
+        median_var = np.divide(
+            np.where(median_valid, (median_stack - median_mean) ** 2, 0.0).sum(axis=0),
+            median_count,
+            out=np.full(median_stack.shape[1], np.nan),
+            where=median_count > 0,
+        )
+        out["mc_seed_median_std"] = np.sqrt(median_var)
+        out["feasible"] = np.logical_and.reduce([r["feasible"].to_numpy(bool) for r in run_outputs])
+        out["mc_early_rejected"] = np.logical_or.reduce([
+            r["mc_early_rejected"].to_numpy(bool) for r in run_outputs
+        ])
+        out["mc_paths_evaluated"] = np.sum(np.vstack([
+            r["mc_paths_evaluated"].to_numpy(np.int64) for r in run_outputs
+        ]), axis=0)
+        rejected = out["mc_early_rejected"].to_numpy(bool)
+        for col in (*mean_cols, *conservative_min_cols, "mc_mdd_mean", "mc_trapped_mean"):
+            out.loc[rejected, col] = np.nan
         out["mc_paths"] = int(mc_paths)
         out["mc_seed_runs"] = int(seed_runs)
         out["mc_days"] = float(mc_days)
         out["mc_bars"] = int(mc_bars)
         out["mc_block"] = int(mc_block)
         out["mc_seed"] = int(mc_seed)
+        out["mc_holdout_pct"] = float(holdout_pct)
+        out["mc_train_bars"] = int(split_idx)
+        out["mc_holdout_bars"] = int(len(ctx["prices_np"]) - split_idx + 1)
 
-        rank_mode = self.m_rank_by.currentText().strip()
+        rank_mode = ctx["rank_mode"].strip()
         if rank_mode == "P5 terminal":
             sort_by = ["feasible", "mc_terminal_p5", "mc_terminal_median", "mc_p_dd50", "mc_p_loss"]
             asc = [False, False, False, True, True]
@@ -1240,13 +1727,14 @@ class MartinGUI(QMainWindow):
 
         out = out.sort_values(by=sort_by, ascending=asc).reset_index(drop=True)
         feasible_count = int(out["feasible"].sum())
-        show_topn = safe_int(self.m_show_topn.text().strip(), 50)
+        show_topn = safe_int(ctx["show_topn"].strip(), 50)
         if show_topn > 0:
             out = out.head(show_topn).copy()
         return out, feasible_count, int(n_cand)
 
     @Slot(object)
     def _mc_scan_update_ui(self, payload):
+        self.btn_mc_run.setEnabled(True)
         df, feasible_count, total = payload
         self.mc_scan_df = df.reset_index(drop=True)
         if self.mc_scan_df.empty:
@@ -1338,6 +1826,7 @@ class MartinGUI(QMainWindow):
             float(params["multiplier"]),
             int(params["max_orders"]),
             float(params["tp"]),
+            self.e_source.currentText().strip().lower(),
         )
         worker.signals.finished.connect(self._render_scan_detail)
         worker.signals.error.connect(self._show_error)
@@ -1375,6 +1864,7 @@ class MartinGUI(QMainWindow):
             float(params["multiplier"]),
             int(params["max_orders"]),
             float(params["tp"]),
+            self.m_source.currentText().strip().lower(),
         )
         worker.signals.finished.connect(self._render_mc_scan_detail)
         worker.signals.error.connect(self._show_error)
@@ -1406,36 +1896,47 @@ class MartinGUI(QMainWindow):
 
     # ---------- single ----------
     def run_single(self):
+        try:
+            config = self._capture_single_config(include_mc=False)
+        except Exception:
+            self._show_error(traceback.format_exc())
+            return
         self._set_status("Single Backtest中…")
-        worker = Worker(self._run_single_compute)
+        self.btn_single_run.setEnabled(False)
+        worker = Worker(self._run_single_compute, config)
         worker.signals.finished.connect(self._run_single_update)
         worker.signals.error.connect(self._show_error)
         self.thread_pool.start(worker)
 
-    def _run_single_compute(self):
-        symbol = self.s_symbol.currentText().strip()
-        interval = self.s_interval.currentText().strip()
-        start, end = self._get_date_range_strings(self.s_start, self.s_end)
-        refresh = DEFAULT_REFRESH_POLICY
-        fee_rate = DEFAULT_FEE_RATE
-        capital = safe_float(self.s_capital.text().strip(), 1000.0)
+    def _run_single_compute(self, config):
+        symbol = config["symbol"]
+        interval = config["interval"]
+        start, end = config["start"], config["end"]
+        refresh = config["refresh_policy"]
+        source = config.get("source", "auto")
+        fee_rate = config["fee_rate"]
+        capital = config["capital"]
 
-        add_drop = safe_float(self.s_add_drop.text().strip(), None)
-        tp = safe_float(self.s_tp.text().strip(), None)
-        multiplier = safe_float(self.s_multiplier.text().strip(), None)
-        max_orders = safe_int(self.s_max_orders.text().strip(), None)
+        add_drop = config.get("add_drop")
+        tp = config.get("tp")
+        multiplier = config.get("multiplier")
+        max_orders = config.get("max_orders")
 
         if None in (add_drop, tp, multiplier, max_orders):
             raise ValueError("請完整填入策略參數（add_drop, tp, multiplier, max_orders）")
         if not symbol or not interval:
             raise ValueError("請填入 symbol 與 interval")
+        if capital is None or not np.isfinite(capital) or capital <= 0:
+            raise ValueError("capital 必須為有限正數")
+        validate_strategy_param_arrays([add_drop], [tp], [multiplier], [max_orders])
 
         df, res, perf = self._compute_backtest(symbol, interval, start, end, refresh, fee_rate, capital,
-                                               add_drop, multiplier, max_orders, tp)
+                                               add_drop, multiplier, max_orders, tp, source)
         return df, res, perf
 
     @Slot(object)
     def _run_single_update(self, payload):
+        self.btn_single_run.setEnabled(True)
         df, res, perf = payload
         self._render_plot_and_metrics(
             df, res, perf,
@@ -1446,8 +1947,14 @@ class MartinGUI(QMainWindow):
         self._set_splitter_when_ready(self.single_splitter, self.INIT_SPLIT)
 
     def run_single_mc(self):
+        try:
+            config = self._capture_single_config(include_mc=True)
+        except Exception:
+            self._show_error(traceback.format_exc())
+            return
         self._set_status("Monte Carlo模擬中…")
-        worker = Worker(self._run_single_mc_compute)
+        self.btn_single_mc.setEnabled(False)
+        worker = Worker(self._run_single_mc_compute, config)
         worker.signals.finished.connect(self._run_single_mc_update)
         worker.signals.error.connect(self._show_error)
         self.thread_pool.start(worker)
@@ -1468,13 +1975,32 @@ class MartinGUI(QMainWindow):
         bars = int(round(float(days) * 86400.0 * 1000.0 / float(step_ms)))
         return max(2, bars)
 
-    def _run_single_mc_compute(self):
-        df, res, perf = self._run_single_compute()
+    def _capture_single_config(self, *, include_mc):
+        config = self._capture_data_config(
+            self.s_symbol, self.s_source, self.s_interval, self.s_start, self.s_end, self.s_capital
+        )
+        config.update({
+            "add_drop": safe_float(self.s_add_drop.text().strip(), None),
+            "tp": safe_float(self.s_tp.text().strip(), None),
+            "multiplier": safe_float(self.s_multiplier.text().strip(), None),
+            "max_orders": safe_int(self.s_max_orders.text().strip(), None),
+        })
+        if include_mc:
+            config.update({
+                "mc_paths": safe_int(self.s_mc_paths.text().strip(), None),
+                "mc_days": safe_float(self.s_mc_days.text().strip(), None),
+                "mc_block": safe_int(self.s_mc_block.text().strip(), None),
+                "mc_seed": safe_int(self.s_mc_seed.text().strip(), 42),
+            })
+        return config
 
-        mc_paths = safe_int(self.s_mc_paths.text().strip(), None)
-        mc_days = safe_float(self.s_mc_days.text().strip(), None)
-        mc_block = safe_int(self.s_mc_block.text().strip(), None)
-        mc_seed = safe_int(self.s_mc_seed.text().strip(), 42)
+    def _run_single_mc_compute(self, config):
+        df, res, perf = self._run_single_compute(config)
+
+        mc_paths = config.get("mc_paths")
+        mc_days = config.get("mc_days")
+        mc_block = config.get("mc_block")
+        mc_seed = config.get("mc_seed", 42)
         if None in (mc_paths, mc_days, mc_block):
             raise ValueError("請完整填入 Monte Carlo 參數（paths/days/block size）")
         if mc_paths <= 0 or mc_days <= 0 or mc_block <= 0:
@@ -1482,7 +2008,13 @@ class MartinGUI(QMainWindow):
 
         prices_np = df["close"].to_numpy(dtype=np.float64)
         hist_rets = prices_np[1:] / prices_np[:-1] - 1.0
-        interval = self.s_interval.currentText().strip()
+        hist_ohlc_ratios = ohlc_ratios_from_history(
+            df["open"].to_numpy(dtype=np.float64),
+            df["high"].to_numpy(dtype=np.float64),
+            df["low"].to_numpy(dtype=np.float64),
+            prices_np,
+        )
+        interval = config["interval"]
         mc_bars = self._days_to_bars(mc_days, interval)
         rng = np.random.default_rng(int(mc_seed))
 
@@ -1502,10 +2034,14 @@ class MartinGUI(QMainWindow):
         trapped_ratio = np.empty(mc_paths, dtype=np.float64)
 
         for i in range(mc_paths):
-            one_ret = bootstrap_path_from_returns(hist_rets, int(mc_bars), int(mc_block), rng)
-            one_path_prices = start_price * np.cumprod(np.concatenate(([1.0], 1.0 + one_ret)))
-            fe_i, mdd_i, tr_i, trap_i = martin._backtest_core(
-                one_path_prices.astype(np.float64),
+            path_open, path_high, path_low, path_close = bootstrap_ohlc_path_from_ratios(
+                hist_ohlc_ratios, start_price, int(mc_bars), int(mc_block), rng
+            )
+            fe_i, mdd_i, tr_i, trap_i = martin._backtest_core_ohlc(
+                path_open,
+                path_high,
+                path_low,
+                path_close,
                 add_drop,
                 multiplier,
                 max_orders,
@@ -1564,6 +2100,7 @@ class MartinGUI(QMainWindow):
 
     @Slot(object)
     def _run_single_mc_update(self, payload):
+        self.btn_single_mc.setEnabled(True)
         df, res, perf, mc = payload
         self._render_plot_and_metrics(
             df, res, perf,
@@ -1577,15 +2114,19 @@ class MartinGUI(QMainWindow):
 
     # ---------- compute ----------
     def _compute_backtest(self, symbol, interval, start, end, refresh_policy,
-                          fee_rate, capital, add_drop, multiplier, max_orders, tp):
+                          fee_rate, capital, add_drop, multiplier, max_orders, tp,
+                          source="auto"):
         cache_key = self._make_backtest_cache_key(
-            symbol, interval, start, end, refresh_policy, fee_rate, capital, add_drop, multiplier, max_orders, tp
+            symbol, interval, start, end, refresh_policy, fee_rate, capital,
+            add_drop, multiplier, max_orders, tp, source,
         )
         cached = self._get_cached_backtest(cache_key)
         if cached is not None:
             return cached
 
-        df = self._fetch_klines_if_needed(symbol, interval, start, end, refresh_policy)
+        df = self._fetch_klines_if_needed(
+            symbol, interval, start, end, refresh_policy, source
+        )
         prices_np = df["close"].to_numpy(dtype=np.float64)
         if prices_np.size < 2:
             raise ValueError("K 線資料不足（<2 根）。")
@@ -1594,15 +2135,21 @@ class MartinGUI(QMainWindow):
             prices_np, add_drop=float(add_drop), multiplier=float(multiplier),
             max_orders=int(max_orders), tp=float(tp), capital=float(capital),
             return_curve=True, times=df["time"].tolist(), fee_rate=float(fee_rate),
+            opens=df["open"].to_numpy(dtype=np.float64),
+            highs=df["high"].to_numpy(dtype=np.float64),
+            lows=df["low"].to_numpy(dtype=np.float64),
         )
 
         first_price = float(prices_np[0])
-        bh_qty = float(capital) / first_price
-        bh_curve = bh_qty * prices_np
+        bh_qty = float(capital) / (first_price * (1.0 + float(fee_rate)))
+        bh_curve = bh_qty * prices_np * (1.0 - float(fee_rate))
 
         perf = martin.compute_performance_metrics(
             res["equity_curve"], res["time_index"], res["trades_log"],
-            capital=float(capital), bh_curve=bh_curve
+            capital=float(capital), bh_curve=bh_curve,
+            position_curve=res.get("position_curve"),
+            open_trade=res.get("open_trade"),
+            max_dd_override=res.get("max_dd_overall"),
         )
 
         res["bh_curve"] = bh_curve
@@ -1611,6 +2158,19 @@ class MartinGUI(QMainWindow):
         res["_multiplier"] = float(multiplier)
         res["_max_orders"] = int(max_orders)
         res["_tp"] = float(tp)
+        if df.attrs.get("coverage_complete") is False:
+            actual_start_ms = df.attrs.get("actual_start_ms")
+            actual_end_ms = df.attrs.get("actual_end_ms")
+            if actual_start_ms is not None and actual_end_ms is not None:
+                actual_start = pd.Timestamp(
+                    int(actual_start_ms), unit="ms", tz="UTC"
+                ).tz_convert("Asia/Taipei").strftime("%Y-%m-%d")
+                actual_end = pd.Timestamp(
+                    int(actual_end_ms), unit="ms", tz="UTC"
+                ).tz_convert("Asia/Taipei").strftime("%Y-%m-%d")
+                res["_coverage_note"] = (
+                    f"Partial market history used: {actual_start} → {actual_end}"
+                )
         payload = (df, res, perf)
         self._store_cached_backtest(cache_key, payload)
         return payload
@@ -1683,26 +2243,20 @@ class MartinGUI(QMainWindow):
         total_secs = None
         trapped_secs = 0.0
         try:
-            if time_index is not None and len(time_index) >= 2:
-                start_t = time_index[0]
-                end_t = time_index[-1]
-                total_secs = (end_t - start_t).total_seconds()
-                if total_secs > 0 and trapped_intervals:
-                    for s_i, e_i in trapped_intervals:
-                        if s_i is None or e_i is None:
-                            continue
-                        s = max(s_i, start_t)
-                        e = min(e_i, end_t)
-                        if e > s:
-                            trapped_secs += (e - s).total_seconds()
-                    trap_ratio = trapped_secs / total_secs
-                else:
-                    trap_ratio = 0.0
+            trapped_mask = np.asarray(res.get("trapped_mask", []), dtype=bool)
+            if time_index is not None and len(time_index) >= 2 and trapped_mask.size == len(time_index):
+                diffs = pd.Series(pd.DatetimeIndex(time_index)).diff().dropna().dt.total_seconds()
+                bar_sec = float(diffs.median()) if len(diffs) else 0.0
+                total_secs = bar_sec * len(time_index)
+                trapped_secs = bar_sec * int(trapped_mask.sum())
+                trap_ratio = float(trapped_mask.mean())
         except Exception:
             trap_ratio = None
 
         if metrics_widget is not None and isinstance(perf, dict):
             t = []
+            if res.get("_coverage_note"):
+                t.append(f"=== Data Coverage ===\n{res['_coverage_note']}\n")
             t.append("=== Performance (Strategy) ===")
             t.append(
                 f"Total Return: {human_pct(perf.get('total_return'))} | CAGR: {human_pct(perf.get('cagr'))} | Ann Vol: {human_pct(perf.get('ann_vol'))}"
@@ -1727,7 +2281,12 @@ class MartinGUI(QMainWindow):
             pf_str = "∞" if (isinstance(pf, (int, float)) and np.isinf(pf)) else (
                 "NaN" if pf is None or (isinstance(pf, float) and np.isnan(pf)) else f"{pf:.2f}"
             )
-            t.append(f"Win Rate: {human_pct(perf.get('win_rate'))} | Profit Factor: {pf_str}")
+            t.append(
+                f"Terminal-adjusted Win Rate: {human_pct(perf.get('win_rate'))} | "
+                f"Profit Factor: {pf_str} | Exposure: {human_pct(perf.get('exposure'))}"
+            )
+            if perf.get("has_open_position"):
+                t.append(f"Open Position Mark-to-market PnL: {perf.get('open_trade_pnl', float('nan')):.2f}")
             if trap_ratio is not None and total_secs is not None:
                 trapped_days = trapped_secs / 86400.0
                 total_days = total_secs / 86400.0
@@ -1761,6 +2320,10 @@ class MartinGUI(QMainWindow):
     @Slot(str)
     def _show_error(self, tb):
         self._set_status("操作失敗。")
+        for name in ("btn_hist_run", "btn_mc_run", "btn_single_run", "btn_single_mc"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(True)
         QMessageBox.critical(self, "錯誤", tb)
 
 

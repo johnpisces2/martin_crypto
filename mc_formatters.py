@@ -44,12 +44,18 @@ def format_mc_scan_display(df: pd.DataFrame, pct_str_fn, human_pct_fn):
     disp["tp"] = disp["tp"].apply(lambda v: pct_str_fn(v, 1))
     disp["multiplier"] = disp["multiplier"].apply(lambda v: f"{v:.1f}")
     disp["trapped_time_ratio"] = disp["trapped_time_ratio"].apply(lambda v: pct_str_fn(v, 2))
-    for col in ("final_equity", "max_dd_overall", "mc_terminal_median", "mc_terminal_p5", "mc_mdd_mean", "mc_trapped_mean"):
+    for col in (
+        "final_equity", "max_dd_overall", "mc_terminal_median", "mc_terminal_p5",
+        "mc_mdd_mean", "mc_trapped_mean", "mc_seed_median_std",
+    ):
         if col in disp.columns:
             disp[col] = disp[col].map(lambda v: "N/A" if pd.isna(v) else f"{float(v):.2f}")
-    disp["mc_p_loss"] = disp["mc_p_loss"].apply(lambda v: human_pct_fn(v, 2))
-    disp["mc_p_severe"] = disp["mc_p_severe"].apply(lambda v: human_pct_fn(v, 2))
-    disp["mc_p_dd50"] = disp["mc_p_dd50"].apply(lambda v: human_pct_fn(v, 2))
+    early = disp.get("mc_early_rejected", pd.Series(False, index=disp.index)).astype(bool)
+    for col in ("mc_p_loss", "mc_p_severe", "mc_p_dd50"):
+        disp[col] = [
+            ("N/A" if pd.isna(v) else (("≥" if is_early else "") + human_pct_fn(v, 2)))
+            for v, is_early in zip(disp[col], early)
+        ]
     disp["feasible"] = disp["feasible"].apply(lambda v: "Y" if bool(v) else "N")
     if "mc_early_rejected" in disp.columns:
         disp["mc_early_rejected"] = disp["mc_early_rejected"].apply(lambda v: "Y" if bool(v) else "N")
@@ -59,7 +65,7 @@ def format_mc_scan_display(df: pd.DataFrame, pct_str_fn, human_pct_fn):
         "add_drop", "tp", "multiplier", "max_orders",
         "final_equity", "max_dd_overall", "trades", "trapped_time_ratio",
         "mc_terminal_median", "mc_terminal_p5",
-        "mc_p_loss", "mc_p_severe", "mc_p_dd50", "mc_mdd_mean",
+        "mc_p_loss", "mc_p_severe", "mc_p_dd50", "mc_mdd_mean", "mc_seed_median_std",
     ]
     cols = [c for c in cols if c in disp.columns]
     return disp, cols

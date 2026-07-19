@@ -6,8 +6,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 import martin
+from mc_sampling import sample_parameter_grid
 from martin import (
-    _grid_search_parallel,
+    _grid_search_parallel_ohlc,
     apply_filters,
     compute_performance_metrics,
     get_klines,
@@ -64,11 +65,20 @@ def main():
     mul = np.array([i / 10 for i in range(15, 21)], dtype=np.float64)
     mo = np.array(list(range(5, 10)), dtype=np.int32)
 
-    AD, MUL, MO, TP = np.meshgrid(ad, mul, mo, tp, indexing="ij")
-    ADf = AD.ravel()
-    MULf = MUL.ravel()
-    MOf = MO.ravel()
-    TPf = TP.ravel()
+    params = sample_parameter_grid(
+        add_drop_arr=ad,
+        tp_arr=tp,
+        mul_arr=mul,
+        mo_arr=mo,
+        mode="full grid",
+        sample_size=1,
+        max_combos=0,
+        seed=0,
+    )
+    ADf = params["add_drop"].to_numpy(dtype=np.float64)
+    MULf = params["multiplier"].to_numpy(dtype=np.float64)
+    MOf = params["max_orders"].to_numpy(dtype=np.int32)
+    TPf = params["tp"].to_numpy(dtype=np.float64)
 
     min_buy_ratio_theory = np.maximum(0.0, (1.0 - ADf) ** (MOf.astype(np.float64) - 1.0))
     if max_buy_ratio is not None:
@@ -79,7 +89,10 @@ def main():
         TPf = TPf[mask]
         min_buy_ratio_theory = min_buy_ratio_theory[mask]
 
-    fe, mdd, tr, trap = _grid_search_parallel(
+    fe, mdd, tr, trap = _grid_search_parallel_ohlc(
+        df["open"].to_numpy(dtype=np.float64),
+        df["high"].to_numpy(dtype=np.float64),
+        df["low"].to_numpy(dtype=np.float64),
         prices_np, ADf, MULf, MOf, TPf, capital=capital, fee_rate=fee_rate
     )
     results_df = pd.DataFrame(
@@ -136,13 +149,18 @@ def main():
         return_curve=True,
         times=df["time"].tolist(),
         fee_rate=fee_rate,
+        opens=df["open"].to_numpy(dtype=np.float64),
+        highs=df["high"].to_numpy(dtype=np.float64),
+        lows=df["low"].to_numpy(dtype=np.float64),
     )
 
     first_price = float(prices_np[0])
-    bh_qty = capital / first_price
-    bh_curve = bh_qty * prices_np
+    bh_qty = capital / (first_price * (1.0 + fee_rate))
+    bh_curve = bh_qty * prices_np * (1.0 - fee_rate)
     perf = compute_performance_metrics(
-        res["equity_curve"], res["time_index"], res["trades_log"], capital=capital, bh_curve=bh_curve
+        res["equity_curve"], res["time_index"], res["trades_log"], capital=capital,
+        bh_curve=bh_curve, position_curve=res.get("position_curve"),
+        open_trade=res.get("open_trade"), max_dd_override=res.get("max_dd_overall"),
     )
 
     print("\n=== Performance (Strategy) ===")

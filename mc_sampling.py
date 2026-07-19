@@ -51,17 +51,22 @@ def sample_parameter_grid(
                 }
             ).drop_duplicates(ignore_index=True)
 
-        # Stream full grid to avoid allocating a giant index vector.
-        rows = []
-        for i_ad in range(na):
-            ad = float(add_drop_arr[i_ad])
-            for i_mul in range(nm):
-                mul = float(mul_arr[i_mul])
-                for i_mo in range(no):
-                    mo = int(mo_arr[i_mo])
-                    for i_tp in range(nt):
-                        rows.append((ad, mul, mo, float(tp_arr[i_tp])))
-        return pd.DataFrame(rows, columns=["add_drop", "multiplier", "max_orders", "tp"])
+        # Allocate only the four result columns. A Python tuple per combination
+        # consumes several times more memory on large grids.
+        ad = np.repeat(np.asarray(add_drop_arr, dtype=np.float64), nm * no * nt)
+        mul = np.tile(
+            np.repeat(np.asarray(mul_arr, dtype=np.float64), no * nt), na
+        )
+        mo = np.tile(
+            np.repeat(np.asarray(mo_arr, dtype=np.int32), nt), na * nm
+        )
+        tp = np.tile(np.asarray(tp_arr, dtype=np.float64), na * nm * no)
+        return pd.DataFrame({
+            "add_drop": ad,
+            "multiplier": mul,
+            "max_orders": mo.astype(int),
+            "tp": tp,
+        })
 
     if mode == "random":
         n = min(max(1, int(sample_size)), total_space)

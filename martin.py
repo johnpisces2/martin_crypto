@@ -10,11 +10,12 @@
   - 保留 anchor_price 欄位（相容原結構），但不再用來判斷加倉門檻。
 - 其餘：
   - 支援 Parquet 快取與 refresh_policy={"never","auto","force"}
-  - 手續費：買入扣 alloc*(1+fee)，賣出收 qty*price*(1-fee)，TP 以含費 PnL 判斷
+- 手續費：買入扣 alloc*(1+fee)，賣出收 qty*price*(1-fee)，TP 以含費 PnL 判斷
+- 歷史回測使用 OHLC；補單按樓梯 trigger 成交，同棒補單與 TP 採保守順序
   - Numba 平行網格加速（_grid_search_parallel）
   - 風險指標與績效統計（Sharpe/Sortino/Calmar 等）
 
-注意：期末未平倉的 final_equity 仍採【不扣賣出費】（與原版一致）。若需更保守，可自行在期末再扣一次賣出費。
+期末未平倉的 final_equity 採保守清算價值，包含假設性賣出費。
 """
 import os
 import time
@@ -24,21 +25,14 @@ import pandas as pd
 from pandas.api.types import DatetimeTZDtype
 import matplotlib.pyplot as plt
 from datetime import datetime, timezone
-import ccxt
 from numba import njit, prange
 import traceback
+from market_data import sources as market_sources
 
 # ===================== 交易所清單 =====================
 _EXCH_LIST = [
-    "binance",       # Binance Spot
-    "binanceusdm",   # Binance USDT-M Futures (linear swap)
-    "okx",
-    "bybit",
-    "kucoin",
-    "kraken",
-    "gateio",
-    "mexc",
-    "huobi",
+    "binance",  # First choice for regular spot symbols.
+    "pionex",   # Fallback and Pionex stock/RWA token source.
 ]
 
 # ===================== Parquet 快取設定 =====================
@@ -58,16 +52,19 @@ def _ensure_dir(path: str):
         os.makedirs(path, exist_ok=True)
 
 
-def _cache_key(base: str, interval: str) -> str:
+def _cache_key(base: str, interval: str, exchange: str, market_type: str) -> str:
+    """A cache is valid for exactly one exchange and one market type."""
     base = base.upper()
-    return f"{base}_USDT_{interval}.parquet"
+    safe_exchange = str(exchange).lower().replace("/", "_").replace(":", "_")
+    safe_market = str(market_type).lower().replace("/", "_").replace(":", "_")
+    return f"{base}_USDT_{safe_exchange}_{safe_market}_{interval}.parquet"
 
 
-def _load_cached_klines(cache_dir: str, base: str, interval: str):
+def _load_cached_klines(cache_dir: str, base: str, interval: str, exchange: str, market_type: str):
     """讀取快取並妥善處理 tz、排序/去重、以及 attrs 還原與保留。"""
     if not PARQUET_OK:
         return None
-    fpath = os.path.join(cache_dir, _cache_key(base, interval))
+    fpath = os.path.join(cache_dir, _cache_key(base, interval, exchange, market_type))
     if not os.path.isfile(fpath):
         return None
     try:
@@ -85,9 +82,15 @@ def _load_cached_klines(cache_dir: str, base: str, interval: str):
 
         # 復原 attrs（若 parquet 有保留）
         attrs = {}
-        for k in ("exchange", "market", "symbol", "interval"):
+        for k in ("exchange", "market", "market_type", "symbol", "interval"):
             if k in df.columns and pd.notna(df[k]).any():
                 attrs[k] = str(df[k].dropna().iloc[0])
+        loaded_market_type = attrs.get("market_type")
+        if loaded_market_type is None:
+            loaded_market_type = "swap" if "perp" in attrs.get("market", "") else "spot"
+            attrs["market_type"] = loaded_market_type
+        if attrs.get("exchange") != str(exchange) or loaded_market_type != str(market_type):
+            return None
 
         price_cols = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
         if "close" not in price_cols:
@@ -100,13 +103,16 @@ def _load_cached_klines(cache_dir: str, base: str, interval: str):
         return None
 
 
-def _save_cached_klines(cache_dir: str, base: str, interval: str, df: pd.DataFrame, attrs: dict):
+def _save_cached_klines(
+    cache_dir: str, base: str, interval: str, exchange: str, market_type: str,
+    df: pd.DataFrame, attrs: dict,
+):
     if not PARQUET_OK:
         return
     _ensure_dir(cache_dir)
-    fpath = os.path.join(cache_dir, _cache_key(base, interval))
+    fpath = os.path.join(cache_dir, _cache_key(base, interval, exchange, market_type))
     out = df.copy()
-    for k in ("exchange", "market", "symbol", "interval"):
+    for k in ("exchange", "market", "market_type", "symbol", "interval"):
         out[k] = attrs.get(k, None)
     out.attrs = attrs.copy()
     out.to_parquet(fpath, index=False)
@@ -146,18 +152,55 @@ def _to_ms(dt_str: str, *, end_of_day: bool = False) -> int:
     return int(dt.timestamp() * 1000)
 
 
+def _datetime_index_ms(values) -> np.ndarray:
+    """Convert timestamps to UTC milliseconds across pandas 2/3 resolutions."""
+    idx = pd.DatetimeIndex(values)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    else:
+        idx = idx.tz_convert("UTC")
+    return np.fromiter(
+        (int(ts.timestamp() * 1000) for ts in idx), dtype=np.int64, count=len(idx)
+    )
+
+
 def _range_is_covered(df: pd.DataFrame, start_ms: int, end_ms: int, step_ms: int) -> bool:
     if df is None or df.empty:
         return False
-    utc_idx = pd.DatetimeIndex(df["time"]).tz_convert("UTC")
-    first_ms = int(utc_idx[0].value // 1_000_000)
-    last_ms = int(utc_idx[-1].value // 1_000_000)
+    utc_ms = _datetime_index_ms(df["time"])
+    first_ms = int(utc_ms[0])
+    last_ms = int(utc_ms[-1])
     return (first_ms <= start_ms + step_ms) and (last_ms >= end_ms - step_ms)
 
 
+def _validate_kline_frame(df: pd.DataFrame, step_ms: int, *, allow_gaps: bool = False):
+    """Validate OHLC values and continuous candle-open timestamps."""
+    required = {"time", "open", "high", "low", "close"}
+    if df is None or df.empty or not required.issubset(df.columns):
+        raise ValueError("K 線缺少必要的 time/open/high/low/close 欄位")
+    ohlc = df[["open", "high", "low", "close"]].to_numpy(dtype=np.float64)
+    if not np.isfinite(ohlc).all() or np.any(ohlc <= 0.0):
+        raise ValueError("K 線包含非有限值或非正價格")
+    if np.any(ohlc[:, 1] < np.maximum(ohlc[:, 0], ohlc[:, 3])):
+        raise ValueError("K 線 high 小於 open/close")
+    if np.any(ohlc[:, 2] > np.minimum(ohlc[:, 0], ohlc[:, 3])):
+        raise ValueError("K 線 low 大於 open/close")
+    if not allow_gaps and len(df) >= 2:
+        utc_ms = _datetime_index_ms(df["time"])
+        diffs_ms = np.diff(utc_ms)
+        bad = np.flatnonzero(diffs_ms != int(step_ms))
+        if bad.size:
+            first_gap = int(bad[0])
+            raise ValueError(
+                f"K 線存在 {bad.size} 個缺棒/不規則間隔；第一處位於 "
+                f"{df['time'].iloc[first_gap]} → {df['time'].iloc[first_gap + 1]}"
+            )
+    return df
+
+
 def _align_to_interval_end(now_ms: int, step_ms: int) -> int:
-    """對齊到 timeframe 的『最後已收』棒結束時間"""
-    return now_ms - (now_ms % step_ms)
+    """Return the opening timestamp of the last fully closed candle."""
+    return now_ms - (now_ms % step_ms) - step_ms
 
 
 def _ohlcv_to_taipei_df(ohlcv):
@@ -172,81 +215,18 @@ def _ohlcv_to_taipei_df(ohlcv):
     return df[["time","open","high","low","close","volume"]].copy()
 
 
-def _find_market_symbol(markets: dict, base: str, prefer_spot=True):
-    """
-    在 ccxt markets 裡，找 base/USDT：
-      1) 優先 spot
-      2) 找不到再找 USDT 線性永續 swap（linear=True）
-    回傳 (symbol_str, market_type)；market_type ∈ {"spot","swap"} 或 (None, None)
-    """
-    base = base.upper()
-    spot_sym = None
-    swap_sym = None
-    for m in markets.values():
-        if m.get("base") == base and m.get("quote") == "USDT" and m.get("active", True):
-            if m.get("spot") and spot_sym is None:
-                spot_sym = m["symbol"]
-            if m.get("swap") and m.get("linear") and swap_sym is None:
-                swap_sym = m["symbol"]
-    if prefer_spot and spot_sym:
-        return spot_sym, "spot"
-    if swap_sym:
-        return swap_sym, "swap"
-    if spot_sym:
-        return spot_sym, "spot"
-    return None, None
-
-
-def _ccxt_fetch_ohlcv_segmented(ex, symbol, timeframe="1h", since_ms=None, end_ms=None, limit=1000, pause=0.12):
-    """
-    分段抓取 OHLCV：避免一次取太多。回傳 list[[ms,o,h,l,c,v], ...]
-    - 若時間沒有前進，中止（避免無窮迴圈）
-    - 末尾裁切到 end_ms（含）
-    - 尾端以 timestamp 去重（保留最後一次）
-    """
-    out = []
-    cursor = since_ms
-    last_seen_ms = -1
-    max_calls = 100000
-
-    calls = 0
-    while True:
-        calls += 1
-        if calls > max_calls:
-            break
-        try:
-            batch = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=limit)
-        except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
-            print(f"[Info] Network error: {e}. Retrying in 5s...")
-            time.sleep(5)
-            continue
-        except Exception:
-            raise
-
-        if not batch:
-            break
-        out.extend(batch)
-        last_ms = batch[-1][0]
-        if last_ms <= last_seen_ms:
-            break
-        last_seen_ms = last_ms
-        cursor = last_ms + 1  # +1ms 避免邊界跳根
-        if end_ms is not None and cursor > end_ms:
-            break
-        time.sleep(pause)
-
-    if end_ms is not None and out:
-        out = [row for row in out if row[0] <= end_ms]
-    if out:
-        dedup = {row[0]: row for row in out}
-        out = [dedup[k] for k in sorted(dedup.keys())]
-    return out
+# Backward-compatible private aliases. Provider details live in market_data.
+_find_market_symbol = market_sources.find_market_symbol
+_ccxt_fetch_ohlcv_segmented = market_sources.fetch_ccxt_ohlcv_segmented
+_fetch_source_ohlcv = market_sources.fetch_source_ohlcv
 
 # ===================== get_klines（含 Parquet 快取 + refresh_policy） =====================
 
 def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pause=0.12,
                exch_list=None, prefer_spot=True,
-               cache_dir=DEFAULT_CACHE_DIR, use_cache=True, refresh_policy: str = "auto"):
+               cache_dir=DEFAULT_CACHE_DIR, use_cache=True, refresh_policy: str = "auto",
+               allow_swap_fallback=False, allow_gaps=False, require_full_coverage=True,
+               allow_partial_sources=()):
     """
     多交易所抓 'BASE/USDT' 的 K 線，回傳 df[['time','close']]，
     並在 attrs 記錄 market/symbol/interval/exchange。
@@ -264,14 +244,62 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
         allowed = ", ".join(sorted(ALLOWED_REFRESH_POLICIES))
         raise ValueError(f"refresh_policy must be one of: {allowed}")
 
+    partial_sources = {
+        str(name).strip().lower() for name in (allow_partial_sources or ())
+    }
+
+    # Resolve auto one provider at a time.  This keeps the declared source
+    # priority authoritative even when only a fallback provider has a cache.
+    if exch_list is None:
+        source_errors = []
+        for source_name in _EXCH_LIST:
+            try:
+                return get_klines(
+                    symbol=symbol,
+                    interval=interval,
+                    bars=bars,
+                    start=start,
+                    end=end,
+                    pause=pause,
+                    exch_list=[source_name],
+                    prefer_spot=prefer_spot,
+                    cache_dir=cache_dir,
+                    use_cache=use_cache,
+                    refresh_policy=refresh_policy,
+                    allow_swap_fallback=allow_swap_fallback,
+                    allow_gaps=allow_gaps,
+                    require_full_coverage=require_full_coverage,
+                    allow_partial_sources=partial_sources,
+                )
+            except Exception as exc:
+                source_errors.append(f"{source_name}: {exc}")
+        details = " | ".join(source_errors) if source_errors else "no configured source"
+        raise ValueError(f"資料來源無法取得 {str(symbol).upper()}/USDT 的 K 線。{details}")
+
     base = symbol.upper()
     step_ms = _interval_ms(interval)
-    exnames = exch_list or _EXCH_LIST
+    exnames = list(exch_list)
 
-    # 讀快取（除非 force）
+    # 讀取與請求來源完全相同的快取（除非 force）。
     cached_df = None
+    cached_exchange = None
+    cached_market_type = None
     if use_cache and refresh_policy != "force":
-        cached_df = _load_cached_klines(cache_dir, base, interval)
+        if prefer_spot:
+            market_preferences = ["spot"] + (["swap"] if allow_swap_fallback else [])
+        else:
+            market_preferences = ["swap", "spot"]
+        for name in exnames:
+            for market_type in market_preferences:
+                cached_df = _load_cached_klines(
+                    cache_dir, base, interval, str(name), market_type
+                )
+                if cached_df is not None and not cached_df.empty:
+                    cached_exchange = str(name)
+                    cached_market_type = market_type
+                    break
+            if cached_df is not None and not cached_df.empty:
+                break
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     expected_end_ms = _align_to_interval_end(now_ms, step_ms)
@@ -294,52 +322,62 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
                     refresh_end = expected_end_ms
             else:
                 s_ms = _to_ms(start)
-                e_ms = _to_ms(end, end_of_day=True)
-                if not _range_is_covered(cached_df, s_ms, e_ms, step_ms):
+                e_ms = min(_to_ms(end, end_of_day=True), expected_end_ms)
+                if e_ms < s_ms:
+                    raise ValueError("指定區間尚無已收盤 K 線")
+                cached_requires_full = (
+                    require_full_coverage
+                    and str(cached_exchange or "").lower() not in partial_sources
+                )
+                if (not cached_requires_full) and cached_max_ms + step_ms <= e_ms:
+                    need_refresh = True
+                    refresh_since = max(s_ms, cached_max_ms + step_ms)
+                    refresh_end = e_ms
+                elif cached_requires_full and not _range_is_covered(cached_df, s_ms, e_ms, step_ms):
                     need_refresh = True
                     refresh_since = s_ms
                     refresh_end = e_ms
 
             if need_refresh:
                 try:
-                    for name in exnames:
-                        ex_cls = getattr(ccxt, name, None)
-                        if ex_cls is None:
+                    refresh_names = [cached_exchange] if cached_exchange else list(exnames)
+                    for name in refresh_names:
+                        require_spot = cached_market_type != "swap"
+                        m_symbol, m_type, ohlcv_new = _fetch_source_ohlcv(
+                            name,
+                            base,
+                            interval,
+                            refresh_since,
+                            refresh_end,
+                            pause,
+                            prefer_spot=require_spot,
+                            allow_swap_fallback=(cached_market_type == "swap"),
+                        )
+                        if not m_symbol or (cached_market_type and m_type != cached_market_type):
                             continue
-                        ex = ex_cls({"enableRateLimit": True})
-                        try:
-                            markets = ex.load_markets()
-                            m_symbol, m_type = _find_market_symbol(markets, base, prefer_spot=prefer_spot)
-                            if not m_symbol:
-                                continue
-                            ohlcv_new = _ccxt_fetch_ohlcv_segmented(
-                                ex, m_symbol, timeframe=interval,
-                                since_ms=refresh_since, end_ms=refresh_end, pause=pause
-                            )
-                            if ohlcv_new:
-                                df_new = _ohlcv_to_taipei_df(ohlcv_new)
-                                tmp = pd.concat([cached_df, df_new], ignore_index=True)
-                                tmp = tmp.drop_duplicates(subset="time").sort_values("time")
-                                price_cols = [
-                                    c for c in ("open", "high", "low", "close", "volume")
-                                    if c in tmp.columns
-                                ]
-                                cached_df = tmp[["time", *price_cols]].copy()
+                        if ohlcv_new:
+                            df_new = _ohlcv_to_taipei_df(ohlcv_new)
+                            tmp = pd.concat([cached_df, df_new], ignore_index=True)
+                            tmp = tmp.drop_duplicates(subset="time").sort_values("time")
+                            price_cols = [
+                                c for c in ("open", "high", "low", "close", "volume")
+                                if c in tmp.columns
+                            ]
+                            cached_df = tmp[["time", *price_cols]].copy()
 
-                                attrs = {
-                                    "exchange": name,
-                                    "market": (f"spot:{name}" if m_type=="spot" else f"usdt_perp:{name}"),
-                                    "symbol": f"{base}USDT",
-                                    "interval": interval
-                                }
-                                if use_cache and PARQUET_OK:
-                                    _save_cached_klines(cache_dir, base, interval, cached_df, attrs)
-                                cached_df.attrs = attrs.copy()
-                                break
-                        finally:
-                            if hasattr(ex, "close"):
-                                try: ex.close()
-                                except Exception: pass
+                            attrs = {
+                                "exchange": name,
+                                "market": (f"spot:{name}" if m_type=="spot" else f"usdt_perp:{name}"),
+                                "market_type": m_type,
+                                "symbol": f"{base}USDT",
+                                "interval": interval
+                            }
+                            if use_cache and PARQUET_OK:
+                                _save_cached_klines(
+                                    cache_dir, base, interval, name, m_type, cached_df, attrs
+                                )
+                            cached_df.attrs = attrs.copy()
+                            break
                 except Exception as e:
                     print(f"[Warning] Auto-refresh failed: {e}")
                     # traceback.print_exc()
@@ -350,8 +388,8 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
             n = int(bars)
             out = cached_df
             # 再以 expected_end_ms 做一次對齊切齊
-            utc_idx = pd.DatetimeIndex(out["time"]).tz_convert("UTC").asi8  # ns
-            mask_end = utc_idx <= (expected_end_ms * 1_000_000)  # ns
+            utc_idx_ms = _datetime_index_ms(out["time"])
+            mask_end = utc_idx_ms <= expected_end_ms
             out = out.loc[mask_end]
             if len(out) >= n:
                 out = out.iloc[-n:].copy()
@@ -360,76 +398,120 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
                 out.attrs["interval"] = base_attrs.get("interval", interval)
                 out.attrs["exchange"] = base_attrs.get("exchange", base_attrs.get("exch", None))
                 out.attrs["market"]   = base_attrs.get("market",   None)
-                return out
+                out.attrs["market_type"] = base_attrs.get("market_type", cached_market_type)
+                try:
+                    _validate_kline_frame(out, step_ms, allow_gaps=allow_gaps)
+                    return out
+                except ValueError as e:
+                    print(f"[Warning] Cached K-line validation failed: {e}")
             # 快取太短 → 走抓取流程
         else:
             s_ms = _to_ms(start)
-            e_ms = _to_ms(end, end_of_day=True)
+            e_ms = min(_to_ms(end, end_of_day=True), expected_end_ms)
+            if e_ms < s_ms:
+                raise ValueError("指定區間尚無已收盤 K 線")
             s_utc = _to_timestamp(start).tz_convert("UTC")
-            e_utc = _to_timestamp(end, end_of_day=True).tz_convert("UTC")
+            e_utc = pd.Timestamp(e_ms, unit="ms", tz="UTC")
             utc_idx = pd.DatetimeIndex(cached_df["time"]).tz_convert("UTC")
             mask = (utc_idx >= s_utc) & (utc_idx <= e_utc)
             sliced = cached_df.loc[mask].copy()
-            if _range_is_covered(sliced, s_ms, e_ms, step_ms):
+            cached_requires_full = (
+                require_full_coverage
+                and str(cached_exchange or "").lower() not in partial_sources
+            )
+            coverage_complete = _range_is_covered(sliced, s_ms, e_ms, step_ms)
+            if (not cached_requires_full and not sliced.empty) or coverage_complete:
                 base_attrs = getattr(cached_df, "attrs", {})
                 sliced.attrs["symbol"]   = base_attrs.get("symbol",   f"{base}USDT")
                 sliced.attrs["interval"] = base_attrs.get("interval", interval)
                 sliced.attrs["exchange"] = base_attrs.get("exchange", base_attrs.get("exch", None))
                 sliced.attrs["market"]   = base_attrs.get("market",   None)
-                return sliced
+                sliced.attrs["market_type"] = base_attrs.get("market_type", cached_market_type)
+                sliced.attrs["coverage_complete"] = bool(coverage_complete)
+                sliced.attrs["requested_start_ms"] = int(s_ms)
+                sliced.attrs["requested_end_ms"] = int(e_ms)
+                if not sliced.empty:
+                    actual_ms = _datetime_index_ms(sliced["time"])
+                    sliced.attrs["actual_start_ms"] = int(actual_ms[0])
+                    sliced.attrs["actual_end_ms"] = int(actual_ms[-1])
+                try:
+                    _validate_kline_frame(sliced, step_ms, allow_gaps=allow_gaps)
+                    return sliced
+                except ValueError as e:
+                    print(f"[Warning] Cached K-line validation failed: {e}")
             # 覆蓋不到 → 走抓取流程
 
     # ====== 走抓取（force 或無快取或快取不足）======
     if bars is not None:
         end_ms = expected_end_ms
-        since_ms = end_ms - int(bars) * step_ms
+        n_bars = int(bars)
+        if n_bars <= 0:
+            raise ValueError("bars 必須 > 0")
+        since_ms = end_ms - (n_bars - 1) * step_ms
     else:
         since_ms = _to_ms(start)
-        end_ms   = _to_ms(end, end_of_day=True)
+        end_ms = min(_to_ms(end, end_of_day=True), expected_end_ms)
+        if end_ms < since_ms:
+            raise ValueError("指定區間尚無已收盤 K 線")
 
     last_error = None
     for name in exnames:
         try:
-            ex_cls = getattr(ccxt, name, None)
-            if ex_cls is None:
+            m_symbol, m_type, ohlcv = _fetch_source_ohlcv(
+                name,
+                base,
+                interval,
+                since_ms,
+                end_ms,
+                pause,
+                prefer_spot=prefer_spot,
+                allow_swap_fallback=allow_swap_fallback,
+            )
+            if not m_symbol:
                 continue
-            ex = ex_cls({"enableRateLimit": True})
-            try:
-                markets = ex.load_markets()
-                m_symbol, m_type = _find_market_symbol(markets, base, prefer_spot=prefer_spot)
-                if not m_symbol:
-                    continue
+            df = _ohlcv_to_taipei_df(ohlcv)
+            if df is None or df.empty:
+                continue
 
-                ohlcv = _ccxt_fetch_ohlcv_segmented(
-                    ex, m_symbol, timeframe=interval,
-                    since_ms=since_ms, end_ms=end_ms, pause=pause
+            df.attrs["exchange"] = name
+            df.attrs["market"] = f"spot:{name}" if m_type == "spot" else f"usdt_perp:{name}"
+            df.attrs["market_type"] = m_type
+            df.attrs["symbol"] = f"{base}USDT"
+            df.attrs["interval"] = interval
+
+            if bars is not None and len(df) > int(bars):
+                df = df.iloc[-int(bars):].copy()
+                df.attrs = df.attrs.copy()
+            _validate_kline_frame(df, step_ms, allow_gaps=allow_gaps)
+            source_requires_full = (
+                require_full_coverage and str(name).lower() not in partial_sources
+            )
+            if source_requires_full:
+                if bars is not None and len(df) < int(bars):
+                    raise ValueError(f"K 線僅取得 {len(df)}/{int(bars)} 根")
+                if bars is None and not _range_is_covered(df, since_ms, end_ms, step_ms):
+                    raise ValueError("K 線未完整覆蓋指定起訖區間")
+            if bars is not None:
+                coverage_complete = len(df) >= int(bars)
+            else:
+                coverage_complete = _range_is_covered(df, since_ms, end_ms, step_ms)
+            df.attrs["coverage_complete"] = bool(coverage_complete)
+            df.attrs["requested_start_ms"] = int(since_ms)
+            df.attrs["requested_end_ms"] = int(end_ms)
+            actual_ms = _datetime_index_ms(df["time"])
+            df.attrs["actual_start_ms"] = int(actual_ms[0])
+            df.attrs["actual_end_ms"] = int(actual_ms[-1])
+            if use_cache and PARQUET_OK:
+                _save_cached_klines(
+                    cache_dir, base, interval, name, m_type, df, df.attrs
                 )
-                df = _ohlcv_to_taipei_df(ohlcv)
-                if df is None or df.empty:
-                    continue
-
-                df.attrs["exchange"] = name
-                df.attrs["market"] = f"spot:{name}" if m_type == "spot" else f"usdt_perp:{name}"
-                df.attrs["symbol"] = f"{base}USDT"
-                df.attrs["interval"] = interval
-
-                if use_cache and PARQUET_OK:
-                    _save_cached_klines(cache_dir, base, interval, df, df.attrs)
-
-                if bars is not None and len(df) > int(bars):
-                    df = df.iloc[-int(bars):].copy()
-                    df.attrs = df.attrs.copy()
-                return df
-            finally:
-                if hasattr(ex, "close"):
-                    try: ex.close()
-                    except Exception: pass
+            return df
 
         except Exception as e:
             last_error = e
             continue
 
-    raise ValueError(f"CCXT 無法在以下交易所找到 {base}/USDT 的 K 線。最後錯誤：{last_error}")
+    raise ValueError(f"資料來源無法取得 {base}/USDT 的 K 線。最後錯誤：{last_error}")
 
 
 # --- 向下相容薄封裝 ---
@@ -447,19 +529,32 @@ def get_klines_range(symbol="ETH", interval="1h", start="2025-01-01", end="2025-
 
 # ===================== 策略與績效（單次模擬） =====================
 
-def calc_init_order(capital, multiplier, max_orders):
-    """計算首單等比序列的單筆本金（避免 multiplier ≈ 1 的數值不穩）。"""
+def _order_factor_sum(multiplier: float, max_orders: int) -> float:
+    """Return 1 + 1 + m + m^2 ... without the cancellation near m == 1."""
     if max_orders <= 0:
         raise ValueError("max_orders 必須 > 0")
-    if multiplier <= 0:
-        raise ValueError("multiplier 必須 > 0")
-    if (abs(multiplier - 1.0) < 1e-9) or (max_orders <= 2):
-        total_factor = float(max_orders)
-    else:
-        k = max_orders - 2
-        tail_sum = (multiplier**(k + 1) - multiplier) / (multiplier - 1.0)
-        total_factor = 2.0 + tail_sum
-    return capital / total_factor
+    if not math.isfinite(multiplier) or multiplier <= 0:
+        raise ValueError("multiplier 必須為有限正數")
+
+    total_factor = 0.0
+    factor = 1.0
+    for order_no in range(1, int(max_orders) + 1):
+        if order_no >= 3:
+            factor *= multiplier
+        total_factor += factor
+        if not math.isfinite(total_factor):
+            raise ValueError("multiplier/max_orders 組合過大，資金倍率已溢位")
+    return total_factor
+
+
+def calc_init_order(capital, multiplier, max_orders, fee_rate=0.0):
+    """計算首單本金，並預留整個樓梯所有買入手續費。"""
+    if not math.isfinite(float(capital)) or capital <= 0:
+        raise ValueError("capital 必須為有限正數")
+    if not math.isfinite(float(fee_rate)) or not (0.0 <= fee_rate < 1.0):
+        raise ValueError("fee_rate 必須滿足 0 <= fee_rate < 1")
+    total_factor = _order_factor_sum(float(multiplier), int(max_orders))
+    return float(capital) / ((1.0 + float(fee_rate)) * total_factor)
 
 
 def _annualization_factor_from_times(times: list[pd.Timestamp]) -> float:
@@ -521,10 +616,27 @@ def _trade_streaks(pnls: list[float]):
     return max_w, max_l
 
 
-def compute_performance_metrics(equity_curve, time_index, trades_log, capital, bh_curve=None):
+def compute_performance_metrics(
+    equity_curve,
+    time_index,
+    trades_log,
+    capital,
+    bh_curve=None,
+    position_curve=None,
+    open_trade=None,
+    max_dd_override=None,
+):
+    if not math.isfinite(float(capital)) or capital <= 0:
+        raise ValueError("capital 必須為有限正數")
+    if len(equity_curve) != len(time_index):
+        raise ValueError("equity_curve 與 time_index 長度必須一致")
     ec = pd.Series(equity_curve, index=pd.to_datetime(time_index))
     if ec.empty:
         raise ValueError("equity_curve must contain at least 1 point")
+    if not np.isfinite(ec.to_numpy(dtype=np.float64)).all() or np.any(ec.to_numpy(dtype=np.float64) <= 0):
+        raise ValueError("equity_curve 必須為有限正數")
+    if not ec.index.is_monotonic_increasing or ec.index.has_duplicates:
+        raise ValueError("time_index 必須嚴格遞增且不可重複")
 
     ec_stats = ec
     if capital > 0 and not np.isclose(float(ec.iloc[0]), float(capital)):
@@ -550,14 +662,29 @@ def compute_performance_metrics(equity_curve, time_index, trades_log, capital, b
     ddv = downside.std() * math.sqrt(af) if len(downside) > 0 else np.nan
     sortino = (mu / ddv) if (pd.notna(mu) and ddv and ddv > 0) else np.nan
     max_dd_pct, peak_t, trough_t, recover_t, max_uw_days, avg_uw_days = _max_drawdown_with_timing(ec_stats)
+    if max_dd_override is not None and np.isfinite(float(max_dd_override)):
+        # The execution engine can observe an intrabar low that is not present in
+        # the close-only equity curve. Keep timing close-based but report the
+        # more conservative magnitude.
+        max_dd_pct = max(float(max_dd_pct), float(max_dd_override))
     calmar = (cagr / (max_dd_pct/100.0)) if (pd.notna(cagr) and max_dd_pct > 0) else np.nan
     max_dd_days = ((trough_t - peak_t).total_seconds() / 86400.0) if (pd.notna(peak_t) and pd.notna(trough_t)) else None
     recov_days  = ((recover_t - trough_t).total_seconds() / 86400.0) if (pd.notna(recover_t) and pd.notna(trough_t)) else None
     total_bars = len(ec)
-    bars_held_sum = sum(t["bars_held"] for t in trades_log) if trades_log else 0
-    exposure = bars_held_sum / total_bars if total_bars > 0 else 0.0
-    closed = trades_log
-    pnl_list = [t["pnl"] for t in closed]
+    if position_curve is not None:
+        pos = np.asarray(position_curve, dtype=bool)
+        if pos.shape[0] != total_bars:
+            raise ValueError("position_curve 長度必須與 equity_curve 相同")
+        exposure = float(np.mean(pos)) if total_bars > 0 else 0.0
+    else:
+        bars_held_sum = sum(t["bars_held"] for t in trades_log) if trades_log else 0
+        exposure = bars_held_sum / total_bars if total_bars > 0 else 0.0
+
+    closed = list(trades_log or [])
+    outcomes = list(closed)
+    if isinstance(open_trade, dict) and np.isfinite(float(open_trade.get("pnl", np.nan))):
+        outcomes.append(open_trade)
+    pnl_list = [float(t["pnl"]) for t in outcomes]
     win_pnls = [p for p in pnl_list if p > 0]
     loss_pnls = [p for p in pnl_list if p < 0]
     wins = len(win_pnls)
@@ -572,27 +699,48 @@ def compute_performance_metrics(equity_curve, time_index, trades_log, capital, b
     else:
         profit_factor = sum(win_pnls) / abs(sum(loss_pnls))
     max_consec_w, max_consec_l = _trade_streaks(pnls=pnl_list)
-    rtn_list = [t["rtn"] for t in closed]
+    rtn_list = [t["rtn"] for t in outcomes]
     avg_trade_rtn = np.mean(rtn_list) if rtn_list else np.nan
     med_trade_rtn = np.median(rtn_list) if rtn_list else np.nan
     diffs = pd.Series(ec.index).diff().dropna().dt.total_seconds()
     bar_sec = float(diffs.median()) if len(diffs) else 3600.0
-    dur_bars = [t["bars_held"] for t in closed]
+    dur_bars = [t["bars_held"] for t in outcomes]
     avg_bars = np.mean(dur_bars) if dur_bars else np.nan
     med_bars = np.median(dur_bars) if dur_bars else np.nan
     avg_days = (avg_bars * bar_sec) / 86400.0 if not np.isnan(avg_bars) else np.nan
     med_days = (med_bars * bar_sec) / 86400.0 if not np.isnan(med_bars) else np.nan
     bh_stats = {}
     if bh_curve is not None:
-        bh = pd.Series(bh_curve, index=ec.index)
-        bh_rets = bh.pct_change().dropna()
+        if len(bh_curve) != len(ec):
+            raise ValueError("bh_curve 長度必須與 equity_curve 相同")
+        bh = pd.Series(np.asarray(bh_curve, dtype=np.float64), index=ec.index)
+        if not np.isfinite(bh.to_numpy()).all() or np.any(bh.to_numpy() <= 0):
+            raise ValueError("bh_curve 必須為有限正數")
+        bh_stats_curve = bh
+        if not np.isclose(float(bh.iloc[0]), float(capital)):
+            if len(bh.index) >= 2:
+                inferred_step = bh.index[1] - bh.index[0]
+                if inferred_step <= pd.Timedelta(0):
+                    inferred_step = pd.Timedelta(seconds=1)
+            else:
+                inferred_step = pd.Timedelta(seconds=1)
+            baseline_ts = bh.index[0] - inferred_step
+            bh_stats_curve = pd.concat([
+                pd.Series([float(capital)], index=[baseline_ts]), bh
+            ])
+        bh_rets = bh_stats_curve.pct_change().dropna()
         bh_mu = bh_rets.mean() * af if len(bh_rets) > 0 else np.nan
         bh_ann_vol = bh_rets.std() * math.sqrt(af) if len(bh_rets) > 1 else np.nan
         bh_sharpe = (bh_mu / bh_ann_vol) if (pd.notna(bh_mu) and bh_ann_vol and bh_ann_vol > 0) else np.nan
-        bh_total = bh.iloc[-1]/bh.iloc[0] - 1.0
-        bh_years = _years_between(bh.index[0], bh.index[-1]) if len(bh) >= 2 else np.nan
-        bh_cagr = (bh.iloc[-1]/bh.iloc[0])**(1.0/bh_years) - 1.0 if (pd.notna(bh_years) and bh_years > 0) else np.nan
-        bh_mdd_pct, *_ = _max_drawdown_with_timing(bh)
+        bh_total = bh_stats_curve.iloc[-1]/bh_stats_curve.iloc[0] - 1.0
+        bh_years = _years_between(
+            bh_stats_curve.index[0], bh_stats_curve.index[-1]
+        ) if len(bh_stats_curve) >= 2 else np.nan
+        bh_cagr = (
+            (bh_stats_curve.iloc[-1]/bh_stats_curve.iloc[0])**(1.0/bh_years) - 1.0
+            if (pd.notna(bh_years) and bh_years > 0) else np.nan
+        )
+        bh_mdd_pct, *_ = _max_drawdown_with_timing(bh_stats_curve)
         bh_stats = {
             "bh_total_return": bh_total, "bh_cagr": bh_cagr,
             "bh_ann_vol": bh_ann_vol, "bh_sharpe": bh_sharpe,
@@ -621,15 +769,18 @@ def compute_performance_metrics(equity_curve, time_index, trades_log, capital, b
         "median_trade_return": med_trade_rtn,
         "avg_hold_days": avg_days,
         "median_hold_days": med_days,
+        "closed_trades": len(closed),
+        "has_open_position": bool(open_trade),
+        "open_trade_pnl": float(open_trade["pnl"]) if isinstance(open_trade, dict) else np.nan,
         **bh_stats
     }
 
 # ===== 百分比字串工具（0.014 -> "1.4"）=====
 
 def pct_str(x: float, digits: int = 1) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
+    if x is None or pd.isna(x):
         return "NaN"
-    if isinstance(x, float) and np.isinf(x):
+    if np.isinf(float(x)):
         return "∞"
     return f"{x * 100:.{digits}f}"
 
@@ -644,31 +795,63 @@ def martingale_backtest(
     return_curve=False,
     times=None,
     fee_rate=0.0,   # 由呼叫端傳入（預設不計費用）
+    opens=None,
+    highs=None,
+    lows=None,
 ):
-    """單次模擬（Python 版）— 固定樓梯加倉。
-    - base_price：一輪的固定基準價（首單成交價）。
-    - next_level_idx：下一層要觀察的台階序號（1..max_orders-1）。
-    """
-    if add_drop <= 0 or tp <= 0 or max_orders < 1 or multiplier <= 0:
-        raise ValueError("參數異常：add_drop,tp需>0，max_orders>=1，multiplier>0")
+    """固定樓梯加倉回測。
 
-    if prices is None or len(prices) == 0:
-        raise ValueError("prices must contain at least 1 value")
+    歷史模式可傳入 OHLC。補單按各樓梯價成交；若同一根 K 同時觸發
+    補單與 TP，採保守順序：先補單，且該根不再止盈。只提供 prices
+    時會使用 O=H=L=C，僅供 close-path 向下相容使用；目前 GUI 的 MC
+    會另外重抽樣歷史 OHLC 形狀並直接呼叫 OHLC 核心。
+    """
+    closes = np.asarray(prices, dtype=np.float64)
+    if closes.ndim != 1 or closes.size == 0:
+        raise ValueError("prices must be a non-empty 1-D array")
+    opens_np = closes if opens is None else np.asarray(opens, dtype=np.float64)
+    highs_np = closes if highs is None else np.asarray(highs, dtype=np.float64)
+    lows_np = closes if lows is None else np.asarray(lows, dtype=np.float64)
+    if any(x.ndim != 1 or x.size != closes.size for x in (opens_np, highs_np, lows_np)):
+        raise ValueError("open/high/low/close 長度必須一致")
+    if not all(np.isfinite(x).all() for x in (opens_np, highs_np, lows_np, closes)):
+        raise ValueError("OHLC 不可包含 NaN/Inf")
+    if not all((x > 0.0).all() for x in (opens_np, highs_np, lows_np, closes)):
+        raise ValueError("OHLC 價格必須全部 > 0")
+    if np.any(highs_np < np.maximum(opens_np, closes)) or np.any(lows_np > np.minimum(opens_np, closes)):
+        raise ValueError("OHLC 關係異常：high/low 未包住 open/close")
+    if np.any(highs_np < lows_np):
+        raise ValueError("OHLC 關係異常：high < low")
+    if not all(math.isfinite(float(x)) for x in (add_drop, tp, multiplier, capital, fee_rate)):
+        raise ValueError("策略參數必須為有限數")
+    if not (0.0 < add_drop < 1.0) or tp <= 0 or max_orders < 1 or multiplier <= 0:
+        raise ValueError("參數需滿足：0 < add_drop < 1、tp > 0、max_orders >= 1、multiplier > 0")
+    if capital <= 0:
+        raise ValueError("capital 必須 > 0")
+    if not (0.0 <= fee_rate < 1.0):
+        raise ValueError("fee_rate 必須滿足 0 <= fee_rate < 1")
+    time_values = None
+    if times is not None:
+        if len(times) != closes.size:
+            raise ValueError("times 長度必須與 prices 相同")
+        time_idx = pd.DatetimeIndex(times)
+        if len(times) >= 2:
+            if not time_idx.is_monotonic_increasing or time_idx.has_duplicates:
+                raise ValueError("times 必須嚴格遞增且不可重複")
+        time_values = time_idx.tolist()
 
     cash = capital
     qty = 0.0
-    cost = 0.0
     order_count = 0
     init_order_round = None
     entry_time = None
     round_cost_sum = 0.0
     round_fee_sum = 0.0    # 本輪累計買入手續費
     bars_held_this_round = 0
-    anchor_price = None    # 相容欄位（不作為門檻）
-
-    # 固定樓梯狀態
     base_price = None
-    next_level_idx = 1
+    next_level_price = None
+    next_order_factor = 1.0
+    target_exit_price = None
 
     peak_equity_overall = capital
     max_drawdown_overall = 0.0
@@ -676,44 +859,85 @@ def martingale_backtest(
     trades = 0
     equity_curve, time_curve = [], []
     trades_log = []
+    position_curve = []
+    trapped_mask = []
 
     trapped_intervals = []
     start_trapped = None
     is_trapped_prev = False
 
-    for idx, price in enumerate(prices):
-        current_time = times[idx] if times is not None else idx
+    r = 1.0 - float(add_drop)
+    sell_fee_mult = 1.0 - float(fee_rate)
+
+    for idx, price in enumerate(closes):
+        current_time = time_values[idx] if time_values is not None else idx
+        high = float(highs_np[idx])
+        low = float(lows_np[idx])
+        low_equity = None
 
         # 開倉（設定固定樓梯基準）
         if qty == 0.0 and cash > 0:
-            init_order_round = calc_init_order(cash, multiplier, max_orders)
+            init_order_round = calc_init_order(cash, multiplier, max_orders, fee_rate=fee_rate)
             alloc = min(init_order_round, cash / (1.0 + fee_rate))
             if alloc > 0:
                 buy_qty = alloc / price
                 qty += buy_qty
-                cost += alloc
                 fee = alloc * fee_rate
                 cash -= (alloc + fee)
                 round_fee_sum += fee
-                entry_time = times[idx] if times is not None else idx
-                anchor_price = price     # 保留但不作觸發
-                base_price = price       # 固定樓梯基準價
-                next_level_idx = 1
+                entry_time = current_time
+                base_price = float(price)
+                next_level_price = base_price * r
+                next_order_factor = 1.0
                 order_count = 1
                 round_cost_sum = alloc
                 bars_held_this_round = 0
+                target_exit_price = (
+                    round_cost_sum + round_fee_sum + round_cost_sum * tp
+                ) / (qty * sell_fee_mult)
         elif qty > 0.0:
             bars_held_this_round += 1
+            added_this_bar = False
 
-            # 止盈（以含費 PnL 達標為準）
-            prospective_proceeds = qty * price * (1.0 - fee_rate)
-            prospective_pnl = prospective_proceeds - round_cost_sum - round_fee_sum
-            target_pnl = round_cost_sum * tp
-            if prospective_pnl >= target_pnl:
+            # 所有已掛樓梯按各自 trigger price 成交。用極小 tolerance
+            # 僅吸收浮點乘法誤差，不改變實際門檻。
+            while (
+                order_count < max_orders
+                and cash > 0.0
+                and next_level_price is not None
+                and low <= next_level_price * (1.0 + 1e-12)
+            ):
+                target_alloc = init_order_round * next_order_factor
+                max_afford = cash / (1.0 + fee_rate)
+                alloc = min(target_alloc, max_afford)
+                if alloc <= 0.0:
+                    break
+                fill_price = next_level_price
+                qty += alloc / fill_price
+                fee = alloc * fee_rate
+                cash -= alloc + fee
+                round_cost_sum += alloc
+                round_fee_sum += fee
+                order_count += 1
+                added_this_bar = True
+                next_level_price *= r
+                if multiplier != 1.0 and order_count >= 2:
+                    next_order_factor *= multiplier
+
+            if qty > 0.0:
+                target_exit_price = (
+                    round_cost_sum + round_fee_sum + round_cost_sum * tp
+                ) / (qty * sell_fee_mult)
+                low_equity = cash + qty * low * sell_fee_mult
+
+            # 同棒有補單時不允許立即止盈，避免未知 OHLC 路徑造成樂觀偏誤。
+            if (not added_this_bar) and target_exit_price is not None and high >= target_exit_price:
+                prospective_proceeds = qty * target_exit_price * sell_fee_mult
+                prospective_pnl = prospective_proceeds - round_cost_sum - round_fee_sum
                 cash += prospective_proceeds
                 pnl = prospective_pnl
                 rtn = pnl / round_cost_sum if round_cost_sum > 0 else np.nan
-                exit_time = times[idx] if times is not None else idx
+                exit_time = current_time
                 trades_log.append({
                     "entry_time": entry_time,
                     "exit_time": exit_time,
@@ -722,8 +946,6 @@ def martingale_backtest(
                     "bars_held": int(bars_held_this_round)
                 })
                 qty = 0.0
-                cost = 0.0
-                anchor_price = None
                 trades += 1
                 order_count = 0
                 init_order_round = None
@@ -731,50 +953,17 @@ def martingale_backtest(
                 round_fee_sum = 0.0
                 bars_held_this_round = 0
                 base_price = None
-                next_level_idx = 1
-            else:
-                # 固定樓梯加倉（O(1)層級計算）：
-                # 直接用當前價位相對 base_price 的比值，推回理論應觸發的最高層級 k*
-                if order_count < max_orders and cash > 0.0 and base_price is not None:
-                    r = (1.0 - add_drop)
-                    if r > 0.0 and price <= base_price:
-                        ratio = price / base_price if base_price > 0 else 0.0
-                        if ratio <= 0.0:
-                            k_star = max_orders - 1
-                        elif r <= 0.0:
-                            k_star = 0
-                        else:
-                            # 注意 log(r)<0，因此 floor(log(ratio)/log(r)) 為非負整數
-                            k_star = int(math.floor(math.log(ratio) / math.log(r)))
-                            if k_star < 0:
-                                k_star = 0
-                            elif k_star > (max_orders - 1):
-                                k_star = max_orders - 1
-                        # 需要新增的層數
-                        if k_star >= next_level_idx:
-                            to_add = min(k_star - next_level_idx + 1, max_orders - order_count)
-                            for _ in range(to_add):
-                                next_idx = order_count + 1  # 第幾筆訂單（含首單）
-                                if next_idx <= 2 or multiplier == 1:
-                                    factor = 1.0
-                                else:
-                                    factor = multiplier ** (next_idx - 2)
-                                target_alloc = init_order_round * factor
-                                max_afford = cash / (1.0 + fee_rate)
-                                alloc = target_alloc if target_alloc < max_afford else max_afford
-                                if alloc <= 0.0:
-                                    break
-                                add_qty = alloc / price
-                                qty += add_qty
-                                cost += alloc
-                                fee = alloc * fee_rate
-                                cash -= (alloc + fee)
-                                round_cost_sum += alloc
-                                round_fee_sum += fee
-                                order_count += 1
-                                next_level_idx += 1
+                next_level_price = None
+                next_order_factor = 1.0
+                target_exit_price = None
 
-        equity = cash + qty * price  # 未平倉不扣賣出費，買入費已在 cash 反映
+        if low_equity is not None and peak_equity_overall > 0:
+            dd_low = (low_equity - peak_equity_overall) / peak_equity_overall
+            if dd_low < max_drawdown_overall:
+                max_drawdown_overall = dd_low
+
+        # 用可清算淨值計價，包含假設性賣出費。
+        equity = cash + qty * price * sell_fee_mult
         if equity > peak_equity_overall:
             peak_equity_overall = equity
         if peak_equity_overall > 0:
@@ -785,10 +974,14 @@ def martingale_backtest(
         if return_curve:
             equity_curve.append(equity)
             time_curve.append(current_time)
+            position_curve.append(qty > 0.0)
 
-        # 套牢判定改為 bar 結束狀態，避免把同一根已解套/剛加滿的 bar 算錯。
-        avg_cost = cost / qty if qty > 0 else float('inf')
-        is_trapped = (order_count == max_orders and qty > 0 and price < avg_cost)
+        is_trapped = (
+            order_count == max_orders
+            and qty > 0.0
+            and qty * price * sell_fee_mult < (round_cost_sum + round_fee_sum)
+        )
+        trapped_mask.append(bool(is_trapped))
         if is_trapped and not is_trapped_prev:
             start_trapped = current_time
         elif not is_trapped and is_trapped_prev and start_trapped is not None:
@@ -798,9 +991,25 @@ def martingale_backtest(
 
     # 期末：若最後仍在套牢，記錄到結束
     if start_trapped is not None:
-        trapped_intervals.append((start_trapped, current_time))
+        if time_values is not None and len(time_values) >= 2:
+            terminal_interval_end = current_time + (time_values[-1] - time_values[-2])
+        else:
+            terminal_interval_end = current_time + 1
+        trapped_intervals.append((start_trapped, terminal_interval_end))
 
-    final_equity = cash + (qty * prices[-1])  # 未平倉不收賣出費（維持原版）
+    final_equity = cash + qty * closes[-1] * sell_fee_mult
+    open_trade = None
+    if qty > 0.0:
+        open_proceeds = qty * closes[-1] * sell_fee_mult
+        open_pnl = open_proceeds - round_cost_sum - round_fee_sum
+        open_trade = {
+            "entry_time": entry_time,
+            "exit_time": time_values[-1] if time_values is not None else int(closes.size - 1),
+            "pnl": float(open_pnl),
+            "rtn": float(open_pnl / round_cost_sum) if round_cost_sum > 0 else np.nan,
+            "bars_held": int(bars_held_this_round),
+            "is_open": True,
+        }
     result = {
         "add_drop": add_drop,
         "multiplier": multiplier,
@@ -809,49 +1018,67 @@ def martingale_backtest(
         "capital": capital,
         "final_equity": round(final_equity, 2),
         "max_dd_overall": round(abs(max_drawdown_overall * 100), 2),
-        "trades": trades
+        "trades": trades,
+        "trapped_time_ratio": float(np.mean(trapped_mask)) if trapped_mask else 0.0,
+        "open_trade": open_trade,
     }
     if return_curve:
         result["equity_curve"] = equity_curve
         result["time_index"] = time_curve
         result["trades_log"] = trades_log
         result["trapped_intervals"] = trapped_intervals
+        result["position_curve"] = position_curve
+        result["trapped_mask"] = trapped_mask
     return result
 
 # ===================== 快速版（平行網格 + 先遮罩） =====================
 
 @njit(cache=True)
-def _calc_init_order_numba(capital, multiplier, max_orders):
-    if max_orders <= 0 or multiplier <= 0.0:
-        return 0.0
-    if (abs(multiplier - 1.0) < 1e-12) or (max_orders <= 2):
-        total_factor = float(max_orders)
-    else:
-        k = max_orders - 2
-        tail_sum = (multiplier**(k + 1) - multiplier) / (multiplier - 1.0)
-        total_factor = 2.0 + tail_sum
-    return capital / total_factor
+def _order_factor_sum_numba(multiplier, max_orders):
+    if max_orders <= 0 or multiplier <= 0.0 or not math.isfinite(multiplier):
+        return np.nan
+    total_factor = 0.0
+    factor = 1.0
+    for order_no in range(1, max_orders + 1):
+        if order_no >= 3:
+            factor *= multiplier
+        total_factor += factor
+        if not math.isfinite(total_factor):
+            return np.nan
+    return total_factor
 
 
 @njit(cache=True)
-def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_rate):
-    """Numba 版單次模擬（固定樓梯加倉） - 極速優化版。"""
+def _calc_init_order_numba(capital, multiplier, max_orders, fee_rate=0.0):
+    total_factor = _order_factor_sum_numba(multiplier, max_orders)
+    if not math.isfinite(total_factor) or capital <= 0.0 or fee_rate < 0.0 or fee_rate >= 1.0:
+        return np.nan
+    return capital / ((1.0 + fee_rate) * total_factor)
+
+
+@njit(cache=True)
+def _backtest_core_ohlc(opens, highs, lows, closes, add_drop, multiplier, max_orders, tp, capital, fee_rate):
+    """Numba OHLC core; mechanics mirror martingale_backtest()."""
     trapped_bars = 0
-    total_bars = prices.shape[0]
-    if total_bars == 0:
+    total_bars = closes.shape[0]
+    if total_bars == 0 or opens.shape[0] != total_bars or highs.shape[0] != total_bars or lows.shape[0] != total_bars:
+        return np.nan, np.nan, 0, np.nan
+    if (
+        not math.isfinite(add_drop) or not math.isfinite(multiplier)
+        or not math.isfinite(tp) or not math.isfinite(capital) or not math.isfinite(fee_rate)
+        or add_drop <= 0.0 or add_drop >= 1.0 or multiplier <= 0.0
+        or max_orders < 1 or tp <= 0.0 or capital <= 0.0
+        or fee_rate < 0.0 or fee_rate >= 1.0
+    ):
         return np.nan, np.nan, 0, 0.0
 
     cash = capital
     qty = 0.0
-    cost = 0.0
     order_count = 0
-    anchor_price = 0.0  # 相容欄位
     init_order_round = 0.0
 
-    # 固定樓梯狀態
     base_price = 0.0
-    inv_base_price = 0.0
-    next_level_idx = 1
+    next_level_price = 0.0
     next_order_factor = 1.0
 
     peak_equity_overall = capital
@@ -860,100 +1087,96 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
     trades = 0
     round_cost_sum = 0.0   # 累計買入本金
     round_fee_sum = 0.0    # 累計買入費
-    target_proceeds = 0.0  # 預先計算好的目標賣出總額
+    target_exit_price = 0.0
 
     inv_one_plus_fee = 1.0 / (1.0 + fee_rate)
     sell_fee_mult = 1.0 - fee_rate
     r = 1.0 - add_drop
-    log_r = math.log(r) if r > 0.0 else 0.0
     multiplier_is_one = multiplier == 1.0
-    if max_orders <= 0 or multiplier <= 0.0:
-        total_factor = 0.0
-    elif (abs(multiplier - 1.0) < 1e-12) or (max_orders <= 2):
-        total_factor = float(max_orders)
-    else:
-        k = max_orders - 2
-        tail_sum = (multiplier**(k + 1) - multiplier) / (multiplier - 1.0)
-        total_factor = 2.0 + tail_sum
+    total_factor = _order_factor_sum_numba(multiplier, max_orders)
+    if not math.isfinite(total_factor):
+        return np.nan, np.nan, 0, np.nan
 
-    for i in range(prices.shape[0]):
-        price = prices[i]
+    for i in range(total_bars):
+        price = closes[i]
+        high = highs[i]
+        low = lows[i]
+        open_price = opens[i]
+        if (
+            not math.isfinite(price) or not math.isfinite(high) or not math.isfinite(low)
+            or not math.isfinite(open_price) or price <= 0.0 or high <= 0.0 or low <= 0.0
+            or open_price <= 0.0 or high < low or high < price or high < open_price
+            or low > price or low > open_price
+        ):
+            return np.nan, np.nan, 0, np.nan
+        low_equity = 0.0
+        has_low_equity = False
 
         # 開倉
         if (qty == 0.0) and (cash > 0.0):
-            init_order_round = cash / total_factor if total_factor > 0.0 else 0.0
+            init_order_round = cash * inv_one_plus_fee / total_factor
             alloc = init_order_round
             max_afford = cash * inv_one_plus_fee
             if alloc > max_afford:
                 alloc = max_afford
             if alloc > 0.0:
                 qty += alloc / price
-                cost += alloc
                 fee = alloc * fee_rate
                 cash -= (alloc + fee)
-                anchor_price = price
                 base_price = price
-                inv_base_price = 1.0 / price if price > 0.0 else 0.0
-                next_level_idx = 1
+                next_level_price = base_price * r
                 next_order_factor = 1.0
                 order_count = 1
                 round_cost_sum = alloc
                 round_fee_sum = fee
-                target_proceeds = round_cost_sum + round_fee_sum + (round_cost_sum * tp)
+                target_exit_price = (round_cost_sum + round_fee_sum + round_cost_sum * tp) / (qty * sell_fee_mult)
 
         elif qty > 0.0:
-            # 止盈（以含費 PnL 達標）
-            prospective_proceeds = qty * price * sell_fee_mult
-            if prospective_proceeds >= target_proceeds:
+            added_this_bar = False
+            while (
+                order_count < max_orders and cash > 0.0
+                and low <= next_level_price * (1.0 + 1e-12)
+            ):
+                target_alloc = init_order_round * next_order_factor
+                max_afford = cash * inv_one_plus_fee
+                alloc = target_alloc if target_alloc < max_afford else max_afford
+                if alloc <= 0.0:
+                    break
+                qty += alloc / next_level_price
+                fee = alloc * fee_rate
+                cash -= alloc + fee
+                order_count += 1
+                round_cost_sum += alloc
+                round_fee_sum += fee
+                added_this_bar = True
+                next_level_price *= r
+                if (not multiplier_is_one) and order_count >= 2:
+                    next_order_factor *= multiplier
+
+            target_exit_price = (round_cost_sum + round_fee_sum + round_cost_sum * tp) / (qty * sell_fee_mult)
+            low_equity = cash + qty * low * sell_fee_mult
+            has_low_equity = True
+
+            if (not added_this_bar) and high >= target_exit_price:
+                prospective_proceeds = qty * target_exit_price * sell_fee_mult
                 cash += prospective_proceeds
                 qty = 0.0
-                cost = 0.0
-                anchor_price = 0.0
                 trades += 1
                 order_count = 0
                 init_order_round = 0.0
                 round_cost_sum = 0.0
                 round_fee_sum = 0.0
                 base_price = 0.0
-                inv_base_price = 0.0
-                next_level_idx = 1
+                next_level_price = 0.0
                 next_order_factor = 1.0
-            elif (order_count < max_orders) and (cash > 0.0) and (base_price > 0.0) and (price <= base_price):
-                # O(1) 計層：由當前價位計算應觸發到的最高層級 k*
-                if r > 0.0:
-                    ratio = price * inv_base_price
-                    if ratio <= 0.0:
-                        k_star = max_orders - 1
-                    elif log_r == 0.0:
-                        k_star = 0
-                    else:
-                        k_star = int(math.floor(math.log(ratio) / log_r))
-                        if k_star < 0:
-                            k_star = 0
-                        elif k_star > (max_orders - 1):
-                            k_star = max_orders - 1
-                    if k_star >= next_level_idx:
-                        to_add = min(k_star - next_level_idx + 1, max_orders - order_count)
-                        for _ in range(to_add):
-                            target_alloc = init_order_round * next_order_factor
-                            max_afford = cash * inv_one_plus_fee
-                            alloc = target_alloc if target_alloc < max_afford else max_afford
-                            if alloc <= 0.0:
-                                break
-                            qty += alloc / price
-                            cost += alloc
-                            fee = alloc * fee_rate
-                            cash -= (alloc + fee)
-                            order_count += 1
-                            round_cost_sum += alloc
-                            round_fee_sum += fee
-                            next_level_idx += 1
-                            if (not multiplier_is_one) and order_count >= 2:
-                                next_order_factor *= multiplier
-                        if to_add > 0:
-                            target_proceeds = round_cost_sum + round_fee_sum + (round_cost_sum * tp)
+                target_exit_price = 0.0
 
-        equity = cash + qty * price
+        if has_low_equity and peak_equity_overall > 0.0:
+            dd_low = (low_equity * inv_peak_equity) - 1.0
+            if dd_low < max_drawdown_overall:
+                max_drawdown_overall = dd_low
+
+        equity = cash + qty * price * sell_fee_mult
         if equity > peak_equity_overall:
             peak_equity_overall = equity
             inv_peak_equity = 1.0 / equity
@@ -962,13 +1185,25 @@ def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_ra
             if dd < max_drawdown_overall:
                 max_drawdown_overall = dd
 
-        if (order_count == max_orders) and ((price * qty) < cost):
+        if (
+            order_count == max_orders and qty > 0.0
+            and qty * price * sell_fee_mult < (round_cost_sum + round_fee_sum)
+        ):
             trapped_bars += 1
 
-    final_equity = cash + qty * prices[-1]
+    final_equity = cash + qty * closes[-1] * sell_fee_mult
     mdd_overall_pct = -max_drawdown_overall * 100.0
     trapped_ratio = (trapped_bars / total_bars) if total_bars > 0 else 0.0
     return final_equity, mdd_overall_pct, trades, trapped_ratio
+
+
+@njit(cache=True)
+def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_rate):
+    """Close-path compatibility wrapper used by Monte Carlo."""
+    return _backtest_core_ohlc(
+        prices, prices, prices, prices,
+        add_drop, multiplier, max_orders, tp, capital, fee_rate,
+    )
 
 
 @njit(parallel=True, cache=True)
@@ -987,6 +1222,30 @@ def _grid_search_parallel(prices_np, add_drop_arr, mul_arr, max_orders_arr, tp_a
             float(tp_arr[i]),
             float(capital),
             float(fee_rate)
+        )
+        fe[i] = fe_i
+        mdd[i] = mdd_i
+        tr[i] = tr_i
+        trap[i] = trap_i
+    return fe, mdd, tr, trap
+
+
+@njit(parallel=True, cache=True)
+def _grid_search_parallel_ohlc(opens, highs, lows, closes, add_drop_arr, mul_arr, max_orders_arr, tp_arr, capital, fee_rate):
+    n = add_drop_arr.shape[0]
+    fe = np.empty(n)
+    mdd = np.empty(n)
+    tr = np.empty(n)
+    trap = np.empty(n)
+    for i in prange(n):
+        fe_i, mdd_i, tr_i, trap_i = _backtest_core_ohlc(
+            opens, highs, lows, closes,
+            float(add_drop_arr[i]),
+            float(mul_arr[i]),
+            int(max_orders_arr[i]),
+            float(tp_arr[i]),
+            float(capital),
+            float(fee_rate),
         )
         fe[i] = fe_i
         mdd[i] = mdd_i

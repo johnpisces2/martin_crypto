@@ -8,7 +8,6 @@ import traceback
 import threading
 import concurrent.futures
 import time
-import re
 import math
 import os
 from collections import OrderedDict
@@ -16,12 +15,12 @@ from collections import OrderedDict
 import numpy as np
 import pandas as pd
 import ccxt
-import requests
+from market_data import coingecko, pionex, universe
 
 os.environ.setdefault("QT_API", "pyside6")
 
 from PySide6.QtCore import Qt, QDate, QThreadPool, QRunnable, QObject, Signal, Slot, QTimer, QAbstractTableModel, QModelIndex
-from PySide6.QtGui import QFont, QFontMetrics
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPalette
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
     QLineEdit, QComboBox, QPushButton, QLabel, QSplitter, QTableView, QDateEdit,
@@ -44,12 +43,13 @@ except Exception as e:
     _import_error = e
 
 DEFAULT_QUOTE_ASSET = "USDT"
-CHART_CACHE_LIMIT = 12
+CHART_CACHE_LIMIT = 96
+KLINE_MEMORY_CACHE_TTL = 300
 COINGECKO_CACHE_TTL = 600
-COINGECKO_PAGE_SIZE = 250
 COINGECKO_RANK_LOOKUP_LIMIT = 1000
 TICKER_CACHE_TTL = 30
 MIN_HISTORY_COVERAGE_RATIO = 0.80
+STOCK_TOKEN_MAX_REQUIRED_HISTORY_DAYS = 90.0
 
 
 # ===================== 指標計算 (From scan_vol_rank.py) =====================
@@ -116,71 +116,6 @@ def bb_width_pct(closes: pd.Series, n: int = 20, k: float = 2.0) -> float:
     return float((2.0 * k * sd) / ma)
 
 
-def fetch_top_mc_coins(limit=250):
-    """
-    Fetch top N coins by market cap from CoinGecko.
-    Returns a dict: { symbol_lowercase: rank }
-    """
-    limit = max(0, int(limit))
-    if limit == 0:
-        return {}
-
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    mapping = {}
-    try:
-        total_pages = math.ceil(limit / COINGECKO_PAGE_SIZE)
-        for page in range(1, total_pages + 1):
-            remaining = limit - ((page - 1) * COINGECKO_PAGE_SIZE)
-            params = {
-                "vs_currency": "usd",
-                "order": "market_cap_desc",
-                "per_page": min(remaining, COINGECKO_PAGE_SIZE),
-                "page": page,
-                "sparkline": "false",
-            }
-            resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code != 200:
-                break
-
-            data = resp.json()
-            if not data:
-                break
-
-            for item in data:
-                sym = str(item.get('symbol') or "").lower()
-                rank = item.get('market_cap_rank')
-                if sym and rank and sym not in mapping:
-                    mapping[sym] = int(rank)
-
-            if len(data) < params["per_page"]:
-                break
-            if page < total_pages:
-                time.sleep(1.0)
-
-        return mapping
-    except Exception as e:
-        print(f"CoinGecko API Error: {e}")
-        return {}
-
-
-def is_stablecoin_base(base: str) -> bool:
-    b = (base or "").upper()
-    if not b:
-        return False
-    stable_set = {
-        "USDT", "USDC", "USDD", "TUSD", "BUSD", "DAI", "FRAX", "FDUSD", "USDP", "GUSD",
-        "PYUSD", "USDS", "USDE", "USD1", "USDI", "USDJ", "USDK", "USDX", "USTC", "EUR",
-        "EURT", "EURS", "GBP", "GBPT", "USDR", "USDN", "USDB",
-    }
-    if b in stable_set:
-        return True
-    if re.match(r"^USD[A-Z0-9]{0,4}$", b):
-        return True
-    if b.endswith("USD"):
-        return True
-    return False
-
-
 class ScanSignals(QObject):
     finished = Signal(object)
     error = Signal(str)
@@ -202,9 +137,16 @@ class ScanWorker(QRunnable):
     def run(self):
         try:
             result = self.fn(self.signals, *self.args, **self.kwargs)
-            self.signals.finished.emit(result)
         except Exception:
-            self.signals.error.emit(traceback.format_exc())
+            try:
+                self.signals.error.emit(traceback.format_exc())
+            except RuntimeError:
+                pass
+        else:
+            try:
+                self.signals.finished.emit(result)
+            except RuntimeError:
+                pass
 
 
 class MarqueeLabel(QLabel):
@@ -301,7 +243,7 @@ class VolatilityScannerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("volatility_scanner_gui")
-        self.resize(1050, 820)
+        self.resize(1280, 820)
 
         self.thread_pool = QThreadPool.globalInstance()
         self.stop_event = threading.Event()
@@ -315,12 +257,13 @@ class VolatilityScannerGUI(QMainWindow):
         self._ticker_cache = {}
         self._mc_rank_cache = {"ts": 0.0, "limit": 0, "mapping": {}}
         self.cols = [
-            "Symbol", "Price", "Vol(M)", "RV(A)%", "ATR(M)%",
-            "MaxDD%", "Chg%", "ER", "MaxRed", "MC Rank",
+            "Symbol", "Asset", "Price", "Vol(M)", "Active%", "MaxGap%",
+            "RV(A)%", "ATR(M)%", "MaxDD%", "Chg%", "ER", "MaxRed", "MC Rank",
         ]
 
         self._build_ui()
         self._apply_style()
+        QTimer.singleShot(0, self._fit_initial_window_to_screen)
         QTimer.singleShot(0, self._autosize_table_columns)
         QTimer.singleShot(0, self._clear_startup_focus)
 
@@ -341,10 +284,20 @@ class VolatilityScannerGUI(QMainWindow):
             QLabel { color: #e8e8e8; }
             QLabel#fieldLabel { color: #cfd2d4; font-size: 10pt; font-weight: 600; }
             QLabel#hintLabel { color: #aeb3b8; font-size: 9pt; }
-            QLineEdit, QComboBox {
+            QLineEdit, QComboBox, QDateEdit {
                 background: #ffffff; color: #1d1d1d; border: 1px solid #b9b9b9; border-radius: 6px; padding: 3px 6px;
+                selection-background-color: #2d6a7a; selection-color: #ffffff;
             }
-            QComboBox QAbstractItemView { background: #ffffff; color: #1d1d1d; }
+            QLineEdit:disabled, QComboBox:disabled, QDateEdit:disabled {
+                background: #dedede; color: #555555; border-color: #a8a8a8;
+            }
+            QDateEdit::drop-down { background: #f2f2f2; border-left: 1px solid #c5c5c5; width: 24px; }
+            QComboBox QAbstractItemView, QDateEdit QAbstractItemView { background: #ffffff; color: #1d1d1d; }
+            QCalendarWidget QWidget { background: #ffffff; color: #1d1d1d; }
+            QCalendarWidget QAbstractItemView:enabled {
+                background: #ffffff; color: #1d1d1d;
+                selection-background-color: #2d6a7a; selection-color: #ffffff;
+            }
             QTableView { background: #ffffff; color: #1d1d1d; border: 1px solid #7c7c7c; border-radius: 8px; gridline-color: #d0d0d0; }
             QTableView::item:selected { font-weight: 400; }
             QHeaderView::section { background: #e9e9e9; color: #1d1d1d; padding: 6px; border: 0px; }
@@ -369,9 +322,24 @@ class VolatilityScannerGUI(QMainWindow):
             """
         )
 
+    @staticmethod
+    def _apply_date_edit_palette(date_edit: QDateEdit):
+        """Keep date text readable under WSL/Linux dark Qt themes."""
+        palette = date_edit.palette()
+        palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#1d1d1d"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#f2f2f2"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#1d1d1d"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#2d6a7a"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(
+            QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#555555")
+        )
+        date_edit.setPalette(palette)
+
     def _build_field(self, label_text: str, widget: QWidget, min_width: int | None = None):
         wrap = QWidget()
-        wrap.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(wrap)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -380,9 +348,24 @@ class VolatilityScannerGUI(QMainWindow):
         label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         layout.addWidget(label)
         if min_width is not None:
-            widget.setFixedWidth(min_width)
-        layout.addWidget(widget, alignment=Qt.AlignLeft)
+            widget.setMinimumWidth(min_width)
+        widget_policy = widget.sizePolicy()
+        widget.setSizePolicy(QSizePolicy.Policy.Expanding, widget_policy.verticalPolicy())
+        layout.addWidget(widget)
         return wrap
+
+    def _fit_initial_window_to_screen(self):
+        """Choose a readable initial size without exceeding the WSL display."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        min_width = min(1180, max(800, available.width() - 40))
+        min_height = min(700, max(560, available.height() - 60))
+        target_width = min(1320, max(min_width, int(available.width() * 0.82)))
+        target_height = min(960, max(min_height, int(available.height() * 0.90)))
+        self.setMinimumSize(min_width, min_height)
+        self.resize(target_width, target_height)
 
     def _build_ui(self):
         central = QWidget()
@@ -401,8 +384,8 @@ class VolatilityScannerGUI(QMainWindow):
         ctrl_layout.setSpacing(10)
 
         self.cb_exchange = QComboBox()
-        self.cb_exchange.addItems(["binance", "bybit", "okx", "gateio"])
-        self.cb_exchange.setCurrentText("binance")
+        self.cb_exchange.addItems(["pionex", "binance"])
+        self.cb_exchange.setCurrentText("pionex")
         self.cb_interval = QComboBox()
         self.cb_interval.addItems(["15m", "1h", "4h", "1d"])
         self.cb_interval.setCurrentText("4h")
@@ -414,10 +397,14 @@ class VolatilityScannerGUI(QMainWindow):
         self.d_end = QDateEdit(today)
         self.d_end.setCalendarPopup(True)
         self.d_end.setDisplayFormat("yyyy/MM/dd")
+        self._apply_date_edit_palette(self.d_start)
+        self._apply_date_edit_palette(self.d_end)
         self.e_min_vol = QLineEdit("10")
         self.e_min_avg_vol = QLineEdit("40")
+        self.cb_asset_universe = QComboBox()
+        self.cb_asset_universe.addItems(["All spot", "Stock/RWA tokens only", "Crypto only"])
         self.e_top_n = QLineEdit("50")
-        self.chk_mc_filter = QCheckBox("Filter Top Rank (CoinGecko)")
+        self.chk_mc_filter = QCheckBox("Enable rank filter")
         self.chk_mc_filter.setChecked(True)
         self.e_max_rank = QLineEdit("100")
         self.btn_scan = QPushButton("Start Scan")
@@ -445,18 +432,18 @@ class VolatilityScannerGUI(QMainWindow):
         top_row.setSpacing(10)
         ctrl_layout.addLayout(top_row)
 
-        filters_group = QGroupBox("Universe & Filters")
+        filters_group = QGroupBox("Universe && Filters")
         filters_layout = QGridLayout(filters_group)
         filters_layout.setContentsMargins(12, 14, 12, 10)
         filters_layout.setHorizontalSpacing(8)
         filters_layout.setVerticalSpacing(8)
-        filters_layout.addWidget(self._build_field("Exchange", self.cb_exchange, 110), 0, 0, alignment=Qt.AlignLeft)
-        filters_layout.addWidget(self._build_field("Interval", self.cb_interval, 110), 0, 1, alignment=Qt.AlignLeft)
-        filters_layout.addWidget(self._build_field("Start", self.d_start, 124), 0, 2, alignment=Qt.AlignLeft)
-        filters_layout.addWidget(self._build_field("End", self.d_end, 124), 0, 3, alignment=Qt.AlignLeft)
-        filters_layout.addWidget(self._build_field("Pre-filter 24h Vol (M)", self.e_min_vol, 96), 1, 0, alignment=Qt.AlignLeft)
-        filters_layout.addWidget(self._build_field("Min Avg Daily Vol (M)", self.e_min_avg_vol, 96), 1, 1, alignment=Qt.AlignLeft)
-        filters_layout.addWidget(self._build_field("Scan Top N (by Vol)", self.e_top_n, 96), 1, 2, alignment=Qt.AlignLeft)
+        filters_layout.addWidget(self._build_field("Exchange", self.cb_exchange, 110), 0, 0)
+        filters_layout.addWidget(self._build_field("Interval", self.cb_interval, 110), 0, 1)
+        filters_layout.addWidget(self._build_field("Start", self.d_start, 168), 0, 2)
+        filters_layout.addWidget(self._build_field("End", self.d_end, 168), 0, 3)
+        filters_layout.addWidget(self._build_field("Pre-filter 24h Vol (M)", self.e_min_vol, 96), 1, 0)
+        filters_layout.addWidget(self._build_field("Min Avg Daily Vol (M)", self.e_min_avg_vol, 96), 1, 1)
+        filters_layout.addWidget(self._build_field("Scan Top N (Total)", self.e_top_n, 96), 1, 2)
 
         rank_wrap = QWidget()
         rank_layout = QHBoxLayout(rank_wrap)
@@ -466,7 +453,15 @@ class VolatilityScannerGUI(QMainWindow):
         self.e_max_rank.setFixedWidth(72)
         rank_layout.addWidget(self.e_max_rank)
         rank_layout.addStretch(1)
-        filters_layout.addWidget(self._build_field("CoinGecko Max Rank", rank_wrap, 176), 1, 3, alignment=Qt.AlignLeft)
+        filters_layout.addWidget(self._build_field("CoinGecko Max Rank", rank_wrap, 260), 1, 3)
+        filters_layout.addWidget(self._build_field("Asset Universe", self.cb_asset_universe, 140), 2, 0)
+        stock_hint = QLabel(
+            "Pionex 全部現貨不套用 24h 與歷史日均成交量門檻；"
+            "Rank 只篩 Crypto；Top N 是全部候選的合計上限。"
+        )
+        stock_hint.setObjectName("hintLabel")
+        stock_hint.setWordWrap(True)
+        filters_layout.addWidget(stock_hint, 2, 1, 1, 3)
 
         for col in range(4):
             filters_layout.setColumnStretch(col, 1)
@@ -499,6 +494,8 @@ class VolatilityScannerGUI(QMainWindow):
 
         self.btn_scan.clicked.connect(self.start_scan)
         self.btn_stop.clicked.connect(self.stop_scan)
+        self.cb_exchange.currentTextChanged.connect(self._on_exchange_changed)
+        self._on_exchange_changed(self.cb_exchange.currentText())
 
         # Splitter (vertical: table on top, chart at bottom)
         splitter = QSplitter(Qt.Vertical)
@@ -553,6 +550,14 @@ class VolatilityScannerGUI(QMainWindow):
         if self.centralWidget() is not None:
             self.centralWidget().setFocus()
 
+    def _on_exchange_changed(self, exchange_name):
+        """Show that Pionex ignores unreliable exchange volume thresholds."""
+        bypass_volume = str(exchange_name or "").strip().lower() == "pionex"
+        tooltip = "Pionex 掃描不套用最低成交量門檻。" if bypass_volume else ""
+        for field in (self.e_min_vol, self.e_min_avg_vol):
+            field.setEnabled(not bypass_volume)
+            field.setToolTip(tooltip)
+
     def _set_status(self, msg, ok=True):
         self.lbl_status.setFullText(msg)
         self.lbl_status.setStyleSheet("color: #9ddc91;" if ok else "color: #f3b6b6;")
@@ -594,7 +599,13 @@ class VolatilityScannerGUI(QMainWindow):
             client = self._exchange_clients.get(exch_name)
             if client is not None:
                 return client
-        client = getattr(ccxt, exch_name)()
+        if str(exch_name).lower() == "pionex":
+            client = pionex.PionexPublicClient()
+        else:
+            client_cls = getattr(ccxt, exch_name, None)
+            if client_cls is None:
+                raise ValueError(f"不支援的交易所：{exch_name}")
+            client = client_cls()
         client.load_markets()
         with self._cache_lock:
             self._exchange_clients[exch_name] = client
@@ -618,7 +629,7 @@ class VolatilityScannerGUI(QMainWindow):
             cached = self._mc_rank_cache
             if cached["mapping"] and cached["limit"] >= limit and (now - cached["ts"] <= COINGECKO_CACHE_TTL):
                 return cached["mapping"]
-        mapping = fetch_top_mc_coins(limit=limit)
+        mapping = coingecko.fetch_market_cap_ranks(limit=limit)
         if mapping:
             with self._cache_lock:
                 self._mc_rank_cache = {"ts": now, "limit": limit, "mapping": mapping}
@@ -642,15 +653,16 @@ class VolatilityScannerGUI(QMainWindow):
             return None
         with self._cache_lock:
             if cache_key in self._chart_cache:
-                df = self._chart_cache.pop(cache_key)
-                self._chart_cache[cache_key] = df
-                return df
+                entry = self._chart_cache.pop(cache_key)
+                if time.time() - entry["ts"] <= KLINE_MEMORY_CACHE_TTL:
+                    self._chart_cache[cache_key] = entry
+                    return entry["df"]
         return None
 
     def _store_chart_df(self, symbol: str, context: dict, df: pd.DataFrame):
         cache_key = self._chart_cache_key_for_context(symbol, context)
         with self._cache_lock:
-            self._chart_cache[cache_key] = df
+            self._chart_cache[cache_key] = {"ts": time.time(), "df": df}
             while len(self._chart_cache) > CHART_CACHE_LIMIT:
                 self._chart_cache.popitem(last=False)
 
@@ -667,7 +679,9 @@ class VolatilityScannerGUI(QMainWindow):
             start=context["start_str"],
             end=context["end_str"],
             exch_list=[context["exch_name"]],
+            pause=(0.0 if str(context["exch_name"]).lower() == "pionex" else 0.12),
             refresh_policy="auto",
+            require_full_coverage=False,
         )
         if df is None or df.empty:
             return None
@@ -684,13 +698,40 @@ class VolatilityScannerGUI(QMainWindow):
         }
 
     def start_scan(self):
+        try:
+            start_qdate = self.d_start.date()
+            end_qdate = self.d_end.date()
+            if start_qdate > end_qdate:
+                raise ValueError("Start date cannot be later than end date.")
+            config = {
+                "exch_name": self.cb_exchange.currentText(),
+                "interval": self.cb_interval.currentText(),
+                "start_str": start_qdate.toString("yyyy-MM-dd"),
+                "end_str": end_qdate.toString("yyyy-MM-dd"),
+                "requested_days": max(1, start_qdate.daysTo(end_qdate) + 1),
+                "min_vol_pre": float(self.e_min_vol.text()) * 1_000_000,
+                "min_avg_vol": float(self.e_min_avg_vol.text()) * 1_000_000,
+                "asset_universe": self.cb_asset_universe.currentText(),
+                "top_n": int(self.e_top_n.text()),
+                "use_mc_filter": self.chk_mc_filter.isChecked(),
+                "max_rank": int(self.e_max_rank.text()),
+                "manual_input": self.e_manual.text().strip(),
+            }
+            volume_values = (config["min_vol_pre"], config["min_avg_vol"])
+            if any(not np.isfinite(v) or v < 0 for v in volume_values):
+                raise ValueError("成交量門檻必須為有限非負數")
+            if config["top_n"] <= 0 or config["max_rank"] <= 0:
+                raise ValueError("Top N 與 Max rank 必須 > 0")
+        except Exception:
+            self._show_error(traceback.format_exc())
+            return
         self.stop_event.clear()
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.progress.setValue(0)
         self._set_status("Starting scan...")
 
-        worker = ScanWorker(self._run_scan_logic)
+        worker = ScanWorker(self._run_scan_logic, config)
         worker.signals.log.connect(lambda m: self._set_status(m, ok=True))
         worker.signals.progress.connect(self._on_progress)
         worker.signals.warning.connect(self._show_warning)
@@ -724,12 +765,21 @@ class VolatilityScannerGUI(QMainWindow):
 
     @Slot(object)
     def _on_scan_finished(self, df):
+        stats = dict(getattr(df, "attrs", {}).get("scan_stats", {}))
         self.scan_results = df
         self.update_table()
         self.btn_scan.setEnabled(True)
         self.btn_stop.setEnabled(False)
         if self.stop_event.is_set():
             self._set_status("Scan stopped by user.", ok=False)
+        elif stats:
+            self._set_status(
+                "Scan completed: "
+                f"results {stats.get('results', 0)}/{stats.get('selected', 0)}, "
+                f"data-filtered {stats.get('data_filtered', 0)}, "
+                f"errors {stats.get('errors', 0)}, "
+                f"429 {stats.get('rate_limited', 0)}."
+            )
         else:
             self._set_status("Scan completed.")
 
@@ -742,7 +792,7 @@ class VolatilityScannerGUI(QMainWindow):
         df = payload.get("df")
         if df is None or df.empty:
             return
-        self.plot_chart(df, payload["symbol"])
+        self.plot_chart(df, payload["symbol"], payload.get("context", {}).get("interval"))
 
     @Slot(str)
     def _on_chart_load_error(self, tb):
@@ -750,26 +800,28 @@ class VolatilityScannerGUI(QMainWindow):
         QMessageBox.critical(self, "Chart Load Error", tb)
 
     # --------- scan logic (background) ---------
-    def _run_scan_logic(self, signals: ScanSignals):
-        exch_name = self.cb_exchange.currentText()
+    def _run_scan_logic(self, signals: ScanSignals, config):
+        exch_name = config["exch_name"]
         quote_asset = DEFAULT_QUOTE_ASSET
-        interval = self.cb_interval.currentText()
-        start_qdate = self.d_start.date()
-        end_qdate = self.d_end.date()
-        if start_qdate > end_qdate:
-            raise ValueError("Start date cannot be later than end date.")
-        requested_days = max(1, start_qdate.daysTo(end_qdate) + 1)
-        start_str = start_qdate.toString("yyyy-MM-dd")
-        end_str = end_qdate.toString("yyyy-MM-dd")
-        min_vol_pre = float(self.e_min_vol.text()) * 1_000_000
-        min_avg_vol = float(self.e_min_avg_vol.text()) * 1_000_000
-        top_n = int(self.e_top_n.text())
+        interval = config["interval"]
+        requested_days = config["requested_days"]
+        start_str = config["start_str"]
+        end_str = config["end_str"]
+        min_vol_pre = config["min_vol_pre"]
+        min_avg_vol = config["min_avg_vol"]
+        asset_universe = config["asset_universe"]
+        top_n = config["top_n"]
 
-        use_mc_filter = self.chk_mc_filter.isChecked()
-        max_rank = int(self.e_max_rank.text())
+        use_mc_filter = config["use_mc_filter"]
+        max_rank = config["max_rank"]
 
         mc_mapping = {}
-        rank_lookup_limit = max(max_rank, COINGECKO_RANK_LOOKUP_LIMIT)
+        # When filtering, ranks beyond max_rank cannot be selected. Avoid the
+        # extra CoinGecko pages and one-second inter-page waits in that case.
+        rank_lookup_limit = (
+            max_rank if use_mc_filter
+            else max(max_rank, COINGECKO_RANK_LOOKUP_LIMIT)
+        )
         signals.log.emit("Fetching Market Cap Rank from CoinGecko...")
         mc_mapping = self._get_cached_mc_mapping(limit=rank_lookup_limit)
         if not mc_mapping:
@@ -782,7 +834,7 @@ class VolatilityScannerGUI(QMainWindow):
 
         tickers = self._get_cached_tickers(exch_name)
 
-        manual_input = self.e_manual.text().strip()
+        manual_input = config["manual_input"]
         manual_bases = set()
         if manual_input:
             parts = manual_input.replace(",", " ").split()
@@ -795,14 +847,27 @@ class VolatilityScannerGUI(QMainWindow):
         manual_pairs_found = set()
 
         candidates = []
+        client = self._get_exchange_client(exch_name)
+        markets = getattr(client, "markets", {}) or {}
         for symbol, ticker in tickers.items():
             if not ticker:
                 continue
-            if f"/{quote_asset}" not in symbol and not symbol.endswith(quote_asset):
+            market = markets.get(symbol)
+            if (
+                not market
+                or not market.get("active", True)
+                or not market.get("spot")
+                or market.get("quote") != quote_asset
+            ):
                 continue
-
-            base = symbol.split('/')[0] if '/' in symbol else symbol.replace(quote_asset, "")
+            base = str(market.get("base") or "").upper()
             is_manual = (base in manual_bases)
+            is_stock_token = universe.is_probable_stock_token(base)
+            if not is_manual:
+                if asset_universe == "Stock/RWA tokens only" and not is_stock_token:
+                    continue
+                if asset_universe == "Crypto only" and is_stock_token:
+                    continue
             if is_manual:
                 if symbol == f"{base}/{quote_asset}":
                     manual_pairs_found.add(symbol)
@@ -814,15 +879,23 @@ class VolatilityScannerGUI(QMainWindow):
                     rank = mc_mapping[base_lower]
 
             if not is_manual:
-                if is_stablecoin_base(base):
+                if universe.is_stablecoin_base(base):
                     continue
 
-                if use_mc_filter and mc_mapping:
-                    if rank <= 0 or rank > max_rank:
-                        continue
+                if not universe.scanner_rank_filter_allows(
+                    rank,
+                    max_rank,
+                    enabled=use_mc_filter,
+                    mapping_available=bool(mc_mapping),
+                    is_stock_token=is_stock_token,
+                ):
+                    continue
 
             vol = ticker.get('quoteVolume') or 0
-            if not is_manual and vol < min_vol_pre:
+            # Pionex public volume is not reliable enough as a universe filter,
+            # especially for its smaller market and tokenized equities.
+            bypass_volume = universe.bypass_scanner_volume_filters(exch_name)
+            if not is_manual and not bypass_volume and vol < min_vol_pre:
                 continue
 
             candidates.append({
@@ -831,6 +904,8 @@ class VolatilityScannerGUI(QMainWindow):
                 'close': ticker.get('close'),
                 'mc_rank': rank,
                 'is_manual': is_manual,
+                'is_stock_token': is_stock_token,
+                'asset_type': "Stock/RWA" if is_stock_token else "Crypto",
             })
 
         if manual_bases:
@@ -845,8 +920,31 @@ class VolatilityScannerGUI(QMainWindow):
 
         manual_candidates = [c for c in candidates if c['symbol'] in manual_pairs_found]
         auto_candidates = [c for c in candidates if c['symbol'] not in manual_pairs_found]
-        auto_candidates.sort(key=lambda x: x['volume'], reverse=True)
-        auto_candidates = auto_candidates[:top_n]
+        manual_candidates.sort(key=lambda x: x['symbol'])
+        if len(manual_candidates) > top_n:
+            signals.warning.emit(
+                f"Manual Include 找到 {len(manual_candidates)} 個標的，"
+                f"但 Top N 為 {top_n}；只掃描前 {top_n} 個。"
+            )
+            manual_candidates = manual_candidates[:top_n]
+        remaining_slots = max(0, top_n - len(manual_candidates))
+
+        if asset_universe == "All spot":
+            auto_stock = [c for c in auto_candidates if c['is_stock_token']]
+            auto_crypto = [c for c in auto_candidates if not c['is_stock_token']]
+            # Pionex stock-token ticker volume is unreliable, so keep a stable
+            # symbol order and reserve their slots before filling with Crypto.
+            auto_stock.sort(key=lambda x: x['symbol'])
+            auto_crypto.sort(key=lambda x: x['volume'], reverse=True)
+            selected_stock = auto_stock[:remaining_slots]
+            crypto_slots = max(0, remaining_slots - len(selected_stock))
+            auto_candidates = selected_stock + auto_crypto[:crypto_slots]
+        elif asset_universe == "Stock/RWA tokens only":
+            auto_candidates.sort(key=lambda x: x['symbol'])
+            auto_candidates = auto_candidates[:remaining_slots]
+        else:
+            auto_candidates.sort(key=lambda x: x['volume'], reverse=True)
+            auto_candidates = auto_candidates[:remaining_slots]
 
         candidates = manual_candidates + auto_candidates
         total_cands = len(candidates)
@@ -870,16 +968,28 @@ class VolatilityScannerGUI(QMainWindow):
             "exch_name": exch_name,
             "quote_asset": quote_asset,
         }
-        self._chart_cache.clear()
-
         completed_count = 0
-        max_workers = 8
+        failed_count = 0
+        no_result_count = 0
+        rate_limited_count = 0
+        # Pionex's K-line route has weight 1 and the adapter enforces a
+        # weight-aware IP limiter. Four workers keep HTTP/network latency from
+        # leaving permitted request slots idle without exceeding that limiter.
+        max_workers = 4 if str(exch_name).lower() == "pionex" else 8
+        signals.log.emit(
+            f"Fetching K-lines with {max_workers} worker(s) for {exch_name}..."
+        )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        stopped = False
+        try:
             future_to_cand = {executor.submit(self.process_coin, cand, scan_args): cand for cand in candidates}
             for future in concurrent.futures.as_completed(future_to_cand):
                 if self.stop_event.is_set():
                     signals.stopped.emit("Scan stopped by user.")
+                    stopped = True
+                    for pending in future_to_cand:
+                        pending.cancel()
                     break
 
                 cand = future_to_cand[future]
@@ -888,19 +998,39 @@ class VolatilityScannerGUI(QMainWindow):
                     res = future.result()
                     if res:
                         results.append(res)
+                    else:
+                        no_result_count += 1
                 except Exception as e:
-                    print(f"Error processing {sym}: {e}")
+                    failed_count += 1
+                    if "429" in str(e) or "Too Many Requests" in str(e):
+                        rate_limited_count += 1
+                    signals.log.emit(f"Skipped {sym}: {e}")
 
                 completed_count += 1
                 signals.progress.emit(completed_count, total_cands)
                 signals.log.emit(f"Scanning {completed_count}/{total_cands}...")
+        finally:
+            executor.shutdown(wait=not stopped, cancel_futures=True)
 
         if self.stop_event.is_set():
             signals.log.emit("Scan stopped by user.")
         else:
-            signals.log.emit("Scan completed.")
+            signals.log.emit(
+                f"Scan completed: selected={total_cands}, results={len(results)}, "
+                f"data-filtered={no_result_count}, errors={failed_count}, "
+                f"rate-limited={rate_limited_count}."
+            )
 
-        return pd.DataFrame(results)
+        out = pd.DataFrame(results)
+        out.attrs["scan_stats"] = {
+            "selected": int(total_cands),
+            "results": int(len(results)),
+            "data_filtered": int(no_result_count),
+            "errors": int(failed_count),
+            "rate_limited": int(rate_limited_count),
+            "workers": int(max_workers),
+        }
+        return out
 
     def process_coin(self, cand, args):
         if self.stop_event.is_set():
@@ -915,18 +1045,30 @@ class VolatilityScannerGUI(QMainWindow):
         requested_days = args['requested_days']
         min_avg_vol = args['min_avg_vol']
         is_manual = cand.get('is_manual', False)
+        is_stock_token = bool(cand.get('is_stock_token', False))
+        kline_pause = 0.0 if str(exch_name).lower() == "pionex" else 0.12
 
         try:
             base = sym.split('/')[0] if '/' in sym else sym.replace(quote_asset, "")
-
-            df = martin.get_klines(
-                symbol=base,
-                interval=interval,
-                start=start_str,
-                end=end_str,
-                exch_list=[exch_name],
-                refresh_policy="auto",
-            )
+            kline_context = {
+                "interval": interval,
+                "start_str": start_str,
+                "end_str": end_str,
+                "exch_name": exch_name,
+                "quote_asset": quote_asset,
+            }
+            df = self._get_cached_chart_df(sym, kline_context)
+            if df is None:
+                df = martin.get_klines(
+                    symbol=base,
+                    interval=interval,
+                    start=start_str,
+                    end=end_str,
+                    exch_list=[exch_name],
+                    pause=kline_pause,
+                    refresh_policy="auto",
+                    require_full_coverage=False,
+                )
             has_complete_ohlc = (
                 df is not None
                 and not df.empty
@@ -940,8 +1082,13 @@ class VolatilityScannerGUI(QMainWindow):
                     start=start_str,
                     end=end_str,
                     exch_list=[exch_name],
+                    pause=kline_pause,
                     refresh_policy="force",
+                    require_full_coverage=False,
                 )
+
+            if df is not None and not df.empty:
+                self._store_chart_df(sym, kline_context, df)
 
             if df is None or df.empty or len(df) < 50:
                 return None
@@ -973,9 +1120,8 @@ class VolatilityScannerGUI(QMainWindow):
             sum_abs_changes = np.sum(np.abs(np.diff(closes)))
             er = abs_net_change / sum_abs_changes if sum_abs_changes > 0 else 1.0
 
-            # Max Consecutive Red Bars
-            diffs = np.diff(closes)
-            is_red = diffs < 0
+            # Max Consecutive Red Bars: candle close below candle open.
+            is_red = (df["close"].to_numpy(float) < df["open"].to_numpy(float))
             max_consec_red = 0
             if len(is_red) > 0:
                 consec_red = 0
@@ -989,12 +1135,28 @@ class VolatilityScannerGUI(QMainWindow):
 
             quote_vols = df['volume'] * df['close']
             total_quote_vol = quote_vols.sum()
+            volumes = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0).to_numpy(float)
+            active_ratio = float(np.mean(volumes > 0.0)) if volumes.size else float("nan")
+            opens = df['open'].to_numpy(dtype=float)
+            prev_closes = closes.to_numpy(dtype=float)[:-1]
+            if len(opens) >= 2 and np.all(prev_closes > 0):
+                max_gap = float(np.max(np.abs(opens[1:] / prev_closes - 1.0)))
+            else:
+                max_gap = float("nan")
 
-            time_span_days = (df['time'].iloc[-1] - df['time'].iloc[0]).total_seconds() / 86400.0
+            time_span_days = (
+                (df['time'].iloc[-1] - df['time'].iloc[0]).total_seconds()
+                + step_ms / 1000.0
+            ) / 86400.0
 
             required_days = max(1.0, (requested_days - 1) * MIN_HISTORY_COVERAGE_RATIO)
             if requested_days > 30:
                 required_days = max(30.0, required_days)
+            if is_stock_token:
+                # Many tokenized equities are newly listed, and Pionex exposes
+                # at most 10,000 public K-lines.  Still require a meaningful
+                # recent sample without demanding nonexistent multi-year data.
+                required_days = min(required_days, STOCK_TOKEN_MAX_REQUIRED_HISTORY_DAYS)
             if time_span_days < required_days and not is_manual:
                 return None
 
@@ -1002,13 +1164,17 @@ class VolatilityScannerGUI(QMainWindow):
                 time_span_days = 0.5
 
             avg_daily_vol = total_quote_vol / time_span_days
-            if avg_daily_vol < min_avg_vol and not is_manual:
+            bypass_volume = universe.bypass_scanner_volume_filters(exch_name)
+            if avg_daily_vol < min_avg_vol and not is_manual and not bypass_volume:
                 return None
 
             return {
                 "Symbol": sym,
+                "Asset": cand.get('asset_type', "Stock/RWA" if is_stock_token else "Crypto"),
                 "Price": closes.iloc[-1],
                 "Vol(M)": avg_daily_vol / 1_000_000,
+                "Active%": active_ratio * 100,
+                "MaxGap%": max_gap * 100,
                 "RV(A)%": rv_annual * 100,
                 "ATR(Day)%": atr_daily_est * 100,
                 "ATR(M)%": atr_monthly_est * 100,
@@ -1019,8 +1185,8 @@ class VolatilityScannerGUI(QMainWindow):
                 "MaxRed": int(max_consec_red),
                 "MC Rank": cand.get('mc_rank', -1),
             }
-        except Exception:
-            return None
+        except Exception as e:
+            raise RuntimeError(f"{sym}: {e}") from e
 
     # --------- table / chart ---------
     def update_table(self):
@@ -1067,8 +1233,11 @@ class VolatilityScannerGUI(QMainWindow):
             return
         disp = pd.DataFrame({
             "Symbol": df["Symbol"],
+            "Asset": df["Asset"],
             "Price": df["Price"].map(lambda v: f"{float(v):.8f}" if float(v) < 0.01 else f"{float(v):.4f}"),
             "Vol(M)": df["Vol(M)"].map(lambda v: f"{float(v):.2f}"),
+            "Active%": df["Active%"].map(lambda v: f"{float(v):.2f}"),
+            "MaxGap%": df["MaxGap%"].map(lambda v: f"{float(v):.2f}"),
             "RV(A)%": df["RV(A)%"].map(lambda v: f"{float(v):.2f}"),
             "ATR(M)%": df["ATR(M)%"].map(lambda v: f"{float(v):.2f}"),
             "MaxDD%": df["MaxDD%"].map(lambda v: f"{float(v):.2f}"),
@@ -1091,7 +1260,7 @@ class VolatilityScannerGUI(QMainWindow):
         self._sort_col = col
         self._sort_asc = ascending
 
-        if col in ["Symbol"]:
+        if col in ["Symbol", "Asset"]:
             self.scan_results.sort_values(col, ascending=ascending, inplace=True)
         elif col == "MC Rank":
             def sort_mc_rank(s):
@@ -1122,7 +1291,7 @@ class VolatilityScannerGUI(QMainWindow):
         request_token = self._chart_request_token
         df = self._get_cached_chart_df(sym, context)
         if df is not None:
-            self.plot_chart(df, sym)
+            self.plot_chart(df, sym, context.get("interval"))
             return
         self._set_status(f"Loading chart: {sym}")
         worker = ScanWorker(self._load_chart_data, request_token, sym, context)
@@ -1130,7 +1299,7 @@ class VolatilityScannerGUI(QMainWindow):
         worker.signals.error.connect(self._on_chart_load_error)
         self.thread_pool.start(worker)
 
-    def plot_chart(self, df, title):
+    def plot_chart(self, df, title, interval=None):
         times = pd.to_datetime(df["time"])
         if getattr(times.dt, "tz", None) is not None:
             times = times.dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
@@ -1155,7 +1324,7 @@ class VolatilityScannerGUI(QMainWindow):
             date_fmt = "%Y-%m"
         self.ax.xaxis.set_major_locator(locator)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt))
-        self.ax.set_title(f"{title} - {self.cb_interval.currentText()}")
+        self.ax.set_title(f"{title} - {interval or '?'}")
         self.ax.set_xlabel("Date")
         self.ax.set_ylabel("Price")
         self.ax.grid(True, alpha=0.3)
@@ -1165,6 +1334,18 @@ class VolatilityScannerGUI(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._autosize_table_columns()
+
+    def closeEvent(self, event):
+        self.stop_event.set()
+        with self._cache_lock:
+            clients = list(self._exchange_clients.values())
+            self._exchange_clients.clear()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
