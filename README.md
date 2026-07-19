@@ -47,7 +47,7 @@
 - `max_dd_overall`
 - `max_trapped_ratio`
 
-雙擊掃描結果可切換到 `Backtest Chart / Performance`，查看策略 equity curve、`Buy & Hold` benchmark、`trapped intervals` 與績效指標。
+雙擊掃描結果可切換到 `Backtest Chart / Performance`，查看策略 equity curve、`Buy & Hold` benchmark、`trapped intervals` 與績效指標。時間軸會以 Taipei 日期顯示，日期輸入不可超過今天。績效區會列出實際資料期間、K 線數、價格變化，以及 `Final Equity = Capital + Closed PnL + Open PnL` 對帳；若淨值或 Total Return 無法一致對帳，詳細回測會直接拒絕顯示結果。
 
 #### MC Scan
 
@@ -222,9 +222,9 @@ MC scan 已做以下優化：
 
 ## Volatility Scanner
 
-`volatility_scanner_gui.py` 是獨立的波動率篩選工具，可協助尋找適合 grid / martingale 策略研究的幣種。
+`volatility_scanner_gui.py` is a standalone scanner for finding markets that may suit grid and martingale strategy research.
 
-目前支援的指標包含：
+Supported metrics include:
 
 - realized volatility
 - ATR% / true range
@@ -236,66 +236,47 @@ MC scan 已做以下優化：
 - active-bar ratio (`Active%`)
 - previous-close to next-open maximum gap (`MaxGap%`)
 
-Scanner 的 `Exchange` 可選 `pionex`，`Asset Universe` 可選全部現貨、只看股票／ETF／RWA 代幣，或只看加密幣。Pionex 全部現貨都不套用 24 小時成交額與歷史日均成交額門檻，因此選擇 Pionex 時 GUI 會停用這兩個輸入欄位；其他交易所仍會使用成交量欄位。CoinGecko rank filter 預設保留，且只篩選 Crypto，股票／RWA 不受 rank 影響。`Top N` 是整份候選清單的總上限，包含手動標的、股票／RWA 與 Crypto；`All spot` 會先保留股票／RWA，再以成交量較高的 Crypto 補滿剩餘名額。候選標的最後仍須通過 K 線品質與最低資料量檢查，因此結果數可能少於 `Top N`。
+`Exchange` supports `pionex` and `binance`. `Asset Universe` can include all spot markets, Stock/RWA tokens only, or crypto only. Pionex markets bypass the 24-hour and historical average-volume thresholds because its public volume data is not reliable enough for universe filtering. The CoinGecko rank filter applies only to crypto. The scan limit covers manual symbols, Stock/RWA tokens, and crypto combined. Every candidate must still pass candle-quality and minimum-history checks, so the result count can be lower than the scan limit.
 
-Pionex 公開請求使用 process-wide、weight-aware rate limiter，以約 `8.3 weight/s` 運作並保留低於官方 `10 weight/s` IP 上限的餘裕；Scanner 使用 `4` 個 K 線 worker，且每個 worker 會重用 HTTP keep-alive 連線。最近掃描的 K 線會在 GUI 記憶體保留 `5` 分鐘（最多 `96` 組），相同條件重掃或點選圖表不必再次下載。HTTP `429` 會優先依 `Retry-After` 等待，沒有 header 時才使用指數退避；完成狀態會分別顯示 selected、results、data-filtered、errors 與 429 數量，避免把進度 `100%` 誤解為所有交易對都成功。
+Pionex public requests use a process-wide, weight-aware rate limiter at approximately `8.3 weight/s`, leaving headroom below the official `10 weight/s` IP limit. The scanner uses `4` candle workers with reusable HTTP keep-alive sessions. Recently scanned candles remain in memory for `5` minutes, up to `96` datasets. HTTP `429` responses honor `Retry-After` when available and otherwise use exponential backoff. Completion status reports selected, results, data-filtered, errors, and 429 counts separately.
 
-Pionex 公開 symbol metadata 沒有資產分類欄位。目前股票／ETF／RWA 辨識採「代號 `X` 後綴 + 已知 crypto 例外表」的保守 heuristic，結果會在 `Asset` 欄標示為 `Stock/RWA`。不能用 CoinGecko symbol presence 排除，因為 CoinGecko 也收錄 `TSLAX`、`SPYX`、`NVDAX` 等 xStocks。若遇到新代號或名稱衝突，仍應以 Pionex 商品頁確認。
+Pionex public symbol metadata has no asset-class field. Stock, ETF, and RWA tokens are identified with a conservative `X`-suffix heuristic plus known crypto exceptions and are labeled `Stock/RWA`. CoinGecko symbol presence cannot be used as an exclusion rule because it also lists xStocks such as `TSLAX`, `SPYX`, and `NVDAX`. Confirm unfamiliar or conflicting symbols on the Pionex product page.
 
-Scanner 會要求非手動標的具備足夠歷史資料覆蓋率。若掃描區間超過 30 天，實際 K 線跨度至少需達請求區間的約 `80%`，避免只有短歷史的新幣與長歷史標的直接混排。
+Non-manual candidates must have enough historical coverage. For requested periods longer than 30 days, the actual candle span must cover approximately `80%` of the requested range. This prevents newly listed assets with short histories from being ranked directly against established assets.
 
-掃描結果可搭配主 GUI 的 `Historical Scan` 與 `MC Scan` 使用。
+Scanner results can be validated with `Historical Scan` and `MC Scan` in the main GUI.
 
-### 馬丁策略選幣指南
+### Martin Fit Mode
 
-`martingale / grid averaging` 策略的核心獲利來源是價格來回震盪，而不是單邊趨勢。
+The scanner defaults to a simplified workflow, so users do not need to combine many technical indicators manually:
 
-- 適合的行情：上下洗盤頻繁，雖然區間淨漲跌不大，但中途波動能持續觸發補倉與止盈。
-- 危險的行情：一去不回頭的單邊趨勢，特別是緩慢陰跌，容易讓加倉層數被打滿並造成長時間套牢。
+1. Select the exchange, candle interval, lookback, and asset universe.
+2. Click `Scan Martin Pairs`.
+3. Results default to `Suitable Only` and are ranked by `Martin Fit` from highest to lowest.
 
-因此選幣時，應優先尋找「高波動、低趨勢、流動性足夠、下跌過程仍有反彈彈性」的標的。
+The simplified result view contains only:
 
-#### 核心指標解讀
+- `Martin Fit`: a `0–100` score. Higher scores indicate stronger volatility, more frequent returns to the prior price, and lower persistent-downtrend risk.
+- `Verdict`: `Suitable`, `Watch`, or `Unsuitable`. The result filter can show suitable markets only, suitable plus watch, or all results.
+- `Recovery Rate`: the percentage of qualifying drops that return to the previous local peak within `30` days.
+- `Cycles/30D`: the average number of completed drop-and-return cycles per `30` days.
+- `Downtrend Risk`: combines the 90-day return, current distance from the peak, consecutive lower closes, and historical maximum drawdown.
+- `Reason`: a direct explanation such as `Drops often fail to recover` or `Strong 90-day decline`.
 
-震盪洗盤力道，通常越高越適合馬丁研究：
+The drop threshold adapts to the latest 30-day ATR and is constrained to `2%–5%`. Martin Fit consists of volatility `25%`, recovery behavior `35%`, mean reversion `20%`, and downtrend risk `20%`. Hard risk conditions cap the score when recovery is poor, the 90-day decline is severe, the market remains in a deep drawdown, a one-way trend is too strong, or a prolonged losing streak is detected.
 
-- `ATR(M)%`：最近約 30 天的平均 true range 百分比，優先使用 `high / low / previous close` 計算；若資料來源缺少 OHLC，才退回 close-to-close 近似。ATR 越高，網格越容易被觸發，也越容易在反彈時止盈。
-- `RV(A)%`：年化已實現波動率，代表幣種整體活躍程度。數值越高，價格行為通常越劇烈。
+Quick Settings default to `4h`, `Last 1 Year`, and `Crypto only`. Dates, volume thresholds, market-cap rank, scan limit, and manual symbols are under `Show Advanced Settings`. Both volume-threshold fields are blank by default; blank means no volume restriction. Raw `ATR / RV / ER / MaxDD / Chg / MaxRed` values are under `Show Advanced Metrics`.
 
-趨勢與震盪型態，通常越低越好：
+Raw metrics remain available for verification:
 
-- `ER`：Efficiency Ratio，衡量價格走勢偏向震盪或單邊趨勢。`ER` 越接近 `0`，代表越偏向原地震盪；越接近 `1`，代表越偏向單邊趨勢。
-- `Chg%`：掃描區間內的淨漲跌幅。若目標是震盪型標的，可優先觀察約 `-30%` 到 `+30%` 之間的幣種。
+- `ATR(M)%` and `RV(A)%`: volatility; higher values generally trigger grids more often.
+- `ER`: values near `0` indicate back-and-forth movement, while values near `1` indicate one-way movement.
+- `Recent90%` and `CurrentDD%`: recent weakness and current distance below the historical peak.
+- `MaxRed` and internal `MaxDown`: consecutive red candles and consecutive lower closes. Scoring converts the streak to elapsed time so different candle intervals are comparable.
+- `MaxDD%`: maximum decline from a historical peak to a later low.
+- `Active%`, `MaxGap%`, `Vol(M)`, and `MC Rank`: trading activity, price gaps, liquidity, and market-cap risk.
 
-套牢與極端下跌風險，通常越低越好：
-
-- `MaxRed`：最大連續收黑 K 線數。連跌次數越高，代表下跌過程越缺乏反彈彈性，馬丁倉位越容易被一路打滿。
-- `MaxDD%`：最大回撤，優先使用 OHLC 的歷史高點到後續低點估算，以反映盤中插針風險；若資料缺少 OHLC，才退回 close-to-close。應避開歷史上動輒下跌 `80%` 到 `90%` 以上的標的，這類標的容易在 regime shift 中讓策略失效。
-- `Active%`：有成交量 K 線占比。股票代幣若此值很低，代表回測中存在大量零成交／價格停滯區間。
-- `MaxGap%`：相鄰 K 線的前收盤到次開盤最大跳空。馬丁策略遇到大幅向下跳空時，可能一次穿越多個補倉階梯。
-
-流動性與防雷條件：
-
-- `MC Rank`：市值排名。建議優先觀察 `Top 50` 內的主流幣，降低深度不足與被單一資金操控的風險。
-- `Vol(M)`：日均成交量。建議至少高於 `20M` 美元，確保進出場與回測假設較接近真實交易環境。
-
-#### 四步選幣流程
-
-1. 先找高波動：在 `volatility_scanner_gui.py` 跑完掃描後，點擊 `ATR(M)%` 或 `RV(A)%` 欄位，由大到小排序，先抓出前 `20` 到 `30` 名高波動標的。
-2. 再篩低趨勢：從高波動名單中，優先保留 `ER < 0.15` 的幣種。這代表它雖然波動大，但更偏向來回震盪，而不是單邊趨勢。
-3. 剔除陰跌標的：檢查 `MaxRed`，避開最大連跌超過 `15` 根 K 線的標的。這類標的在下跌時可能缺少足夠反彈讓倉位解套。
-4. 做最後安全檢查：確認 `MC Rank` 不要過低、`Vol(M)` 足夠、`MaxDD%` 不要深到接近歸零。通過後再丟進主 GUI 做 `Historical Scan` 與 `MC Scan`。
-
-#### 範例對比
-
-| 幣種狀態 | `ATR(M)%` | `ER` | `MaxRed` | 解讀 |
-| --- | --- | --- | --- | --- |
-| 理想震盪標的 | 高，例如 `12%` | 低，例如 `0.05` | 低，例如 `8` | 高波動且低趨勢，適合進一步回測與 MC 壓力測試。 |
-| 單邊趨勢標的 | 高，例如 `10%` | 高，例如 `0.45` | 中等，例如 `10` | 雖然波動大，但方向性太強，逆勢加倉風險高。 |
-| 低效率標的 | 低，例如 `3%` | 低，例如 `0.02` | 中等，例如 `12` | 雖然不是單邊趨勢，但波動不足，資金效率較差。 |
-| 陰跌高風險標的 | 中高，例如 `8%` | 中等，例如 `0.20` | 高，例如 `22` | 下跌時缺少反彈，容易長時間套牢或觸發極端虧損。 |
-
-> 風險提醒：上述指標都是歷史資料統計，無法保證未來仍維持相同行為。實際使用時仍需設定 `max_orders`、總資金風險上限與停損規則，避免無限制扛單。
+> Risk notice: these metrics are historical statistics and cannot guarantee future behavior. Always set `max_orders`, an overall capital-risk limit, and stop-loss rules to prevent unlimited averaging down.
 
 ---
 
@@ -321,7 +302,7 @@ pip install pyarrow
 python martin_gui.py
 ```
 
-啟動 volatility scanner：
+Launch the volatility scanner:
 
 ```bash
 python volatility_scanner_gui.py
@@ -340,7 +321,7 @@ python volatility_scanner_gui.py
 - `mc_sampling.py`：MC 參數抽樣與 refine neighbors
 - `mc_eval.py`：MC path generation、early rejection、two-pass survivor quantile
 - `mc_formatters.py`：MC / historical scan 顯示格式化
-- `volatility_scanner_gui.py`：波動率篩選 GUI
+- `volatility_scanner_gui.py`: Martin-focused volatility scanner GUI
 - `requirements.txt`：依賴套件
 - `cache/`：K 線 cache 目錄
 

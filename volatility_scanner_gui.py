@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Volatility Scanner GUI for Martin Strategy (PySide6)
-用來掃描高波動幣種，輔助馬丁策略選幣。
+Scans volatile markets and ranks their suitability for a Martin strategy.
 """
 
 import traceback
@@ -34,7 +34,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 
-# 嘗試匯入 martin.py 以重用 get_klines
+# Import martin.py to reuse get_klines.
 try:
     import martin
     _import_error = None
@@ -52,7 +52,15 @@ MIN_HISTORY_COVERAGE_RATIO = 0.80
 STOCK_TOKEN_MAX_REQUIRED_HISTORY_DAYS = 90.0
 
 
-# ===================== 指標計算 (From scan_vol_rank.py) =====================
+def optional_millions(text_value) -> float:
+    """Return zero for a blank threshold, otherwise convert millions to units."""
+    text_value = str(text_value or "").strip()
+    if not text_value:
+        return 0.0
+    return float(text_value) * 1_000_000.0
+
+
+# ===================== Metric calculations =====================
 def realized_vol_annual_from_closes(closes: pd.Series, bars_per_year: float) -> float:
     c = closes.to_numpy(dtype=float)
     c = c[np.isfinite(c) & (c > 0)]
@@ -114,6 +122,231 @@ def bb_width_pct(closes: pd.Series, n: int = 20, k: float = 2.0) -> float:
     if not np.isfinite(ma) or not np.isfinite(sd) or ma == 0:
         return float("nan")
     return float((2.0 * k * sd) / ma)
+
+
+def martin_recovery_metrics(
+    closes: pd.Series,
+    bars_per_day: float,
+    drop_pct: float = 0.03,
+    max_recovery_days: float = 30.0,
+) -> dict:
+    """Measure repeated drop-and-return cycles that a Martin strategy needs.
+
+    A cycle starts after price falls ``drop_pct`` from a running local peak and
+    succeeds only when it returns to that peak within ``max_recovery_days``.
+    Failed episodes advance to a new observation window, so a prolonged decline
+    is counted as repeated failure instead of being hidden by one old peak.
+    """
+    c = pd.to_numeric(closes, errors="coerce").to_numpy(dtype=float)
+    c = c[np.isfinite(c) & (c > 0)]
+    if c.size < 2 or not np.isfinite(bars_per_day) or bars_per_day <= 0:
+        return {
+            "events": 0,
+            "successes": 0,
+            "success_rate": 0.0,
+            "cycles_per_30d": 0.0,
+            "median_recovery_days": float("nan"),
+        }
+
+    drop_pct = float(np.clip(drop_pct, 0.001, 0.50))
+    max_recovery_bars = max(1, int(round(bars_per_day * max_recovery_days)))
+    events = 0
+    successes = 0
+    recovery_bars = []
+    i = 0
+
+    while i < c.size - 1:
+        peak = c[i]
+        j = i + 1
+        while j < c.size:
+            peak = max(peak, c[j])
+            if c[j] <= peak * (1.0 - drop_pct):
+                break
+            j += 1
+        if j >= c.size:
+            break
+
+        events += 1
+        deadline = min(c.size - 1, j + max_recovery_bars)
+        k = j + 1
+        while k <= deadline and c[k] < peak:
+            k += 1
+        if k <= deadline:
+            successes += 1
+            recovery_bars.append(k - j)
+            i = k
+        else:
+            # Begin a fresh episode after the allowed recovery window. This is
+            # intentionally conservative for a strategy that must avoid being
+            # trapped in a persistent downtrend.
+            i = max(j + 1, deadline)
+
+    span_days = max((c.size - 1) / float(bars_per_day), 1.0)
+    success_rate = successes / events if events else 0.0
+    return {
+        "events": int(events),
+        "successes": int(successes),
+        "success_rate": float(success_rate),
+        "cycles_per_30d": float(successes * 30.0 / span_days),
+        "median_recovery_days": (
+            float(np.median(recovery_bars) / bars_per_day)
+            if recovery_bars else float("nan")
+        ),
+    }
+
+
+def _linear_score(value: float, bad: float, good: float) -> float:
+    if not np.isfinite(value):
+        return 0.0
+    if good == bad:
+        return 100.0 if value >= good else 0.0
+    return float(np.clip((value - bad) / (good - bad), 0.0, 1.0) * 100.0)
+
+
+def martin_fit_from_row(row) -> dict:
+    """Convert scanner metrics into a conservative, readable Martin verdict."""
+    def metric(name, default=0.0):
+        try:
+            value = float(row.get(name, default))
+        except (TypeError, ValueError):
+            return float(default)
+        return value if np.isfinite(value) else float(default)
+
+    atr = metric("ATR(M)%")
+    rv = metric("RV(A)%")
+    er = metric("ER", 1.0)
+    change = metric("Chg%")
+    max_dd = metric("MaxDD%", -100.0)
+    max_red = metric("MaxRed", 99.0)
+    recovery = metric("Recovery%")
+    recovery_events = int(metric("Recovery Events"))
+    cycles = metric("Cycles/30D")
+    recent_change = metric("Recent90%")
+    current_dd = metric("CurrentDD%", -100.0)
+    max_down = metric("MaxDown", 99.0)
+    max_decline_hours = metric(
+        "MaxDeclineHours",
+        max(max_red, max_down) * 4.0,
+    )
+
+    volatility_score = (
+        0.70 * _linear_score(atr, 1.5, 6.0)
+        + 0.30 * _linear_score(rv, 35.0, 150.0)
+    )
+    oscillation_score = (
+        0.70 * float(np.clip(recovery, 0.0, 100.0))
+        + 0.30 * _linear_score(cycles, 0.25, 3.0)
+    )
+    er_score = 100.0 - _linear_score(er, 0.05, 0.35)
+    net_change_score = 100.0 - _linear_score(abs(change), 10.0, 80.0)
+    mean_reversion_score = 0.70 * er_score + 0.30 * net_change_score
+
+    current_dd_score = 100.0 - _linear_score(abs(min(current_dd, 0.0)), 10.0, 50.0)
+    recent_down_score = 100.0 - _linear_score(abs(min(recent_change, 0.0)), 5.0, 40.0)
+    red_score = 100.0 - _linear_score(max_decline_hours, 32.0, 80.0)
+    max_dd_score = 100.0 - _linear_score(abs(min(max_dd, 0.0)), 45.0, 90.0)
+    risk_score = (
+        0.35 * current_dd_score
+        + 0.35 * recent_down_score
+        + 0.15 * red_score
+        + 0.15 * max_dd_score
+    )
+
+    score = (
+        0.25 * volatility_score
+        + 0.35 * oscillation_score
+        + 0.20 * mean_reversion_score
+        + 0.20 * risk_score
+    )
+
+    blockers = []
+    cautions = []
+    if recovery_events < 2:
+        blockers.append("Insufficient recovery samples")
+        score = min(score, 54.0)
+    elif recovery < 40.0:
+        blockers.append("Drops often fail to recover")
+        score = min(score, 49.0)
+    elif recovery < 65.0:
+        cautions.append("Moderate recovery rate")
+    if recent_change <= -30.0:
+        blockers.append("Strong 90-day decline")
+        score = min(score, 44.0)
+    elif recent_change <= -12.0:
+        cautions.append("Weak over the last 90 days")
+    if current_dd <= -40.0:
+        blockers.append("Still in a deep drawdown")
+        score = min(score, 44.0)
+    elif current_dd <= -20.0:
+        cautions.append("Still well below its peak")
+    if er >= 0.35:
+        blockers.append("One-way trend is too strong")
+        score = min(score, 49.0)
+    elif er >= 0.20:
+        cautions.append("Trend strength is elevated")
+    if change <= -60.0:
+        blockers.append("Long-term decline is too deep")
+        score = min(score, 44.0)
+    if max_decline_hours >= 80.0:
+        blockers.append("Prolonged losing streak detected")
+        score = min(score, 49.0)
+    elif max_decline_hours >= 48.0:
+        cautions.append("Extended losing streak detected")
+    if volatility_score < 30.0:
+        blockers.append("Insufficient volatility")
+        score = min(score, 54.0)
+    elif volatility_score < 55.0:
+        cautions.append("Only moderate volatility")
+
+    score_int = int(round(np.clip(score, 0.0, 100.0)))
+    if not blockers and score_int >= 75:
+        verdict = "Suitable"
+    elif not blockers and score_int >= 60:
+        verdict = "Watch"
+    else:
+        verdict = "Unsuitable"
+
+    high_downtrend_risk = (
+        recent_change <= -30.0
+        or current_dd <= -40.0
+        or change <= -60.0
+        or max_decline_hours >= 80.0
+        or (recovery_events >= 2 and recovery < 40.0)
+    )
+    medium_downtrend_risk = (
+        recent_change <= -12.0
+        or current_dd <= -20.0
+        or max_decline_hours >= 48.0
+        or (change < 0.0 and er >= 0.20)
+    )
+    downtrend_risk = "High" if high_downtrend_risk else ("Medium" if medium_downtrend_risk else "Low")
+
+    if blockers:
+        reason = ", ".join(blockers[:2])
+    elif cautions:
+        reason = ", ".join(cautions[:2])
+    else:
+        reason = "Stable recoveries, sufficient volatility, no persistent decline"
+
+    return {
+        "Martin Score": score_int,
+        "Verdict": verdict,
+        "Downtrend Risk": downtrend_risk,
+        "Reason": reason,
+    }
+
+
+def add_martin_fit_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    fit = pd.DataFrame(
+        [martin_fit_from_row(row) for _, row in out.iterrows()],
+        index=out.index,
+    )
+    for column in fit.columns:
+        out[column] = fit[column]
+    return out
 
 
 class ScanSignals(QObject):
@@ -209,6 +442,12 @@ class ScanTableModel(QAbstractTableModel):
             self._df = df.reset_index(drop=True).copy()
         self.endResetModel()
 
+    def set_columns(self, columns):
+        self.beginResetModel()
+        self._columns = list(columns)
+        self._df = pd.DataFrame(columns=self._columns)
+        self.endResetModel()
+
     def rowCount(self, parent=QModelIndex()):
         if parent.isValid():
             return 0
@@ -227,6 +466,16 @@ class ScanTableModel(QAbstractTableModel):
             return "" if pd.isna(value) else str(value)
         if role == Qt.TextAlignmentRole:
             return int(Qt.AlignCenter)
+        if role == Qt.BackgroundRole:
+            verdict_col = "Verdict"
+            if verdict_col in self._df.columns:
+                verdict = str(self._df.iloc[index.row()][verdict_col])
+                if verdict == "Suitable":
+                    return QColor("#e4f4e7")
+                if verdict == "Watch":
+                    return QColor("#fff4d6")
+                if verdict == "Unsuitable":
+                    return QColor("#f9e2e2")
         return None
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
@@ -242,7 +491,7 @@ class ScanTableModel(QAbstractTableModel):
 class VolatilityScannerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("volatility_scanner_gui")
+        self.setWindowTitle("Martin Pair Scanner")
         self.resize(1280, 820)
 
         self.thread_pool = QThreadPool.globalInstance()
@@ -250,16 +499,24 @@ class VolatilityScannerGUI(QMainWindow):
         self._cache_lock = threading.Lock()
 
         self.scan_results = None
+        self.display_results = None
         self._scan_context = None
         self._chart_cache = OrderedDict()
         self._chart_request_token = 0
         self._exchange_clients = {}
         self._ticker_cache = {}
         self._mc_rank_cache = {"ts": 0.0, "limit": 0, "mapping": {}}
-        self.cols = [
-            "Symbol", "Asset", "Price", "Vol(M)", "Active%", "MaxGap%",
+        self.simple_cols = [
+            "Rank", "Symbol", "Martin Fit", "Verdict", "Recovery Rate",
+            "Cycles/30D", "Downtrend Risk", "Reason",
+        ]
+        self.advanced_cols = [
+            "Symbol", "Martin Score", "Verdict", "Recovery%", "Cycles/30D",
+            "Recent90%", "CurrentDD%", "Downtrend Risk", "Reason",
+            "Asset", "Price", "Vol(M)", "Active%", "MaxGap%",
             "RV(A)%", "ATR(M)%", "MaxDD%", "Chg%", "ER", "MaxRed", "MC Rank",
         ]
+        self.cols = list(self.simple_cols)
 
         self._build_ui()
         self._apply_style()
@@ -376,8 +633,9 @@ class VolatilityScannerGUI(QMainWindow):
         main_layout.setContentsMargins(12, 12, 12, 10)
         main_layout.setSpacing(12)
 
-        # Top controls
-        ctrl_group = QGroupBox("Scanner Settings")
+        # Top controls: the default view only exposes the decisions most users
+        # need. Data-quality and universe knobs remain available on demand.
+        ctrl_group = QGroupBox("Martin Pair Selection")
         main_layout.addWidget(ctrl_group)
         ctrl_layout = QVBoxLayout(ctrl_group)
         ctrl_layout.setContentsMargins(12, 14, 12, 12)
@@ -389,8 +647,14 @@ class VolatilityScannerGUI(QMainWindow):
         self.cb_interval = QComboBox()
         self.cb_interval.addItems(["15m", "1h", "4h", "1d"])
         self.cb_interval.setCurrentText("4h")
+        self.cb_lookback = QComboBox()
+        self.cb_lookback.addItem("Last 180 Days", 180)
+        self.cb_lookback.addItem("Last 1 Year", 365)
+        self.cb_lookback.addItem("Last 2 Years", 730)
+        self.cb_lookback.addItem("Custom Dates", None)
+        self.cb_lookback.setCurrentIndex(1)
         today = QDate.currentDate()
-        default_start = today.addYears(-2)
+        default_start = today.addDays(-364)
         self.d_start = QDateEdit(default_start)
         self.d_start.setCalendarPopup(True)
         self.d_start.setDisplayFormat("yyyy/MM/dd")
@@ -399,18 +663,21 @@ class VolatilityScannerGUI(QMainWindow):
         self.d_end.setDisplayFormat("yyyy/MM/dd")
         self._apply_date_edit_palette(self.d_start)
         self._apply_date_edit_palette(self.d_end)
-        self.e_min_vol = QLineEdit("10")
-        self.e_min_avg_vol = QLineEdit("40")
+        self.e_min_vol = QLineEdit()
+        self.e_min_vol.setPlaceholderText("No limit")
+        self.e_min_avg_vol = QLineEdit()
+        self.e_min_avg_vol.setPlaceholderText("No limit")
         self.cb_asset_universe = QComboBox()
         self.cb_asset_universe.addItems(["All spot", "Stock/RWA tokens only", "Crypto only"])
+        self.cb_asset_universe.setCurrentText("Crypto only")
         self.e_top_n = QLineEdit("50")
-        self.chk_mc_filter = QCheckBox("Enable rank filter")
+        self.chk_mc_filter = QCheckBox("Enable market-cap rank filter")
         self.chk_mc_filter.setChecked(True)
         self.e_max_rank = QLineEdit("100")
-        self.btn_scan = QPushButton("Start Scan")
+        self.btn_scan = QPushButton("Scan Martin Pairs")
         self.btn_scan.setObjectName("btnPrimary")
         self.btn_scan.setMinimumHeight(38)
-        self.btn_scan.setFixedWidth(132)
+        self.btn_scan.setFixedWidth(168)
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setObjectName("btnDanger")
         self.btn_stop.setEnabled(False)
@@ -432,18 +699,34 @@ class VolatilityScannerGUI(QMainWindow):
         top_row.setSpacing(10)
         ctrl_layout.addLayout(top_row)
 
-        filters_group = QGroupBox("Universe && Filters")
-        filters_layout = QGridLayout(filters_group)
+        quick_group = QGroupBox("Quick Settings")
+        quick_layout = QGridLayout(quick_group)
+        quick_layout.setContentsMargins(12, 14, 12, 10)
+        quick_layout.setHorizontalSpacing(8)
+        quick_layout.setVerticalSpacing(8)
+        quick_layout.addWidget(self._build_field("Exchange", self.cb_exchange, 110), 0, 0)
+        quick_layout.addWidget(self._build_field("Candle Interval", self.cb_interval, 110), 0, 1)
+        quick_layout.addWidget(self._build_field("Lookback", self.cb_lookback, 140), 0, 2)
+        quick_layout.addWidget(self._build_field("Asset Universe", self.cb_asset_universe, 150), 0, 3)
+        quick_hint = QLabel("Scan results are ranked automatically by Martin Fit. Higher scores are better.")
+        quick_hint.setObjectName("hintLabel")
+        quick_hint.setWordWrap(True)
+        quick_layout.addWidget(quick_hint, 1, 0, 1, 4)
+        for col in range(4):
+            quick_layout.setColumnStretch(col, 1)
+
+        top_row.addWidget(quick_group, 3)
+
+        self.advanced_settings_group = QGroupBox("Advanced Scan Settings")
+        filters_layout = QGridLayout(self.advanced_settings_group)
         filters_layout.setContentsMargins(12, 14, 12, 10)
         filters_layout.setHorizontalSpacing(8)
         filters_layout.setVerticalSpacing(8)
-        filters_layout.addWidget(self._build_field("Exchange", self.cb_exchange, 110), 0, 0)
-        filters_layout.addWidget(self._build_field("Interval", self.cb_interval, 110), 0, 1)
-        filters_layout.addWidget(self._build_field("Start", self.d_start, 168), 0, 2)
-        filters_layout.addWidget(self._build_field("End", self.d_end, 168), 0, 3)
-        filters_layout.addWidget(self._build_field("Pre-filter 24h Vol (M)", self.e_min_vol, 96), 1, 0)
-        filters_layout.addWidget(self._build_field("Min Avg Daily Vol (M)", self.e_min_avg_vol, 96), 1, 1)
-        filters_layout.addWidget(self._build_field("Scan Top N (Total)", self.e_top_n, 96), 1, 2)
+        filters_layout.addWidget(self._build_field("Start Date", self.d_start, 168), 0, 0)
+        filters_layout.addWidget(self._build_field("End Date", self.d_end, 168), 0, 1)
+        filters_layout.addWidget(self._build_field("Min 24h Volume (M)", self.e_min_vol, 96), 0, 2)
+        filters_layout.addWidget(self._build_field("Min Avg Daily Volume (M)", self.e_min_avg_vol, 96), 0, 3)
+        filters_layout.addWidget(self._build_field("Scan Limit", self.e_top_n, 96), 1, 0)
 
         rank_wrap = QWidget()
         rank_layout = QHBoxLayout(rank_wrap)
@@ -453,20 +736,17 @@ class VolatilityScannerGUI(QMainWindow):
         self.e_max_rank.setFixedWidth(72)
         rank_layout.addWidget(self.e_max_rank)
         rank_layout.addStretch(1)
-        filters_layout.addWidget(self._build_field("CoinGecko Max Rank", rank_wrap, 260), 1, 3)
-        filters_layout.addWidget(self._build_field("Asset Universe", self.cb_asset_universe, 140), 2, 0)
+        filters_layout.addWidget(self._build_field("CoinGecko Max Rank", rank_wrap, 260), 1, 1)
         stock_hint = QLabel(
-            "Pionex 全部現貨不套用 24h 與歷史日均成交量門檻；"
-            "Rank 只篩 Crypto；Top N 是全部候選的合計上限。"
+            "Pionex spot markets ignore the 24h and historical average-volume thresholds. "
+            "The rank filter applies only to crypto; the scan limit covers all candidates."
         )
         stock_hint.setObjectName("hintLabel")
         stock_hint.setWordWrap(True)
-        filters_layout.addWidget(stock_hint, 2, 1, 1, 3)
+        filters_layout.addWidget(stock_hint, 1, 2, 1, 2)
 
         for col in range(4):
             filters_layout.setColumnStretch(col, 1)
-
-        top_row.addWidget(filters_group, 3)
 
         status_group = QGroupBox("Run Status")
         status_layout = QVBoxLayout(status_group)
@@ -482,19 +762,27 @@ class VolatilityScannerGUI(QMainWindow):
         status_layout.addWidget(self.progress)
         top_row.addWidget(status_group, 1)
 
-        manual_group = QGroupBox("Manual Include")
-        manual_layout = QVBoxLayout(manual_group)
+        self.manual_group = QGroupBox("Manual Include")
+        manual_layout = QVBoxLayout(self.manual_group)
         manual_layout.setContentsMargins(12, 14, 12, 10)
         manual_layout.setSpacing(4)
         manual_layout.addWidget(self.e_manual)
-        manual_hint = QLabel("Add base symbols separated by space or comma. Example: SUI, BTC")
+        manual_hint = QLabel("Separate base symbols with spaces or commas, for example: SUI, BTC")
         manual_hint.setObjectName("hintLabel")
         manual_layout.addWidget(manual_hint)
-        ctrl_layout.addWidget(manual_group)
+        self.chk_advanced_settings = QCheckBox("Show Advanced Settings")
+        self.chk_advanced_settings.setChecked(False)
+        ctrl_layout.addWidget(self.chk_advanced_settings)
+        ctrl_layout.addWidget(self.advanced_settings_group)
+        ctrl_layout.addWidget(self.manual_group)
+        self.advanced_settings_group.setVisible(False)
+        self.manual_group.setVisible(False)
 
         self.btn_scan.clicked.connect(self.start_scan)
         self.btn_stop.clicked.connect(self.stop_scan)
         self.cb_exchange.currentTextChanged.connect(self._on_exchange_changed)
+        self.cb_lookback.currentIndexChanged.connect(self._on_lookback_changed)
+        self.chk_advanced_settings.toggled.connect(self._toggle_advanced_settings)
         self._on_exchange_changed(self.cb_exchange.currentText())
 
         # Splitter (vertical: table on top, chart at bottom)
@@ -504,6 +792,21 @@ class VolatilityScannerGUI(QMainWindow):
         # Table
         table_wrap = QWidget()
         table_layout = QVBoxLayout(table_wrap)
+        result_toolbar = QHBoxLayout()
+        result_toolbar.setSpacing(10)
+        result_toolbar.addWidget(QLabel("Show Results:"))
+        self.cb_result_filter = QComboBox()
+        self.cb_result_filter.addItems(["Suitable Only", "Suitable + Watch", "All Results"])
+        self.cb_result_filter.setCurrentText("Suitable Only")
+        result_toolbar.addWidget(self.cb_result_filter)
+        self.chk_advanced_results = QCheckBox("Show Advanced Metrics")
+        self.chk_advanced_results.setChecked(False)
+        result_toolbar.addWidget(self.chk_advanced_results)
+        self.lbl_result_summary = QLabel("Not scanned yet")
+        self.lbl_result_summary.setObjectName("hintLabel")
+        result_toolbar.addWidget(self.lbl_result_summary)
+        result_toolbar.addStretch(1)
+        table_layout.addLayout(result_toolbar)
         self.table = QTableView()
         self.table_model = ScanTableModel(self.cols, self)
         self.table.setModel(self.table_model)
@@ -523,6 +826,8 @@ class VolatilityScannerGUI(QMainWindow):
 
         self.table.horizontalHeader().sectionClicked.connect(self.on_header_clicked)
         self.table.selectionModel().selectionChanged.connect(self.on_table_select)
+        self.cb_result_filter.currentTextChanged.connect(self._apply_result_filter)
+        self.chk_advanced_results.toggled.connect(self._apply_result_filter)
 
         # Chart
         chart_wrap = QWidget()
@@ -553,10 +858,23 @@ class VolatilityScannerGUI(QMainWindow):
     def _on_exchange_changed(self, exchange_name):
         """Show that Pionex ignores unreliable exchange volume thresholds."""
         bypass_volume = str(exchange_name or "").strip().lower() == "pionex"
-        tooltip = "Pionex 掃描不套用最低成交量門檻。" if bypass_volume else ""
+        tooltip = "Pionex scans do not apply minimum-volume thresholds." if bypass_volume else ""
         for field in (self.e_min_vol, self.e_min_avg_vol):
             field.setEnabled(not bypass_volume)
             field.setToolTip(tooltip)
+
+    def _toggle_advanced_settings(self, visible):
+        self.advanced_settings_group.setVisible(bool(visible))
+        self.manual_group.setVisible(bool(visible))
+
+    def _on_lookback_changed(self, _index=None):
+        days = self.cb_lookback.currentData()
+        if days is None:
+            self.chk_advanced_settings.setChecked(True)
+            return
+        today = QDate.currentDate()
+        self.d_end.setDate(today)
+        self.d_start.setDate(today.addDays(-(int(days) - 1)))
 
     def _set_status(self, msg, ok=True):
         self.lbl_status.setFullText(msg)
@@ -604,7 +922,7 @@ class VolatilityScannerGUI(QMainWindow):
         else:
             client_cls = getattr(ccxt, exch_name, None)
             if client_cls is None:
-                raise ValueError(f"不支援的交易所：{exch_name}")
+                raise ValueError(f"Unsupported exchange: {exch_name}")
             client = client_cls()
         client.load_markets()
         with self._cache_lock:
@@ -709,8 +1027,8 @@ class VolatilityScannerGUI(QMainWindow):
                 "start_str": start_qdate.toString("yyyy-MM-dd"),
                 "end_str": end_qdate.toString("yyyy-MM-dd"),
                 "requested_days": max(1, start_qdate.daysTo(end_qdate) + 1),
-                "min_vol_pre": float(self.e_min_vol.text()) * 1_000_000,
-                "min_avg_vol": float(self.e_min_avg_vol.text()) * 1_000_000,
+                "min_vol_pre": optional_millions(self.e_min_vol.text()),
+                "min_avg_vol": optional_millions(self.e_min_avg_vol.text()),
                 "asset_universe": self.cb_asset_universe.currentText(),
                 "top_n": int(self.e_top_n.text()),
                 "use_mc_filter": self.chk_mc_filter.isChecked(),
@@ -719,9 +1037,9 @@ class VolatilityScannerGUI(QMainWindow):
             }
             volume_values = (config["min_vol_pre"], config["min_avg_vol"])
             if any(not np.isfinite(v) or v < 0 for v in volume_values):
-                raise ValueError("成交量門檻必須為有限非負數")
+                raise ValueError("Volume thresholds must be finite non-negative values")
             if config["top_n"] <= 0 or config["max_rank"] <= 0:
-                raise ValueError("Top N 與 Max rank 必須 > 0")
+                raise ValueError("Scan limit and max rank must be greater than zero")
         except Exception:
             self._show_error(traceback.format_exc())
             return
@@ -923,8 +1241,8 @@ class VolatilityScannerGUI(QMainWindow):
         manual_candidates.sort(key=lambda x: x['symbol'])
         if len(manual_candidates) > top_n:
             signals.warning.emit(
-                f"Manual Include 找到 {len(manual_candidates)} 個標的，"
-                f"但 Top N 為 {top_n}；只掃描前 {top_n} 個。"
+                f"Manual Include found {len(manual_candidates)} markets, but the scan "
+                f"limit is {top_n}. Only the first {top_n} will be scanned."
             )
             manual_candidates = manual_candidates[:top_n]
         remaining_slots = max(0, top_n - len(manual_candidates))
@@ -1021,7 +1339,7 @@ class VolatilityScannerGUI(QMainWindow):
                 f"rate-limited={rate_limited_count}."
             )
 
-        out = pd.DataFrame(results)
+        out = add_martin_fit_columns(pd.DataFrame(results))
         out.attrs["scan_stats"] = {
             "selected": int(total_cands),
             "results": int(len(results)),
@@ -1133,6 +1451,18 @@ class VolatilityScannerGUI(QMainWindow):
                     else:
                         consec_red = 0
 
+            # Consecutive lower closes catches slow declines that can still
+            # contain visually green candles after a small gap down.
+            is_lower_close = np.diff(closes.to_numpy(dtype=float)) < 0.0
+            max_consec_down = 0
+            consec_down = 0
+            for value in is_lower_close:
+                if value:
+                    consec_down += 1
+                    max_consec_down = max(max_consec_down, consec_down)
+                else:
+                    consec_down = 0
+
             quote_vols = df['volume'] * df['close']
             total_quote_vol = quote_vols.sum()
             volumes = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0).to_numpy(float)
@@ -1163,6 +1493,23 @@ class VolatilityScannerGUI(QMainWindow):
             if time_span_days < 0.5:
                 time_span_days = 0.5
 
+            recent_bars = max(2, int(round(bars_per_day * 90.0)))
+            recent_closes = closes.iloc[-min(len(closes), recent_bars):]
+            recent_change = (
+                (recent_closes.iloc[-1] / recent_closes.iloc[0]) - 1.0
+                if len(recent_closes) >= 2 else 0.0
+            )
+            current_dd = (closes.iloc[-1] / closes.max()) - 1.0
+            # Adapt the reference move to the instrument, but keep it within a
+            # practical 2%-5% Martin/grid range.
+            cycle_move = float(np.clip(atr_monthly_est * 1.25, 0.02, 0.05))
+            recovery = martin_recovery_metrics(
+                closes,
+                bars_per_day=bars_per_day,
+                drop_pct=cycle_move,
+                max_recovery_days=30.0,
+            )
+
             avg_daily_vol = total_quote_vol / time_span_days
             bypass_volume = universe.bypass_scanner_volume_filters(exch_name)
             if avg_daily_vol < min_avg_vol and not is_manual and not bypass_volume:
@@ -1183,6 +1530,17 @@ class VolatilityScannerGUI(QMainWindow):
                 "Chg%": change * 100,
                 "ER": er,
                 "MaxRed": int(max_consec_red),
+                "MaxDown": int(max_consec_down),
+                "MaxDeclineHours": (
+                    max(max_consec_red, max_consec_down) * step_ms / 3_600_000.0
+                ),
+                "Recent90%": recent_change * 100,
+                "CurrentDD%": current_dd * 100,
+                "CycleMove%": cycle_move * 100,
+                "Recovery Events": recovery["events"],
+                "Recovery%": recovery["success_rate"] * 100,
+                "Cycles/30D": recovery["cycles_per_30d"],
+                "Median Recovery Days": recovery["median_recovery_days"],
                 "MC Rank": cand.get('mc_rank', -1),
             }
         except Exception as e:
@@ -1192,26 +1550,21 @@ class VolatilityScannerGUI(QMainWindow):
     def update_table(self):
         self.table.clearSelection()
         if self.scan_results is None or self.scan_results.empty:
-            self.table_model.set_dataframe(pd.DataFrame(columns=self.cols))
+            self.display_results = pd.DataFrame()
+            self.table_model.set_columns(self.simple_cols)
+            self.table_model.set_dataframe(pd.DataFrame(columns=self.simple_cols))
+            if hasattr(self, "lbl_result_summary"):
+                self.lbl_result_summary.setText("No results to display")
             return
 
-        if "MC Rank" in self.scan_results.columns:
-            work_df = self.scan_results.copy()
-            mc_rank = pd.to_numeric(work_df["MC Rank"], errors="coerce")
-            work_df["_mc_sort"] = np.where(mc_rank > 0, mc_rank, np.inf)
-            sort_cols = ["_mc_sort"]
-            sort_asc = [True]
-            if "RV(A)%" in work_df.columns:
-                sort_cols.append("RV(A)%")
-                sort_asc.append(False)
-            work_df.sort_values(sort_cols, ascending=sort_asc, inplace=True)
-            self.scan_results = work_df.drop(columns=["_mc_sort"])
-            self._sort_col = "MC Rank"
-            self._sort_asc = True
-        elif "RV(A)%" in self.scan_results.columns:
-            self.scan_results.sort_values("RV(A)%", ascending=False, inplace=True)
-            self._sort_col = "RV(A)%"
-            self._sort_asc = False
+        self.scan_results.sort_values(
+            ["Martin Score", "Recovery%", "Cycles/30D"],
+            ascending=[False, False, False],
+            inplace=True,
+        )
+        self.scan_results.reset_index(drop=True, inplace=True)
+        self._sort_col = "Martin Fit"
+        self._sort_asc = False
 
         quote_asset = DEFAULT_QUOTE_ASSET
         raw_symbols = self.scan_results["Symbol"].tolist()
@@ -1225,27 +1578,78 @@ class VolatilityScannerGUI(QMainWindow):
                 norm_symbols.append(sym)
         print("[Scan Results] Symbols:", ", ".join(norm_symbols))
 
-        self._render_table(self.scan_results)
+        self._apply_result_filter()
+
+    @Slot()
+    def _apply_result_filter(self, *_args):
+        if self.scan_results is None or self.scan_results.empty:
+            columns = self.advanced_cols if self.chk_advanced_results.isChecked() else self.simple_cols
+            self.table_model.set_columns(columns)
+            self.table_model.set_dataframe(pd.DataFrame(columns=columns))
+            self.display_results = pd.DataFrame()
+            return
+
+        work = self.scan_results.copy()
+        work["_Rank"] = np.arange(1, len(work) + 1)
+        mode = self.cb_result_filter.currentText()
+        if mode == "Suitable Only":
+            work = work[work["Verdict"] == "Suitable"]
+        elif mode == "Suitable + Watch":
+            work = work[work["Verdict"].isin(["Suitable", "Watch"])]
+        self.display_results = work.reset_index(drop=True)
+
+        suitable = int((self.scan_results["Verdict"] == "Suitable").sum())
+        watch = int((self.scan_results["Verdict"] == "Watch").sum())
+        unsuitable = int((self.scan_results["Verdict"] == "Unsuitable").sum())
+        self.lbl_result_summary.setText(
+            f"Suitable {suitable} | Watch {watch} | Unsuitable {unsuitable} | Showing {len(work)}"
+        )
+        self._render_table(self.display_results)
 
     def _render_table(self, df: pd.DataFrame):
+        advanced = self.chk_advanced_results.isChecked()
+        columns = self.advanced_cols if advanced else self.simple_cols
+        self.cols = list(columns)
+        self.table_model.set_columns(columns)
         if df is None or df.empty:
-            self.table_model.set_dataframe(pd.DataFrame(columns=self.cols))
+            self.table_model.set_dataframe(pd.DataFrame(columns=columns))
             return
-        disp = pd.DataFrame({
-            "Symbol": df["Symbol"],
-            "Asset": df["Asset"],
-            "Price": df["Price"].map(lambda v: f"{float(v):.8f}" if float(v) < 0.01 else f"{float(v):.4f}"),
-            "Vol(M)": df["Vol(M)"].map(lambda v: f"{float(v):.2f}"),
-            "Active%": df["Active%"].map(lambda v: f"{float(v):.2f}"),
-            "MaxGap%": df["MaxGap%"].map(lambda v: f"{float(v):.2f}"),
-            "RV(A)%": df["RV(A)%"].map(lambda v: f"{float(v):.2f}"),
-            "ATR(M)%": df["ATR(M)%"].map(lambda v: f"{float(v):.2f}"),
-            "MaxDD%": df["MaxDD%"].map(lambda v: f"{float(v):.2f}"),
-            "Chg%": df["Chg%"].map(lambda v: f"{float(v):.2f}"),
-            "ER": df["ER"].map(lambda v: f"{float(v):.3f}"),
-            "MaxRed": df["MaxRed"].map(lambda v: f"{int(v)}"),
-            "MC Rank": df["MC Rank"].map(lambda v: f"{int(v)}" if pd.notna(v) and float(v) > 0 else "-"),
-        })
+
+        if advanced:
+            disp = pd.DataFrame({
+                "Symbol": df["Symbol"],
+                "Martin Score": df["Martin Score"].map(lambda v: f"{int(v)}"),
+                "Verdict": df["Verdict"],
+                "Recovery%": df["Recovery%"].map(lambda v: f"{float(v):.0f}"),
+                "Cycles/30D": df["Cycles/30D"].map(lambda v: f"{float(v):.2f}"),
+                "Recent90%": df["Recent90%"].map(lambda v: f"{float(v):.2f}"),
+                "CurrentDD%": df["CurrentDD%"].map(lambda v: f"{float(v):.2f}"),
+                "Downtrend Risk": df["Downtrend Risk"],
+                "Reason": df["Reason"],
+                "Asset": df["Asset"],
+                "Price": df["Price"].map(lambda v: f"{float(v):.8f}" if float(v) < 0.01 else f"{float(v):.4f}"),
+                "Vol(M)": df["Vol(M)"].map(lambda v: f"{float(v):.2f}"),
+                "Active%": df["Active%"].map(lambda v: f"{float(v):.2f}"),
+                "MaxGap%": df["MaxGap%"].map(lambda v: f"{float(v):.2f}"),
+                "RV(A)%": df["RV(A)%"].map(lambda v: f"{float(v):.2f}"),
+                "ATR(M)%": df["ATR(M)%"].map(lambda v: f"{float(v):.2f}"),
+                "MaxDD%": df["MaxDD%"].map(lambda v: f"{float(v):.2f}"),
+                "Chg%": df["Chg%"].map(lambda v: f"{float(v):.2f}"),
+                "ER": df["ER"].map(lambda v: f"{float(v):.3f}"),
+                "MaxRed": df["MaxRed"].map(lambda v: f"{int(v)}"),
+                "MC Rank": df["MC Rank"].map(lambda v: f"{int(v)}" if pd.notna(v) and float(v) > 0 else "-"),
+            })
+        else:
+            disp = pd.DataFrame({
+                "Rank": df["_Rank"].map(lambda v: f"{int(v)}"),
+                "Symbol": df["Symbol"],
+                "Martin Fit": df["Martin Score"].map(lambda v: f"{int(v)}/100"),
+                "Verdict": df["Verdict"],
+                "Recovery Rate": df["Recovery%"].map(lambda v: f"{float(v):.0f}%"),
+                "Cycles/30D": df["Cycles/30D"].map(lambda v: f"{float(v):.1f}"),
+                "Downtrend Risk": df["Downtrend Risk"],
+                "Reason": df["Reason"],
+            })
         self.table_model.set_dataframe(disp)
         self._autosize_table_columns()
 
@@ -1253,23 +1657,44 @@ class VolatilityScannerGUI(QMainWindow):
     def on_header_clicked(self, idx: int):
         if self.scan_results is None or self.scan_results.empty:
             return
-        col = self.cols[idx]
-        ascending = True
+        columns = self.table_model._columns
+        if idx < 0 or idx >= len(columns):
+            return
+        col = columns[idx]
+        sort_map = {
+            "Rank": "Martin Score",
+            "Martin Fit": "Martin Score",
+            "Recovery Rate": "Recovery%",
+            "Verdict": "Martin Score",
+        }
+        sort_col = sort_map.get(col, col)
+        descending_first = sort_col in {
+            "Martin Score", "Recovery%", "Cycles/30D", "RV(A)%", "ATR(M)%",
+            "Active%", "Vol(M)",
+        }
+        ascending = not descending_first
         if getattr(self, "_sort_col", None) == col:
             ascending = not getattr(self, "_sort_asc", True)
         self._sort_col = col
         self._sort_asc = ascending
 
-        if col in ["Symbol", "Asset"]:
-            self.scan_results.sort_values(col, ascending=ascending, inplace=True)
-        elif col == "MC Rank":
+        if sort_col == "MC Rank":
             def sort_mc_rank(s):
                 n = pd.to_numeric(s, errors="coerce")
                 return np.where(n > 0, n, np.inf if ascending else -np.inf)
-            self.scan_results.sort_values(col, ascending=ascending, inplace=True, key=sort_mc_rank)
+            self.scan_results.sort_values(sort_col, ascending=ascending, inplace=True, key=sort_mc_rank)
+        elif sort_col == "Downtrend Risk":
+            risk_order = {"Low": 0, "Medium": 1, "High": 2}
+            self.scan_results.sort_values(
+                sort_col,
+                ascending=ascending,
+                inplace=True,
+                key=lambda s: s.map(risk_order).fillna(3),
+            )
         else:
-            self.scan_results.sort_values(col, ascending=ascending, inplace=True, key=lambda s: pd.to_numeric(s, errors="coerce"))
-        self._render_table(self.scan_results)
+            self.scan_results.sort_values(sort_col, ascending=ascending, inplace=True)
+        self.scan_results.reset_index(drop=True, inplace=True)
+        self._apply_result_filter()
 
     @Slot(object, object)
     def on_table_select(self, *_args):
@@ -1280,9 +1705,9 @@ class VolatilityScannerGUI(QMainWindow):
         if not sel:
             return
         idx = sel[0].row()
-        if self.scan_results is None or idx >= len(self.scan_results):
+        if self.display_results is None or idx >= len(self.display_results):
             return
-        record = self.scan_results.iloc[idx]
+        record = self.display_results.iloc[idx]
         sym = record["Symbol"]
         if not self._scan_context:
             return
@@ -1351,7 +1776,7 @@ class VolatilityScannerGUI(QMainWindow):
 if __name__ == "__main__":
     app = QApplication([])
     if _import_error is not None:
-        QMessageBox.critical(None, "Import Error", f"無法匯入 martin.py：\n{_import_error}")
+        QMessageBox.critical(None, "Import Error", f"Could not import martin.py:\n{_import_error}")
         raise SystemExit(1)
     w = VolatilityScannerGUI()
     w.show()

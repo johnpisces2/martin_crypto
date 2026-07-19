@@ -1,5 +1,7 @@
 cache
 __pycache__
 test_*.py
+!tests/test_volatility_scanner.py
+!tests/test_martin_gui_regressions.py
 .vscode
 .DS_Store

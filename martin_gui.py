@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 import matplotlib
 matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 
 try:
@@ -140,6 +141,57 @@ def human_pct(x, digits=2):
     if np.isinf(float(x)):
         return "∞"
     return f"{x * 100:.{digits}f}%"
+
+
+def configure_datetime_axis(ax, time_values, timezone_name="Asia/Taipei"):
+    """Install an explicit date converter and readable formatter on an axis."""
+    time_index = pd.DatetimeIndex(time_values)
+    if time_index.empty:
+        return None
+    if time_index.tz is None:
+        time_index = time_index.tz_localize(timezone_name)
+    else:
+        time_index = time_index.tz_convert(timezone_name)
+    locator = mdates.AutoDateLocator(
+        tz=time_index.tz,
+        minticks=4,
+        maxticks=9,
+        interval_multiples=True,
+    )
+    formatter = mdates.ConciseDateFormatter(locator, tz=time_index.tz)
+    ax.xaxis_date(tz=time_index.tz)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+    ax.tick_params(axis="x", labelrotation=20)
+    return formatter
+
+
+def backtest_accounting_summary(result, capital):
+    """Reconcile final equity against realized and open-position PnL."""
+    capital = float(capital)
+    closed_pnl = float(sum(float(trade.get("pnl", 0.0)) for trade in result.get("trades_log", [])))
+    open_trade = result.get("open_trade")
+    open_pnl = (
+        float(open_trade.get("pnl", 0.0))
+        if isinstance(open_trade, dict) else 0.0
+    )
+    equity_curve = np.asarray(result.get("equity_curve", []), dtype=np.float64)
+    if equity_curve.size == 0 or not np.isfinite(equity_curve[-1]):
+        raise ValueError("Backtest equity curve has no finite terminal value")
+    final_equity = float(equity_curve[-1])
+    reconciled_equity = capital + closed_pnl + open_pnl
+    tolerance = max(0.01, abs(final_equity) * 1e-9)
+    if not np.isclose(final_equity, reconciled_equity, rtol=1e-9, atol=tolerance):
+        raise ValueError(
+            "Backtest accounting mismatch: "
+            f"curve={final_equity:.8f}, reconciled={reconciled_equity:.8f}"
+        )
+    return {
+        "closed_pnl": closed_pnl,
+        "open_pnl": open_pnl,
+        "net_pnl": final_equity - capital,
+        "final_equity": final_equity,
+    }
 
 
 
@@ -449,6 +501,7 @@ class MartinGUI(QMainWindow):
         e = QDateEdit()
         e.setCalendarPopup(True)
         e.setDisplayFormat("yyyy/MM/dd")
+        e.setMaximumDate(QDate.currentDate())
         e.setDate(default_date)
         date_text_width = e.fontMetrics().horizontalAdvance("0000/00/00")
         e.setMinimumWidth(max(width, date_text_width + 52))
@@ -2140,6 +2193,16 @@ class MartinGUI(QMainWindow):
             lows=df["low"].to_numpy(dtype=np.float64),
         )
 
+        accounting = backtest_accounting_summary(res, capital)
+        res["_closed_pnl"] = accounting["closed_pnl"]
+        res["_open_pnl"] = accounting["open_pnl"]
+        res["_net_pnl"] = accounting["net_pnl"]
+        res["_accounting_final_equity"] = accounting["final_equity"]
+        res["_data_rows"] = int(len(df))
+        res["_price_start"] = float(prices_np[0])
+        res["_price_end"] = float(prices_np[-1])
+        res["_price_return"] = float(prices_np[-1] / prices_np[0] - 1.0)
+
         first_price = float(prices_np[0])
         bh_qty = float(capital) / (first_price * (1.0 + float(fee_rate)))
         bh_curve = bh_qty * prices_np * (1.0 - float(fee_rate))
@@ -2151,6 +2214,17 @@ class MartinGUI(QMainWindow):
             open_trade=res.get("open_trade"),
             max_dd_override=res.get("max_dd_overall"),
         )
+        expected_total_return = accounting["final_equity"] / float(capital) - 1.0
+        if not np.isclose(
+            float(perf.get("total_return", np.nan)),
+            expected_total_return,
+            rtol=1e-10,
+            atol=1e-10,
+        ):
+            raise ValueError(
+                "Performance total-return mismatch: "
+                f"metrics={perf.get('total_return')}, expected={expected_total_return}"
+            )
 
         res["bh_curve"] = bh_curve
         res["capital"] = float(capital)
@@ -2194,6 +2268,7 @@ class MartinGUI(QMainWindow):
             bh_line.set_visible(True)
         else:
             bh_line.set_visible(False)
+        configure_datetime_axis(ax, time_index)
 
         for patch in state["trap_patches"]:
             try:
@@ -2257,7 +2332,29 @@ class MartinGUI(QMainWindow):
             t = []
             if res.get("_coverage_note"):
                 t.append(f"=== Data Coverage ===\n{res['_coverage_note']}\n")
+            price_start = float(res.get("_price_start", df["close"].iloc[0]))
+            price_end = float(res.get("_price_end", df["close"].iloc[-1]))
+            price_return = float(res.get("_price_return", price_end / price_start - 1.0))
+            final_equity = float(res.get("_accounting_final_equity", equity_curve[-1]))
+            closed_pnl = float(res.get("_closed_pnl", 0.0))
+            open_pnl = float(res.get("_open_pnl", 0.0))
+            net_pnl = float(res.get("_net_pnl", final_equity - float(res.get("capital", 0.0))))
+            t.append("=== Data Summary ===")
+            t.append(
+                f"Period: {df['time'].iloc[0].strftime('%Y-%m-%d %H:%M')} → "
+                f"{df['time'].iloc[-1].strftime('%Y-%m-%d %H:%M')} | "
+                f"Candles: {int(res.get('_data_rows', len(df))):,}"
+            )
+            t.append(
+                f"Price: {price_start:.4f} → {price_end:.4f} | "
+                f"Change: {human_pct(price_return)}"
+            )
+            t.append("")
             t.append("=== Performance (Strategy) ===")
+            t.append(
+                f"Final Equity: {final_equity:.2f} | Net PnL: {net_pnl:+.2f} | "
+                f"Closed/Open PnL: {closed_pnl:+.2f}/{open_pnl:+.2f}"
+            )
             t.append(
                 f"Total Return: {human_pct(perf.get('total_return'))} | CAGR: {human_pct(perf.get('cagr'))} | Ann Vol: {human_pct(perf.get('ann_vol'))}"
             )
@@ -2285,8 +2382,6 @@ class MartinGUI(QMainWindow):
                 f"Terminal-adjusted Win Rate: {human_pct(perf.get('win_rate'))} | "
                 f"Profit Factor: {pf_str} | Exposure: {human_pct(perf.get('exposure'))}"
             )
-            if perf.get("has_open_position"):
-                t.append(f"Open Position Mark-to-market PnL: {perf.get('open_trade_pnl', float('nan')):.2f}")
             if trap_ratio is not None and total_secs is not None:
                 trapped_days = trapped_secs / 86400.0
                 total_days = total_secs / 86400.0

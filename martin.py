@@ -616,6 +616,16 @@ def _trade_streaks(pnls: list[float]):
     return max_w, max_l
 
 
+def _matches_capital_baseline(value: float, capital: float) -> bool:
+    """Use a strict comparison so fees never erase the true capital baseline."""
+    return math.isclose(
+        float(value),
+        float(capital),
+        rel_tol=1e-12,
+        abs_tol=1e-9,
+    )
+
+
 def compute_performance_metrics(
     equity_curve,
     time_index,
@@ -639,7 +649,7 @@ def compute_performance_metrics(
         raise ValueError("time_index 必須嚴格遞增且不可重複")
 
     ec_stats = ec
-    if capital > 0 and not np.isclose(float(ec.iloc[0]), float(capital)):
+    if capital > 0 and not _matches_capital_baseline(ec.iloc[0], capital):
         first_ts = ec.index[0]
         if len(ec.index) >= 2:
             inferred_step = ec.index[1] - ec.index[0]
@@ -717,7 +727,7 @@ def compute_performance_metrics(
         if not np.isfinite(bh.to_numpy()).all() or np.any(bh.to_numpy() <= 0):
             raise ValueError("bh_curve 必須為有限正數")
         bh_stats_curve = bh
-        if not np.isclose(float(bh.iloc[0]), float(capital)):
+        if not _matches_capital_baseline(bh.iloc[0], capital):
             if len(bh.index) >= 2:
                 inferred_step = bh.index[1] - bh.index[0]
                 if inferred_step <= pd.Timedelta(0):
