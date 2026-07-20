@@ -322,4 +322,4 @@ pytest -q
 
 ### Volatility Scanner
 
-![volatility_scanner_gui](screenshot%20volatility_scanner_gui.png)
+![volatility_scanner_gui](screenshot%20volatility%20scanner%20gui.png)
