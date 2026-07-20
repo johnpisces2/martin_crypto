@@ -7,6 +7,8 @@ import time
 
 import requests
 
+from . import rate_limit
+
 
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 COINGECKO_PAGE_SIZE = 250
@@ -18,6 +20,7 @@ def fetch_market_cap_ranks(
     session=None,
     timeout: float = 10.0,
     page_pause: float = 1.0,
+    max_retries: int = 4,
 ) -> dict[str, int]:
     """Return ``{symbol_lowercase: market_cap_rank}`` for the top N coins.
 
@@ -35,17 +38,34 @@ def fetch_market_cap_ranks(
         for page in range(1, total_pages + 1):
             remaining = requested - ((page - 1) * COINGECKO_PAGE_SIZE)
             per_page = min(remaining, COINGECKO_PAGE_SIZE)
-            response = client.get(
-                COINGECKO_MARKETS_URL,
-                params={
-                    "vs_currency": "usd",
-                    "order": "market_cap_desc",
-                    "per_page": per_page,
-                    "page": page,
-                    "sparkline": "false",
-                },
-                timeout=float(timeout),
-            )
+            response = None
+            for attempt in range(max(0, int(max_retries)) + 1):
+                try:
+                    rate_limit.acquire("coingecko")
+                    response = client.get(
+                        COINGECKO_MARKETS_URL,
+                        params={
+                            "vs_currency": "usd",
+                            "order": "market_cap_desc",
+                            "per_page": per_page,
+                            "page": page,
+                            "sparkline": "false",
+                        },
+                        timeout=float(timeout),
+                    )
+                except requests.RequestException:
+                    if attempt >= max(0, int(max_retries)):
+                        raise
+                    rate_limit.defer("coingecko", min(2 ** attempt, 16))
+                    continue
+                rate_limit.observe_response("coingecko", response)
+                if int(getattr(response, "status_code", 200)) != 429:
+                    break
+                if attempt >= max(0, int(max_retries)):
+                    return {}
+                rate_limit.defer_from_response("coingecko", response, attempt)
+            if response is None:
+                return {}
             if int(getattr(response, "status_code", 200)) != 200:
                 return {}
             data = response.json()

@@ -37,6 +37,8 @@ except Exception as e:
     martin = None
     _import_error = e
 
+from market_data import alpaca, universe
+
 from mc_sampling import sample_parameter_grid, refine_neighbors
 from mc_eval import (
     eval_candidates_parallel,
@@ -44,25 +46,21 @@ from mc_eval import (
     ohlc_ratios_from_history,
 )
 from mc_formatters import format_hist_scan_display, format_hist_scan_csv, format_mc_scan_display
-from market_data import pionex, universe
-
-
-PIONEX_STOCK_SYMBOLS_FALLBACK = [
-    "AAPLX", "AMZNX", "BMNRX", "CRCLX", "GOOGLX", "METAX", "NVDAX",
-    "QQQX", "SLVX", "SPYX", "TSLAX", "USOX",
-]
 CRYPTO_SYMBOLS = [
     "ASTER", "BONK", "ENA", "PEPE", "WLD", "ZEC", "TAO", "SUI", "HBAR",
     "UNI", "NEAR", "FIL", "APT", "ARB",
     "DOGE", "SHIB", "ADA", "AVAX", "LINK", "XRP", "SOL", "LTC", "ETH",
     "BNB", "TRX", "BCH", "BTC",
 ]
-DEFAULT_SYMBOLS = PIONEX_STOCK_SYMBOLS_FALLBACK + CRYPTO_SYMBOLS
+DEFAULT_SYMBOLS = CRYPTO_SYMBOLS
+ALPACA_DEFAULT_SYMBOLS = list(universe.ALPACA_MAINSTREAM_STOCK_SYMBOLS[:50])
 CRYPTO_INTERVALS = ["15m", "1h", "4h", "1d"]
-DATA_SOURCES = ["auto", "binance", "pionex"]
+DATA_SOURCES = ["binance", "alpaca"]
 DEFAULT_REFRESH_POLICY = "auto"
 DEFAULT_FEE_RATE = 0.0005
 DEFAULT_FEE_LABEL = "0.05%"
+ALPACA_TRADING_DAYS_PER_YEAR = 252.0
+ALPACA_BARS_PER_TRADING_DAY = dict(alpaca.DEFAULT_BARS_PER_TRADING_DAY)
 
 
 def parse_range(s: str, is_int=False):
@@ -333,18 +331,16 @@ class MartinGUI(QMainWindow):
         self._data_cache = OrderedDict()
         self.scan_df = None
         self.mc_scan_df = None
+        self._scan_run_config = None
+        self._mc_scan_run_config = None
         self._mc_executor = None
         self._mc_executor_workers = 0
         self._backtest_cache = OrderedDict()
         self._plot_states = {}
-        self._pionex_stock_symbols = list(PIONEX_STOCK_SYMBOLS_FALLBACK)
-        self._pionex_symbols_loading = False
-        self._pionex_symbols_loaded = False
-
         self._build_scan_tab()
         self._build_mc_scan_tab()
         self._build_single_tab()
-        self._connect_source_symbol_lists()
+        self._configure_symbol_inputs()
 
         self.nb.currentChanged.connect(self._on_main_tab_changed)
 
@@ -529,136 +525,64 @@ class MartinGUI(QMainWindow):
         self._add_form_row(form, label, cb)
         return cb
 
-    @staticmethod
-    def _replace_combobox_items(combo: QComboBox, values):
-        """Replace suggestions without discarding editable/manual input."""
-        current = combo.currentText().strip()
-        unique_values = list(dict.fromkeys(str(value).strip().upper() for value in values if value))
-        combo.blockSignals(True)
-        try:
-            combo.clear()
-            combo.addItems(unique_values)
-            if current:
-                combo.setCurrentText(current)
-        finally:
-            combo.blockSignals(False)
-
-    def _connect_source_symbol_lists(self):
-        self._source_symbol_pairs = [
+    def _configure_symbol_inputs(self):
+        pairs = (
             (self.e_source, self.e_symbol),
             (self.m_source, self.m_symbol),
             (self.s_source, self.s_symbol),
-        ]
-        for source_combo, symbol_combo in self._source_symbol_pairs:
-            source_combo.currentTextChanged.connect(
-                lambda text, combo=symbol_combo: self._on_source_changed(text, combo)
-            )
-            self._on_source_changed(source_combo.currentText(), symbol_combo)
-
-        self._source_range_controls = [
-            (self.e_source, self.e_interval, self.e_start, self.e_end),
-            (self.m_source, self.m_interval, self.m_start, self.m_end),
-            (self.s_source, self.s_interval, self.s_start, self.s_end),
-        ]
-        for source_combo, interval_combo, start_edit, end_edit in self._source_range_controls:
-            source_combo.currentTextChanged.connect(
-                lambda _text, s=source_combo, i=interval_combo, a=start_edit, b=end_edit:
-                    self._shorten_pionex_date_range(s, i, a, b)
-            )
-            interval_combo.currentTextChanged.connect(
-                lambda _text, s=source_combo, i=interval_combo, a=start_edit, b=end_edit:
-                    self._shorten_pionex_date_range(s, i, a, b)
-            )
-            end_edit.dateChanged.connect(
-                lambda _date, s=source_combo, i=interval_combo, a=start_edit, b=end_edit:
-                    self._shorten_pionex_date_range(s, i, a, b)
-            )
-            self._shorten_pionex_date_range(
-                source_combo, interval_combo, start_edit, end_edit
-            )
-
-    def _shorten_pionex_date_range(
-        self, source_combo, interval_combo, start_edit, end_edit
-    ):
-        """Keep explicit Pionex requests within its 10,000-candle window."""
-        if source_combo.currentText().strip().lower() != "pionex":
-            start_edit.setToolTip("")
-            return
-        step_ms = martin._interval_ms(interval_combo.currentText().strip())
-        # Date inputs include both Start and End calendar days. Reserve one day
-        # from the raw bar span so even a completed historical End date remains
-        # within the inclusive 10,000-candle request.
-        max_span_days = max(
-            1,
-            int((pionex.PIONEX_MAX_KLINES * step_ms) // 86_400_000) - 1,
         )
-        end_date = end_edit.date()
-        earliest = end_date.addDays(-max_span_days)
-        if start_edit.date() < earliest:
-            start_edit.setDate(earliest)
-            self._set_status(
-                f"Pionex {interval_combo.currentText()} 公開歷史上限為 "
-                f"{pionex.PIONEX_MAX_KLINES:,} 根；Start 已縮短至 "
-                f"{earliest.toString('yyyy/MM/dd')}。"
+        for source_combo, symbol_combo in pairs:
+            symbol_combo.setMaxVisibleItems(12)
+            symbol_combo.view().setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            symbol_combo.view().setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
+            source_combo.currentTextChanged.connect(
+                lambda source, combo=symbol_combo: self._update_symbol_input(combo, source)
             )
-        start_edit.setToolTip(
-            "Pionex 公開 K 線最多 10,000 根；若商品上市較晚，會使用實際可取得的部分資料。"
-        )
+            self._update_symbol_input(symbol_combo, source_combo.currentText())
 
-    def _on_source_changed(self, source_name: str, symbol_combo: QComboBox):
-        source = str(source_name or "").strip().lower()
-        if source == "pionex":
-            self._replace_combobox_items(
-                symbol_combo, self._pionex_stock_symbols + CRYPTO_SYMBOLS
+    def _update_symbol_input(self, symbol_combo: QComboBox, source: str):
+        source_name = str(source or "").strip().lower()
+        if source_name == "alpaca":
+            symbols = ALPACA_DEFAULT_SYMBOLS
+            default = "AAPL"
+            tooltip = (
+                "Alpaca US stock/ETF ticker，例如 AAPL、NVDA、STRC。"
+                "下拉清單預設提供 50 個主流標的，也可手動輸入其他有效 ticker。"
             )
-            symbol_combo.setToolTip(
-                "Pionex 股票／ETF／RWA 代幣會從公開市場清單自動更新；亦可手動輸入。"
-            )
-            self._request_pionex_stock_symbols()
         else:
-            suggestions = DEFAULT_SYMBOLS if source == "auto" else CRYPTO_SYMBOLS
-            self._replace_combobox_items(symbol_combo, suggestions)
-            symbol_combo.setToolTip("可從清單選擇，亦可手動輸入交易對 base symbol。")
+            symbols = CRYPTO_SYMBOLS
+            default = "XRP"
+            tooltip = (
+                "Binance crypto spot base symbol，例如 BTC、ETH、XRP。"
+                "可從清單選擇，亦可手動輸入有效的 USDT 現貨幣種。"
+            )
 
-    def _request_pionex_stock_symbols(self):
-        if self._pionex_symbols_loaded or self._pionex_symbols_loading:
-            return
-        self._pionex_symbols_loading = True
-        self._set_status("Loading Pionex stock/RWA symbols…")
-        worker = Worker(self._fetch_pionex_stock_symbols)
-        worker.signals.finished.connect(self._on_pionex_stock_symbols_loaded)
-        worker.signals.error.connect(self._on_pionex_stock_symbols_error)
-        self.thread_pool.start(worker)
+        previous = symbol_combo.blockSignals(True)
+        try:
+            symbol_combo.clear()
+            symbol_combo.addItems(symbols)
+            symbol_combo.setCurrentText(default)
+            symbol_combo.setToolTip(tooltip)
+        finally:
+            symbol_combo.blockSignals(previous)
+
+        if source_name == "alpaca":
+            try:
+                alpaca.load_env_file()
+                alpaca.credentials_from_env()
+            except (OSError, ValueError) as exc:
+                self._set_status(f"Alpaca 尚未就緒：{str(exc).splitlines()[0]}")
+            else:
+                self._set_status("Alpaca 已就緒；Symbol 清單載入 50 個美股／ETF。")
+        else:
+            self._set_status("Binance crypto spot symbols loaded.")
 
     @staticmethod
-    def _fetch_pionex_stock_symbols():
-        client = pionex.PionexPublicClient()
-        try:
-            markets = client.load_markets()
-            return universe.listed_stock_token_bases(markets)
-        finally:
-            client.close()
-
-    @Slot(object)
-    def _on_pionex_stock_symbols_loaded(self, symbols):
-        self._pionex_symbols_loading = False
-        loaded = list(symbols or [])
-        if not loaded:
-            self._set_status("Pionex stock list is empty; using built-in fallback list.")
-            return
-        self._pionex_symbols_loaded = True
-        self._pionex_stock_symbols = loaded
-        for source_combo, symbol_combo in self._source_symbol_pairs:
-            if source_combo.currentText().strip().lower() == "pionex":
-                self._replace_combobox_items(
-                    symbol_combo, self._pionex_stock_symbols + CRYPTO_SYMBOLS
-                )
-        self._set_status(f"Loaded {len(loaded)} Pionex stock/RWA symbols.")
-
-    @Slot(str)
-    def _on_pionex_stock_symbols_error(self, _traceback_text):
-        self._pionex_symbols_loading = False
-        self._set_status("Pionex stock list unavailable; using built-in fallback list.")
+    def _source_date_range(source: str, start: str, end: str):
+        """Use full New York trading dates for Alpaca stock requests."""
+        if str(source or "").strip().lower() != "alpaca":
+            return start, end
+        return alpaca.full_new_york_date_range(start, end)
 
     # ---------- scan tab ----------
     def _build_scan_tab(self):
@@ -677,7 +601,7 @@ class MartinGUI(QMainWindow):
         top.addWidget(gb_filter)
 
         form_data = QFormLayout(gb_data)
-        self.e_source = self._add_combobox(form_data, "Source:", DATA_SOURCES, default="auto")
+        self.e_source = self._add_combobox(form_data, "Source:", DATA_SOURCES, default="binance")
         self.e_symbol = self._add_combobox(form_data, "Symbol:", DEFAULT_SYMBOLS, default="XRP")
         self.e_symbol.setEditable(True)
         self.e_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
@@ -796,7 +720,7 @@ class MartinGUI(QMainWindow):
         top.addWidget(gb_risk)
 
         form_data = QFormLayout(gb_data)
-        self.m_source = self._add_combobox(form_data, "Source:", DATA_SOURCES, default="auto")
+        self.m_source = self._add_combobox(form_data, "Source:", DATA_SOURCES, default="binance")
         self.m_symbol = self._add_combobox(form_data, "Symbol:", DEFAULT_SYMBOLS, default="XRP")
         self.m_symbol.setEditable(True)
         self.m_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
@@ -967,7 +891,7 @@ class MartinGUI(QMainWindow):
         top.addStretch(1)
 
         form_data = QFormLayout(gb_data)
-        self.s_source = self._add_combobox(form_data, "Source:", DATA_SOURCES, default="auto")
+        self.s_source = self._add_combobox(form_data, "Source:", DATA_SOURCES, default="binance")
         self.s_symbol = self._add_combobox(form_data, "Symbol:", DEFAULT_SYMBOLS, default="XRP")
         self.s_symbol.setEditable(True)
         self.s_interval = self._add_combobox(form_data, "Interval:", CRYPTO_INTERVALS, default="15m")
@@ -1062,8 +986,10 @@ class MartinGUI(QMainWindow):
         now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
         return martin._align_to_interval_end(now_ms, martin._interval_ms(interval))
 
-    def _fetch_klines_if_needed(self, symbol, interval, start, end, refresh_policy, source="auto"):
-        source = str(source or "auto").strip().lower()
+    def _fetch_klines_if_needed(self, symbol, interval, start, end, refresh_policy, source="binance"):
+        source = str(source or "binance").strip().lower()
+        if source not in DATA_SOURCES:
+            raise ValueError(f"不支援的資料來源：{source}")
         key = (
             symbol, interval, start, end, refresh_policy, source,
             self._refresh_generation(interval, refresh_policy),
@@ -1075,16 +1001,21 @@ class MartinGUI(QMainWindow):
                 return cached
             # Serialize cache misses so two tabs cannot concurrently overwrite
             # the same parquet file or pair one request key with another frame.
+            if source == "alpaca":
+                alpaca.load_env_file()
+                alpaca.credentials_from_env()
+            request_start, request_end = self._source_date_range(source, start, end)
             df = martin.get_klines(
                 symbol=symbol,
                 interval=interval,
-                start=start,
-                end=end,
+                start=request_start,
+                end=request_end,
                 cache_dir=martin.DEFAULT_CACHE_DIR,
                 use_cache=True,
                 refresh_policy=refresh_policy,
-                exch_list=None if source == "auto" else [source],
-                allow_partial_sources=("pionex",),
+                exch_list=[source],
+                allow_gaps=(source == "alpaca"),
+                require_full_coverage=(source != "alpaca"),
             )
             self._data_cache[key] = df
             self._data_cache.move_to_end(key)
@@ -1094,7 +1025,7 @@ class MartinGUI(QMainWindow):
 
     def _make_backtest_cache_key(
         self, symbol, interval, start, end, refresh_policy, fee_rate, capital,
-        add_drop, multiplier, max_orders, tp, source="auto",
+        add_drop, multiplier, max_orders, tp, source="binance",
     ):
         return (
             symbol,
@@ -1108,7 +1039,7 @@ class MartinGUI(QMainWindow):
             float(multiplier),
             int(max_orders),
             float(tp),
-            str(source or "auto").lower(),
+            str(source or "binance").lower(),
             self._refresh_generation(interval, refresh_policy),
         )
 
@@ -1254,7 +1185,7 @@ class MartinGUI(QMainWindow):
             raise ValueError("capital 必須為正數")
         df = self._fetch_klines_if_needed(
             symbol, interval, config["start"], config["end"], config["refresh_policy"],
-            config.get("source", "auto"),
+            config.get("source", "binance"),
         )
         prices_np = df["close"].to_numpy(dtype=np.float64)
         required = {"open", "high", "low", "close"}
@@ -1272,9 +1203,10 @@ class MartinGUI(QMainWindow):
         }
 
     def _collect_context_from_inputs(
-        self, symbol_cb, interval_cb, start_edit, end_edit, capital_edit
+        self, symbol_cb, source_cb, interval_cb, start_edit, end_edit, capital_edit
     ):
         symbol = symbol_cb.currentText().strip()
+        source = source_cb.currentText().strip().lower()
         interval = interval_cb.currentText().strip()
         start, end = self._get_date_range_strings(start_edit, end_edit)
 
@@ -1286,7 +1218,9 @@ class MartinGUI(QMainWindow):
         if capital is None or not np.isfinite(capital) or capital <= 0:
             raise ValueError("capital 必須為正數")
 
-        df = self._fetch_klines_if_needed(symbol, interval, start, end, refresh_policy)
+        df = self._fetch_klines_if_needed(
+            symbol, interval, start, end, refresh_policy, source
+        )
         prices_np = df["close"].to_numpy(dtype=np.float64)
         if prices_np.size < 2:
             raise ValueError("K 線資料不足（<2 根），無法回測/掃描。")
@@ -1296,6 +1230,7 @@ class MartinGUI(QMainWindow):
 
         return {
             "symbol": symbol,
+            "source": source,
             "interval": interval,
             "start": start,
             "end": end,
@@ -1312,6 +1247,7 @@ class MartinGUI(QMainWindow):
     def _collect_scan_context(self):
         return self._collect_context_from_inputs(
             self.e_symbol,
+            self.e_source,
             self.e_interval,
             self.e_start,
             self.e_end,
@@ -1321,6 +1257,7 @@ class MartinGUI(QMainWindow):
     def _collect_mc_scan_context(self):
         return self._collect_context_from_inputs(
             self.m_symbol,
+            self.m_source,
             self.m_interval,
             self.m_start,
             self.m_end,
@@ -1584,7 +1521,7 @@ class MartinGUI(QMainWindow):
         if topn <= 0:
             raise ValueError("Show Top N 必須 > 0")
         top_df = filtered.nlargest(topn, "final_equity").copy()
-        return top_df
+        return top_df, dict(config)
 
     def _populate_scan_table(self, disp: pd.DataFrame, cols):
         self.table.setUpdatesEnabled(False)
@@ -1601,12 +1538,16 @@ class MartinGUI(QMainWindow):
         self.mc_table.viewport().update()
 
     @Slot(object)
-    def _scan_update_ui(self, top_df: pd.DataFrame):
+    def _scan_update_ui(self, payload):
         self.btn_hist_run.setEnabled(True)
-        disp, cols = self._format_hist_scan_display(top_df)
-        self._populate_scan_table(disp, cols)
-
+        if isinstance(payload, tuple) and len(payload) == 2:
+            top_df, run_config = payload
+        else:
+            top_df, run_config = payload, None
         self.scan_df = top_df.reset_index(drop=True)
+        self._scan_run_config = dict(run_config) if run_config is not None else None
+        disp, cols = self._format_hist_scan_display(self.scan_df)
+        self._populate_scan_table(disp, cols)
         if self.scan_df.empty:
             self._set_status("Scan completed. No rows matched current filters.")
             QMessageBox.information(self, "Info", "篩選條件過嚴，請放寬。")
@@ -1660,7 +1601,7 @@ class MartinGUI(QMainWindow):
         candidates = self._compute_filtered_mc_candidates(train_ctx)
         n_cand = len(candidates)
         if candidates.empty:
-            return pd.DataFrame(), 0, 0
+            return pd.DataFrame(), 0, 0, dict(config)
         if workers <= 0:
             workers = max(1, min(os.cpu_count() or 1, 8))
         workers = min(int(workers), max(1, int(n_cand)))
@@ -1685,7 +1626,12 @@ class MartinGUI(QMainWindow):
                 "請縮小 block 或 holdout。"
             )
         start_price = float(ctx["prices_np"][-1])
-        mc_bars = self._days_to_bars(mc_days, ctx["interval"])
+        mc_bars = self._days_to_bars(
+            mc_days,
+            ctx["interval"],
+            ctx.get("source", "binance"),
+            ctx.get("df"),
+        )
         seed_children = np.random.SeedSequence(int(mc_seed)).spawn(int(seed_runs))
         run_outputs = []
         for child in seed_children:
@@ -1783,13 +1729,20 @@ class MartinGUI(QMainWindow):
         show_topn = safe_int(ctx["show_topn"].strip(), 50)
         if show_topn > 0:
             out = out.head(show_topn).copy()
-        return out, feasible_count, int(n_cand)
+        return out, feasible_count, int(n_cand), dict(config)
 
     @Slot(object)
     def _mc_scan_update_ui(self, payload):
         self.btn_mc_run.setEnabled(True)
-        df, feasible_count, total = payload
+        if len(payload) == 4:
+            df, feasible_count, total, run_config = payload
+        else:
+            df, feasible_count, total = payload
+            run_config = None
         self.mc_scan_df = df.reset_index(drop=True)
+        self._mc_scan_run_config = (
+            dict(run_config) if run_config is not None else None
+        )
         if self.mc_scan_df.empty:
             self._populate_mc_scan_table(pd.DataFrame(columns=[]), [])
             self._set_status("Scan completed. No candidate after filters.")
@@ -1821,6 +1774,7 @@ class MartinGUI(QMainWindow):
         if hasattr(self, "figure_mc_scan") and self.figure_mc_scan:
             self._clear_plot(self.figure_mc_scan, self.canvas_mc_scan)
         self.mc_scan_df = None
+        self._mc_scan_run_config = None
         self._set_status("Scan results cleared.")
 
     def save_scan_csv(self):
@@ -1845,6 +1799,7 @@ class MartinGUI(QMainWindow):
         if self.figure_scan:
             self._clear_plot(self.figure_scan, self.canvas_scan)
         self.scan_df = None
+        self._scan_run_config = None
         self._set_status("Scan results cleared.")
 
     def plot_selected_from_table(self, _row=None, _col=None):
@@ -1861,25 +1816,29 @@ class MartinGUI(QMainWindow):
             return
         original_idx = self.scan_table_model.frame.index[idx]
         params = self.scan_df.loc[original_idx]
+        config = self._scan_run_config
+        if not config:
+            QMessageBox.information(self, "提示", "掃描設定已不存在，請重新 Run Scan。")
+            return
         self._set_status("載入詳細回測…")
 
-        interval_str = self.e_interval.currentText().strip()
-        start, end = self._get_date_range_strings(self.e_start, self.e_end)
+        interval_str = str(config["interval"]).strip()
+        start, end = str(config["start"]), str(config["end"])
 
         worker = Worker(
             self._compute_backtest,
-            self.e_symbol.currentText().strip(),
+            str(config["symbol"]).strip(),
             interval_str,
             start,
             end,
-            DEFAULT_REFRESH_POLICY,
-            DEFAULT_FEE_RATE,
-            safe_float(self.e_capital.text().strip(), 1000.0),
+            str(config.get("refresh_policy", DEFAULT_REFRESH_POLICY)),
+            float(config.get("fee_rate", DEFAULT_FEE_RATE)),
+            float(config["capital"]),
             float(params["add_drop"]),
             float(params["multiplier"]),
             int(params["max_orders"]),
             float(params["tp"]),
-            self.e_source.currentText().strip().lower(),
+            str(config.get("source", "binance")).strip().lower(),
         )
         worker.signals.finished.connect(self._render_scan_detail)
         worker.signals.error.connect(self._show_error)
@@ -1899,25 +1858,29 @@ class MartinGUI(QMainWindow):
             return
         original_idx = self.mc_table_model.frame.index[idx]
         params = self.mc_scan_df.loc[original_idx]
+        config = self._mc_scan_run_config
+        if not config:
+            QMessageBox.information(self, "提示", "掃描設定已不存在，請重新 Run Scan。")
+            return
         self._set_status("載入候選參數詳細回測…")
 
-        interval_str = self.m_interval.currentText().strip()
-        start, end = self._get_date_range_strings(self.m_start, self.m_end)
+        interval_str = str(config["interval"]).strip()
+        start, end = str(config["start"]), str(config["end"])
 
         worker = Worker(
             self._compute_backtest,
-            self.m_symbol.currentText().strip(),
+            str(config["symbol"]).strip(),
             interval_str,
             start,
             end,
-            DEFAULT_REFRESH_POLICY,
-            DEFAULT_FEE_RATE,
-            safe_float(self.m_capital.text().strip(), 1000.0),
+            str(config.get("refresh_policy", DEFAULT_REFRESH_POLICY)),
+            float(config.get("fee_rate", DEFAULT_FEE_RATE)),
+            float(config["capital"]),
             float(params["add_drop"]),
             float(params["multiplier"]),
             int(params["max_orders"]),
             float(params["tp"]),
-            self.m_source.currentText().strip().lower(),
+            str(config.get("source", "binance")).strip().lower(),
         )
         worker.signals.finished.connect(self._render_mc_scan_detail)
         worker.signals.error.connect(self._show_error)
@@ -1966,7 +1929,7 @@ class MartinGUI(QMainWindow):
         interval = config["interval"]
         start, end = config["start"], config["end"]
         refresh = config["refresh_policy"]
-        source = config.get("source", "auto")
+        source = config.get("source", "binance")
         fee_rate = config["fee_rate"]
         capital = config["capital"]
 
@@ -2019,11 +1982,30 @@ class MartinGUI(QMainWindow):
             self._clear_plot(self.figure_single, self.canvas_single)
         self._set_status("Single backtest results cleared.")
 
-    def _interval_bars_per_year(self, interval: str) -> float:
+    def _interval_bars_per_year(
+        self, interval: str, source="binance", df: pd.DataFrame | None = None
+    ) -> float:
+        if str(source or "").strip().lower() == "alpaca":
+            return alpaca.bars_per_trading_day(
+                df, interval
+            ) * ALPACA_TRADING_DAYS_PER_YEAR
         step_ms = martin._interval_ms(interval)
         return (365.0 * 24.0 * 3600.0 * 1000.0) / float(step_ms)
 
-    def _days_to_bars(self, days: float, interval: str) -> int:
+    def _days_to_bars(
+        self,
+        days: float,
+        interval: str,
+        source="binance",
+        df: pd.DataFrame | None = None,
+    ) -> int:
+        if str(source or "").strip().lower() == "alpaca":
+            bars_per_calendar_day = (
+                alpaca.bars_per_trading_day(df, interval)
+                * ALPACA_TRADING_DAYS_PER_YEAR
+                / 365.0
+            )
+            return max(2, int(round(float(days) * bars_per_calendar_day)))
         step_ms = martin._interval_ms(interval)
         bars = int(round(float(days) * 86400.0 * 1000.0 / float(step_ms)))
         return max(2, bars)
@@ -2068,7 +2050,8 @@ class MartinGUI(QMainWindow):
             prices_np,
         )
         interval = config["interval"]
-        mc_bars = self._days_to_bars(mc_days, interval)
+        source = config.get("source", "binance")
+        mc_bars = self._days_to_bars(mc_days, interval, source, df)
         rng = np.random.default_rng(int(mc_seed))
 
         add_drop = float(res["_add_drop"])
@@ -2077,7 +2060,7 @@ class MartinGUI(QMainWindow):
         tp = float(res["_tp"])
         capital = float(res["capital"])
         fee_rate = DEFAULT_FEE_RATE
-        bars_per_year = self._interval_bars_per_year(interval)
+        bars_per_year = self._interval_bars_per_year(interval, source, df)
         years_per_path = mc_bars / bars_per_year if bars_per_year > 0 else np.nan
 
         start_price = float(prices_np[-1]) if len(prices_np) else 1.0
@@ -2168,7 +2151,7 @@ class MartinGUI(QMainWindow):
     # ---------- compute ----------
     def _compute_backtest(self, symbol, interval, start, end, refresh_policy,
                           fee_rate, capital, add_drop, multiplier, max_orders, tp,
-                          source="auto"):
+                          source="binance"):
         cache_key = self._make_backtest_cache_key(
             symbol, interval, start, end, refresh_policy, fee_rate, capital,
             add_drop, multiplier, max_orders, tp, source,
@@ -2213,6 +2196,9 @@ class MartinGUI(QMainWindow):
             position_curve=res.get("position_curve"),
             open_trade=res.get("open_trade"),
             max_dd_override=res.get("max_dd_overall"),
+            annualization_factor=self._interval_bars_per_year(
+                interval, source, df
+            ),
         )
         expected_total_return = accounting["final_equity"] / float(capital) - 1.0
         if not np.isclose(
@@ -2282,9 +2268,10 @@ class MartinGUI(QMainWindow):
             state["trap_patches"].append(ax.axvspan(s_i, e_i, alpha=0.1, color="red"))
 
         sym = df.attrs.get("symbol", "UNKNOWN")
-        market_code = df.attrs.get("market", "spot")
-        market_label = "Spot" if str(market_code).startswith("spot") else ("USDT Perp" if "usdt_perp" in str(market_code) else str(market_code))
         interval_str = df.attrs.get("interval", "N/A")
+        is_stock = str(df.attrs.get("market_type", "")).lower() == "stock"
+        market_label = "Stock" if is_stock else "Spot"
+        quote_currency = "USD" if is_stock else "USDT"
         ax.set_title(
             f"{sym} | {market_label} | exch={df.attrs.get('exchange','?')} | interval={interval_str}\n"
             f"[{df['time'].iloc[0].date()} → {df['time'].iloc[-1].date()}] "
@@ -2293,7 +2280,7 @@ class MartinGUI(QMainWindow):
             pad=12,
         )
         ax.set_xlabel("" if ax_mc is not None else "Time (Taipei)")
-        ax.set_ylabel("Equity (USDT)")
+        ax.set_ylabel(f"Equity ({quote_currency})")
         ax.relim()
         ax.autoscale_view()
         ax.legend(loc="upper left")
@@ -2304,7 +2291,7 @@ class MartinGUI(QMainWindow):
             ax_mc.hist(safe_terminal, bins=45, color="#35507a", alpha=0.75)
             ax_mc.axvline(np.median(safe_terminal), color="#8a2d3a", linestyle="--", linewidth=1.5, label="Median")
             ax_mc.set_title("Monte Carlo terminal equity distribution", fontsize=12, pad=10)
-            ax_mc.set_xlabel("Terminal Equity (USDT)")
+            ax_mc.set_xlabel(f"Terminal Equity ({quote_currency})")
             ax_mc.set_ylabel("Count")
             ax_mc.legend(loc="best")
         if not state["use_constrained"]:
@@ -2354,6 +2341,16 @@ class MartinGUI(QMainWindow):
             t.append(
                 f"Final Equity: {final_equity:.2f} | Net PnL: {net_pnl:+.2f} | "
                 f"Closed/Open PnL: {closed_pnl:+.2f}/{open_pnl:+.2f}"
+            )
+            closed_trades = int(
+                perf.get("closed_trades", res.get("trades", len(res.get("trades_log", []))))
+            )
+            has_open_position = bool(
+                perf.get("has_open_position", isinstance(res.get("open_trade"), dict))
+            )
+            t.append(
+                f"Closed Trades: {closed_trades:,} | "
+                f"Open Position at End: {'Yes' if has_open_position else 'No'}"
             )
             t.append(
                 f"Total Return: {human_pct(perf.get('total_return'))} | CAGR: {human_pct(perf.get('cagr'))} | Ann Vol: {human_pct(perf.get('ann_vol'))}"

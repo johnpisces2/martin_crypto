@@ -10,12 +10,13 @@ import concurrent.futures
 import time
 import math
 import os
+import re
 from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
 import ccxt
-from market_data import coingecko, pionex, universe
+from market_data import alpaca, coingecko, sources as market_sources, universe
 
 os.environ.setdefault("QT_API", "pyside6")
 
@@ -49,7 +50,63 @@ COINGECKO_CACHE_TTL = 600
 COINGECKO_RANK_LOOKUP_LIMIT = 1000
 TICKER_CACHE_TTL = 30
 MIN_HISTORY_COVERAGE_RATIO = 0.80
-STOCK_TOKEN_MAX_REQUIRED_HISTORY_DAYS = 90.0
+US_EQUITY_TRADING_DAYS_PER_YEAR = 252.0
+DATA_FILTERED_FLAG = "_DataFiltered"
+DATA_FILTERED_VERDICT = "Data Filtered"
+
+
+def make_data_filtered_result(cand: dict, reason: str, **available) -> dict:
+    """Build a table-compatible diagnostic row for a rejected dataset."""
+    is_stock = bool(cand.get("is_stock", False))
+    row = {
+        "Symbol": cand.get("symbol", "?"),
+        "Asset": cand.get(
+            "asset_type", "US Stock/ETF" if is_stock else "Crypto Spot"
+        ),
+        "Price": np.nan,
+        "Vol(M)": np.nan,
+        "Active%": np.nan,
+        "MaxGap%": np.nan,
+        "RV(A)%": np.nan,
+        "ATR(Day)%": np.nan,
+        "ATR(M)%": np.nan,
+        "BBW(%)": np.nan,
+        "MaxDD%": np.nan,
+        "Chg%": np.nan,
+        "ER": np.nan,
+        "MaxRed": np.nan,
+        "MaxDown": np.nan,
+        "MaxDeclineHours": np.nan,
+        "Recent90%": np.nan,
+        "CurrentDD%": np.nan,
+        "CycleMove%": np.nan,
+        "Recovery Events": np.nan,
+        "Recovery%": np.nan,
+        "Cycles/30D": np.nan,
+        "Median Recovery Days": np.nan,
+        "MC Rank": cand.get("mc_rank", -1),
+        DATA_FILTERED_FLAG: True,
+        "Reason": str(reason),
+    }
+    row.update(available)
+    return row
+
+
+def is_data_filtered_row(row) -> bool:
+    value = row.get(DATA_FILTERED_FLAG, False)
+    return bool(value) if pd.notna(value) else False
+
+
+def display_float(value, digits=2, suffix="") -> str:
+    if value is None or pd.isna(value) or not np.isfinite(float(value)):
+        return "-"
+    return f"{float(value):.{int(digits)}f}{suffix}"
+
+
+def display_int(value, suffix="") -> str:
+    if value is None or pd.isna(value) or not np.isfinite(float(value)):
+        return "-"
+    return f"{int(round(float(value)))}{suffix}"
 
 
 def optional_millions(text_value) -> float:
@@ -58,6 +115,47 @@ def optional_millions(text_value) -> float:
     if not text_value:
         return 0.0
     return float(text_value) * 1_000_000.0
+
+
+def is_alpaca_source(source_name) -> bool:
+    return str(source_name or "").strip().lower() == "alpaca"
+
+
+def initialize_alpaca_environment(path=None, environ=None) -> str | None:
+    """Load and validate the scanner's Alpaca credential file."""
+    try:
+        alpaca.load_env_file(path=path, environ=environ)
+        alpaca.credentials_from_env(environ=environ)
+    except (OSError, ValueError) as exc:
+        return str(exc)
+    return None
+
+
+def source_quote_asset(source_name) -> str:
+    return "USD" if is_alpaca_source(source_name) else DEFAULT_QUOTE_ASSET
+
+
+def source_date_range(source_name, start_str: str, end_str: str) -> tuple[str, str]:
+    """Interpret Alpaca date fields as New York trading dates."""
+    if not is_alpaca_source(source_name):
+        return start_str, end_str
+    return alpaca.full_new_york_date_range(start_str, end_str)
+
+
+def stock_bars_per_trading_day(df: pd.DataFrame, interval: str) -> float:
+    """Estimate actual bars/session so extended-hours feeds annualize correctly."""
+    return alpaca.bars_per_trading_day(df, interval)
+
+
+def parse_manual_symbols(text_value) -> list[str]:
+    symbols = []
+    for part in str(text_value or "").replace(",", " ").split():
+        symbol = part.strip().upper()
+        if "/" in symbol:
+            symbol = symbol.split("/", 1)[0]
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    return symbols
 
 
 # ===================== Metric calculations =====================
@@ -340,10 +438,18 @@ def add_martin_fit_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     out = df.copy()
-    fit = pd.DataFrame(
-        [martin_fit_from_row(row) for _, row in out.iterrows()],
-        index=out.index,
-    )
+    fit_rows = []
+    for _, row in out.iterrows():
+        if is_data_filtered_row(row):
+            fit_rows.append({
+                "Martin Score": np.nan,
+                "Verdict": DATA_FILTERED_VERDICT,
+                "Downtrend Risk": "-",
+                "Reason": row.get("Reason", "Dataset did not pass data filters"),
+            })
+        else:
+            fit_rows.append(martin_fit_from_row(row))
+    fit = pd.DataFrame(fit_rows, index=out.index)
     for column in fit.columns:
         out[column] = fit[column]
     return out
@@ -476,6 +582,8 @@ class ScanTableModel(QAbstractTableModel):
                     return QColor("#fff4d6")
                 if verdict == "Unsuitable":
                     return QColor("#f9e2e2")
+                if verdict == DATA_FILTERED_VERDICT:
+                    return QColor("#e5e7eb")
         return None
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
@@ -642,8 +750,8 @@ class VolatilityScannerGUI(QMainWindow):
         ctrl_layout.setSpacing(10)
 
         self.cb_exchange = QComboBox()
-        self.cb_exchange.addItems(["pionex", "binance"])
-        self.cb_exchange.setCurrentText("pionex")
+        self.cb_exchange.addItems(["binance", "alpaca"])
+        self.cb_exchange.setCurrentText("binance")
         self.cb_interval = QComboBox()
         self.cb_interval.addItems(["15m", "1h", "4h", "1d"])
         self.cb_interval.setCurrentText("4h")
@@ -668,8 +776,8 @@ class VolatilityScannerGUI(QMainWindow):
         self.e_min_avg_vol = QLineEdit()
         self.e_min_avg_vol.setPlaceholderText("No limit")
         self.cb_asset_universe = QComboBox()
-        self.cb_asset_universe.addItems(["All spot", "Stock/RWA tokens only", "Crypto only"])
-        self.cb_asset_universe.setCurrentText("Crypto only")
+        self.cb_asset_universe.addItem("Crypto Spot")
+        self.cb_asset_universe.setEnabled(False)
         self.e_top_n = QLineEdit("50")
         self.chk_mc_filter = QCheckBox("Enable market-cap rank filter")
         self.chk_mc_filter.setChecked(True)
@@ -704,7 +812,7 @@ class VolatilityScannerGUI(QMainWindow):
         quick_layout.setContentsMargins(12, 14, 12, 10)
         quick_layout.setHorizontalSpacing(8)
         quick_layout.setVerticalSpacing(8)
-        quick_layout.addWidget(self._build_field("Exchange", self.cb_exchange, 110), 0, 0)
+        quick_layout.addWidget(self._build_field("Data Source", self.cb_exchange, 110), 0, 0)
         quick_layout.addWidget(self._build_field("Candle Interval", self.cb_interval, 110), 0, 1)
         quick_layout.addWidget(self._build_field("Lookback", self.cb_lookback, 140), 0, 2)
         quick_layout.addWidget(self._build_field("Asset Universe", self.cb_asset_universe, 150), 0, 3)
@@ -737,13 +845,13 @@ class VolatilityScannerGUI(QMainWindow):
         rank_layout.addWidget(self.e_max_rank)
         rank_layout.addStretch(1)
         filters_layout.addWidget(self._build_field("CoinGecko Max Rank", rank_wrap, 260), 1, 1)
-        stock_hint = QLabel(
-            "Pionex spot markets ignore the 24h and historical average-volume thresholds. "
-            "The rank filter applies only to crypto; the scan limit covers all candidates."
+        self.stock_hint = QLabel(
+            "Binance scans active USDT crypto spot markets only. "
+            "Tokenized equities, swaps, futures, and stablecoin bases are excluded."
         )
-        stock_hint.setObjectName("hintLabel")
-        stock_hint.setWordWrap(True)
-        filters_layout.addWidget(stock_hint, 1, 2, 1, 2)
+        self.stock_hint.setObjectName("hintLabel")
+        self.stock_hint.setWordWrap(True)
+        filters_layout.addWidget(self.stock_hint, 1, 2, 1, 2)
 
         for col in range(4):
             filters_layout.setColumnStretch(col, 1)
@@ -767,9 +875,11 @@ class VolatilityScannerGUI(QMainWindow):
         manual_layout.setContentsMargins(12, 14, 12, 10)
         manual_layout.setSpacing(4)
         manual_layout.addWidget(self.e_manual)
-        manual_hint = QLabel("Separate base symbols with spaces or commas, for example: SUI, BTC")
-        manual_hint.setObjectName("hintLabel")
-        manual_layout.addWidget(manual_hint)
+        self.manual_hint = QLabel(
+            "Separate Binance crypto spot base symbols with spaces or commas, for example: SUI, BTC"
+        )
+        self.manual_hint.setObjectName("hintLabel")
+        manual_layout.addWidget(self.manual_hint)
         self.chk_advanced_settings = QCheckBox("Show Advanced Settings")
         self.chk_advanced_settings.setChecked(False)
         ctrl_layout.addWidget(self.chk_advanced_settings)
@@ -796,7 +906,9 @@ class VolatilityScannerGUI(QMainWindow):
         result_toolbar.setSpacing(10)
         result_toolbar.addWidget(QLabel("Show Results:"))
         self.cb_result_filter = QComboBox()
-        self.cb_result_filter.addItems(["Suitable Only", "Suitable + Watch", "All Results"])
+        self.cb_result_filter.addItems([
+            "Suitable Only", "Suitable + Watch", "Data Filtered", "All Results"
+        ])
         self.cb_result_filter.setCurrentText("Suitable Only")
         result_toolbar.addWidget(self.cb_result_filter)
         self.chk_advanced_results = QCheckBox("Show Advanced Metrics")
@@ -855,13 +967,43 @@ class VolatilityScannerGUI(QMainWindow):
         if self.centralWidget() is not None:
             self.centralWidget().setFocus()
 
-    def _on_exchange_changed(self, exchange_name):
-        """Show that Pionex ignores unreliable exchange volume thresholds."""
-        bypass_volume = str(exchange_name or "").strip().lower() == "pionex"
-        tooltip = "Pionex scans do not apply minimum-volume thresholds." if bypass_volume else ""
-        for field in (self.e_min_vol, self.e_min_avg_vol):
-            field.setEnabled(not bypass_volume)
-            field.setToolTip(tooltip)
+    def _on_exchange_changed(self, source_name):
+        alpaca_mode = is_alpaca_source(source_name)
+        self.cb_asset_universe.blockSignals(True)
+        self.cb_asset_universe.clear()
+        self.cb_asset_universe.addItem(
+            "US Stocks & ETFs" if alpaca_mode else "Crypto Spot"
+        )
+        self.cb_asset_universe.setEnabled(False)
+        self.cb_asset_universe.blockSignals(False)
+
+        self.e_min_vol.setEnabled(not alpaca_mode)
+        self.e_min_vol.setToolTip(
+            "Alpaca candidates use historical average daily USD volume instead."
+            if alpaca_mode else ""
+        )
+        self.chk_mc_filter.setEnabled(not alpaca_mode)
+        self.e_max_rank.setEnabled(not alpaca_mode)
+        if alpaca_mode:
+            count = len(universe.ALPACA_MAINSTREAM_STOCK_SYMBOLS)
+            self.stock_hint.setText(
+                f"Alpaca scans {count} curated mainstream US stocks/ETFs in priority order. "
+                "The scan limit selects how many; Min Avg Daily Volume uses historical USD volume."
+            )
+            self.manual_hint.setText(
+                "Add any US stock/ETF ticker, including symbols outside the curated list; "
+                "for example: SNDK, NVDA, AAPL, SPY"
+            )
+            self.e_manual.setPlaceholderText("e.g. SNDK, NVDA, AAPL")
+        else:
+            self.stock_hint.setText(
+                "Binance scans active USDT crypto spot markets only. "
+                "Tokenized equities, swaps, futures, and stablecoin bases are excluded."
+            )
+            self.manual_hint.setText(
+                "Add Binance crypto spot base symbols, for example: SUI, BTC, ETH"
+            )
+            self.e_manual.setPlaceholderText("e.g. SUI, BTC")
 
     def _toggle_advanced_settings(self, visible):
         self.advanced_settings_group.setVisible(bool(visible))
@@ -913,18 +1055,17 @@ class VolatilityScannerGUI(QMainWindow):
         )
 
     def _get_exchange_client(self, exch_name: str):
+        exch_name = str(exch_name or "").strip().lower()
+        if exch_name != "binance":
+            raise ValueError(f"Unsupported exchange: {exch_name}")
         with self._cache_lock:
             client = self._exchange_clients.get(exch_name)
             if client is not None:
                 return client
-        if str(exch_name).lower() == "pionex":
-            client = pionex.PionexPublicClient()
-        else:
-            client_cls = getattr(ccxt, exch_name, None)
-            if client_cls is None:
-                raise ValueError(f"Unsupported exchange: {exch_name}")
-            client = client_cls()
-        client.load_markets()
+        client = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        market_sources.call_ccxt(
+            client, client.load_markets, provider="binance", weight=20
+        )
         with self._cache_lock:
             self._exchange_clients[exch_name] = client
         return client
@@ -936,7 +1077,9 @@ class VolatilityScannerGUI(QMainWindow):
             if cached and (now - cached["ts"] <= TICKER_CACHE_TTL):
                 return cached["tickers"]
         client = self._get_exchange_client(exch_name)
-        tickers = client.fetch_tickers()
+        tickers = market_sources.call_ccxt(
+            client, client.fetch_tickers, provider=exch_name, weight=80
+        )
         with self._cache_lock:
             self._ticker_cache[exch_name] = {"ts": now, "tickers": tickers}
         return tickers
@@ -989,16 +1132,19 @@ class VolatilityScannerGUI(QMainWindow):
         if cached_df is not None:
             return cached_df
 
-        quote_asset = context["quote_asset"]
-        base = symbol.split('/')[0] if '/' in symbol else symbol.replace(quote_asset, "")
+        base = symbol.split('/', 1)[0] if '/' in symbol else symbol
+        request_start, request_end = source_date_range(
+            context["exch_name"], context["start_str"], context["end_str"]
+        )
         df = martin.get_klines(
             symbol=base,
             interval=context["interval"],
-            start=context["start_str"],
-            end=context["end_str"],
+            start=request_start,
+            end=request_end,
             exch_list=[context["exch_name"]],
-            pause=(0.0 if str(context["exch_name"]).lower() == "pionex" else 0.12),
+            pause=0.12,
             refresh_policy="auto",
+            allow_gaps=is_alpaca_source(context["exch_name"]),
             require_full_coverage=False,
         )
         if df is None or df.empty:
@@ -1029,7 +1175,6 @@ class VolatilityScannerGUI(QMainWindow):
                 "requested_days": max(1, start_qdate.daysTo(end_qdate) + 1),
                 "min_vol_pre": optional_millions(self.e_min_vol.text()),
                 "min_avg_vol": optional_millions(self.e_min_avg_vol.text()),
-                "asset_universe": self.cb_asset_universe.currentText(),
                 "top_n": int(self.e_top_n.text()),
                 "use_mc_filter": self.chk_mc_filter.isChecked(),
                 "max_rank": int(self.e_max_rank.text()),
@@ -1040,6 +1185,14 @@ class VolatilityScannerGUI(QMainWindow):
                 raise ValueError("Volume thresholds must be finite non-negative values")
             if config["top_n"] <= 0 or config["max_rank"] <= 0:
                 raise ValueError("Scan limit and max rank must be greater than zero")
+            if is_alpaca_source(config["exch_name"]):
+                configuration_error = initialize_alpaca_environment()
+                if configuration_error:
+                    raise ValueError(configuration_error)
+        except ValueError as exc:
+            self._set_status("Scan could not start.", ok=False)
+            QMessageBox.warning(self, "Configuration Error", str(exc))
+            return
         except Exception:
             self._show_error(traceback.format_exc())
             return
@@ -1094,6 +1247,7 @@ class VolatilityScannerGUI(QMainWindow):
             self._set_status(
                 "Scan completed: "
                 f"results {stats.get('results', 0)}/{stats.get('selected', 0)}, "
+                f"listed {stats.get('listed_rows', stats.get('results', 0))}, "
                 f"data-filtered {stats.get('data_filtered', 0)}, "
                 f"errors {stats.get('errors', 0)}, "
                 f"429 {stats.get('rate_limited', 0)}."
@@ -1118,20 +1272,165 @@ class VolatilityScannerGUI(QMainWindow):
         QMessageBox.critical(self, "Chart Load Error", tb)
 
     # --------- scan logic (background) ---------
+    def _build_alpaca_candidates(self, signals: ScanSignals, config) -> list[dict]:
+        top_n = int(config["top_n"])
+        manual_symbols = []
+        invalid_symbols = []
+        for symbol in parse_manual_symbols(config.get("manual_input")):
+            if re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol):
+                manual_symbols.append(symbol)
+            else:
+                invalid_symbols.append(symbol)
+        if invalid_symbols:
+            signals.warning.emit(
+                "Ignored invalid Alpaca symbols: " + ", ".join(invalid_symbols)
+            )
+        if len(manual_symbols) > top_n:
+            signals.warning.emit(
+                f"Manual Include contains {len(manual_symbols)} symbols, but the scan "
+                f"limit is {top_n}. Only the first {top_n} will be scanned."
+            )
+            manual_symbols = manual_symbols[:top_n]
+
+        selected = list(manual_symbols)
+        for symbol in universe.ALPACA_MAINSTREAM_STOCK_SYMBOLS:
+            if len(selected) >= top_n:
+                break
+            if symbol not in selected:
+                selected.append(symbol)
+
+        manual_set = set(manual_symbols)
+        return [
+            {
+                "symbol": symbol,
+                "volume": 0.0,
+                "close": None,
+                "mc_rank": -1,
+                "is_manual": symbol in manual_set,
+                "is_stock": True,
+                "asset_type": "US Stock/ETF",
+            }
+            for symbol in selected
+        ]
+
+    def _execute_candidate_scan(
+        self, signals: ScanSignals, config, candidates: list[dict], quote_asset: str
+    ):
+        exch_name = config["exch_name"]
+        total_cands = len(candidates)
+        signals.log.emit(f"Found {total_cands} candidates. Fetching K-lines (Parallel)...")
+        results = []
+        scan_args = {
+            "interval": config["interval"],
+            "start_str": config["start_str"],
+            "end_str": config["end_str"],
+            "exch_name": exch_name,
+            "quote_asset": quote_asset,
+            "requested_days": config["requested_days"],
+            "min_avg_vol": config["min_avg_vol"],
+        }
+        self._scan_context = {
+            "interval": config["interval"],
+            "start_str": config["start_str"],
+            "end_str": config["end_str"],
+            "exch_name": exch_name,
+            "quote_asset": quote_asset,
+        }
+        completed_count = 0
+        failed_count = 0
+        no_result_count = 0
+        valid_result_count = 0
+        rate_limited_count = 0
+        max_workers = 8
+        signals.log.emit(
+            f"Fetching K-lines with {max_workers} worker(s) for {exch_name}..."
+        )
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        stopped = False
+        try:
+            future_to_cand = {
+                executor.submit(self.process_coin, cand, scan_args): cand
+                for cand in candidates
+            }
+            for future in concurrent.futures.as_completed(future_to_cand):
+                if self.stop_event.is_set():
+                    signals.stopped.emit("Scan stopped by user.")
+                    stopped = True
+                    for pending in future_to_cand:
+                        pending.cancel()
+                    break
+
+                cand = future_to_cand[future]
+                sym = cand["symbol"]
+                try:
+                    res = future.result()
+                    if res:
+                        results.append(res)
+                        if is_data_filtered_row(res):
+                            no_result_count += 1
+                        else:
+                            valid_result_count += 1
+                    else:
+                        no_result_count += 1
+                except Exception as exc:
+                    failed_count += 1
+                    if "429" in str(exc) or "Too Many Requests" in str(exc):
+                        rate_limited_count += 1
+                    signals.log.emit(f"Skipped {sym}: {exc}")
+
+                completed_count += 1
+                signals.progress.emit(completed_count, total_cands)
+                signals.log.emit(f"Scanning {completed_count}/{total_cands}...")
+        finally:
+            executor.shutdown(wait=not stopped, cancel_futures=True)
+
+        if self.stop_event.is_set():
+            signals.log.emit("Scan stopped by user.")
+        else:
+            signals.log.emit(
+                f"Scan completed: selected={total_cands}, results={valid_result_count}, "
+                f"listed={len(results)}, "
+                f"data-filtered={no_result_count}, errors={failed_count}, "
+                f"rate-limited={rate_limited_count}."
+            )
+
+        out = add_martin_fit_columns(pd.DataFrame(results))
+        out.attrs["scan_stats"] = {
+            "selected": int(total_cands),
+            "results": int(valid_result_count),
+            "listed_rows": int(len(results)),
+            "data_filtered": int(no_result_count),
+            "errors": int(failed_count),
+            "rate_limited": int(rate_limited_count),
+            "workers": int(max_workers),
+        }
+        return out
+
     def _run_scan_logic(self, signals: ScanSignals, config):
         exch_name = config["exch_name"]
-        quote_asset = DEFAULT_QUOTE_ASSET
+        quote_asset = source_quote_asset(exch_name)
         interval = config["interval"]
         requested_days = config["requested_days"]
         start_str = config["start_str"]
         end_str = config["end_str"]
         min_vol_pre = config["min_vol_pre"]
         min_avg_vol = config["min_avg_vol"]
-        asset_universe = config["asset_universe"]
         top_n = config["top_n"]
 
         use_mc_filter = config["use_mc_filter"]
         max_rank = config["max_rank"]
+
+        if is_alpaca_source(exch_name):
+            alpaca.credentials_from_env()
+            signals.log.emit(
+                "Using Alpaca US stock/ETF history "
+                f"(feed={os.getenv('ALPACA_DATA_FEED') or alpaca.DEFAULT_FEED})..."
+            )
+            candidates = self._build_alpaca_candidates(signals, config)
+            return self._execute_candidate_scan(
+                signals, config, candidates, quote_asset
+            )
 
         mc_mapping = {}
         # When filtering, ranks beyond max_rank cannot be selected. Avoid the
@@ -1171,21 +1470,12 @@ class VolatilityScannerGUI(QMainWindow):
             if not ticker:
                 continue
             market = markets.get(symbol)
-            if (
-                not market
-                or not market.get("active", True)
-                or not market.get("spot")
-                or market.get("quote") != quote_asset
+            if not universe.is_binance_crypto_spot_market(
+                market, quote=quote_asset
             ):
                 continue
             base = str(market.get("base") or "").upper()
             is_manual = (base in manual_bases)
-            is_stock_token = universe.is_probable_stock_token(base)
-            if not is_manual:
-                if asset_universe == "Stock/RWA tokens only" and not is_stock_token:
-                    continue
-                if asset_universe == "Crypto only" and is_stock_token:
-                    continue
             if is_manual:
                 if symbol == f"{base}/{quote_asset}":
                     manual_pairs_found.add(symbol)
@@ -1205,15 +1495,11 @@ class VolatilityScannerGUI(QMainWindow):
                     max_rank,
                     enabled=use_mc_filter,
                     mapping_available=bool(mc_mapping),
-                    is_stock_token=is_stock_token,
                 ):
                     continue
 
             vol = ticker.get('quoteVolume') or 0
-            # Pionex public volume is not reliable enough as a universe filter,
-            # especially for its smaller market and tokenized equities.
-            bypass_volume = universe.bypass_scanner_volume_filters(exch_name)
-            if not is_manual and not bypass_volume and vol < min_vol_pre:
+            if not is_manual and vol < min_vol_pre:
                 continue
 
             candidates.append({
@@ -1222,8 +1508,8 @@ class VolatilityScannerGUI(QMainWindow):
                 'close': ticker.get('close'),
                 'mc_rank': rank,
                 'is_manual': is_manual,
-                'is_stock_token': is_stock_token,
-                'asset_type': "Stock/RWA" if is_stock_token else "Crypto",
+                'is_stock': False,
+                'asset_type': "Crypto Spot",
             })
 
         if manual_bases:
@@ -1247,108 +1533,11 @@ class VolatilityScannerGUI(QMainWindow):
             manual_candidates = manual_candidates[:top_n]
         remaining_slots = max(0, top_n - len(manual_candidates))
 
-        if asset_universe == "All spot":
-            auto_stock = [c for c in auto_candidates if c['is_stock_token']]
-            auto_crypto = [c for c in auto_candidates if not c['is_stock_token']]
-            # Pionex stock-token ticker volume is unreliable, so keep a stable
-            # symbol order and reserve their slots before filling with Crypto.
-            auto_stock.sort(key=lambda x: x['symbol'])
-            auto_crypto.sort(key=lambda x: x['volume'], reverse=True)
-            selected_stock = auto_stock[:remaining_slots]
-            crypto_slots = max(0, remaining_slots - len(selected_stock))
-            auto_candidates = selected_stock + auto_crypto[:crypto_slots]
-        elif asset_universe == "Stock/RWA tokens only":
-            auto_candidates.sort(key=lambda x: x['symbol'])
-            auto_candidates = auto_candidates[:remaining_slots]
-        else:
-            auto_candidates.sort(key=lambda x: x['volume'], reverse=True)
-            auto_candidates = auto_candidates[:remaining_slots]
+        auto_candidates.sort(key=lambda x: x['volume'], reverse=True)
+        auto_candidates = auto_candidates[:remaining_slots]
 
         candidates = manual_candidates + auto_candidates
-        total_cands = len(candidates)
-        signals.log.emit(f"Found {total_cands} candidates. Fetching K-lines (Parallel)...")
-
-        results = []
-
-        scan_args = {
-            "interval": interval,
-            "start_str": start_str,
-            "end_str": end_str,
-            "exch_name": exch_name,
-            "quote_asset": quote_asset,
-            "requested_days": requested_days,
-            "min_avg_vol": min_avg_vol,
-        }
-        self._scan_context = {
-            "interval": interval,
-            "start_str": start_str,
-            "end_str": end_str,
-            "exch_name": exch_name,
-            "quote_asset": quote_asset,
-        }
-        completed_count = 0
-        failed_count = 0
-        no_result_count = 0
-        rate_limited_count = 0
-        # Pionex's K-line route has weight 1 and the adapter enforces a
-        # weight-aware IP limiter. Four workers keep HTTP/network latency from
-        # leaving permitted request slots idle without exceeding that limiter.
-        max_workers = 4 if str(exch_name).lower() == "pionex" else 8
-        signals.log.emit(
-            f"Fetching K-lines with {max_workers} worker(s) for {exch_name}..."
-        )
-
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-        stopped = False
-        try:
-            future_to_cand = {executor.submit(self.process_coin, cand, scan_args): cand for cand in candidates}
-            for future in concurrent.futures.as_completed(future_to_cand):
-                if self.stop_event.is_set():
-                    signals.stopped.emit("Scan stopped by user.")
-                    stopped = True
-                    for pending in future_to_cand:
-                        pending.cancel()
-                    break
-
-                cand = future_to_cand[future]
-                sym = cand['symbol']
-                try:
-                    res = future.result()
-                    if res:
-                        results.append(res)
-                    else:
-                        no_result_count += 1
-                except Exception as e:
-                    failed_count += 1
-                    if "429" in str(e) or "Too Many Requests" in str(e):
-                        rate_limited_count += 1
-                    signals.log.emit(f"Skipped {sym}: {e}")
-
-                completed_count += 1
-                signals.progress.emit(completed_count, total_cands)
-                signals.log.emit(f"Scanning {completed_count}/{total_cands}...")
-        finally:
-            executor.shutdown(wait=not stopped, cancel_futures=True)
-
-        if self.stop_event.is_set():
-            signals.log.emit("Scan stopped by user.")
-        else:
-            signals.log.emit(
-                f"Scan completed: selected={total_cands}, results={len(results)}, "
-                f"data-filtered={no_result_count}, errors={failed_count}, "
-                f"rate-limited={rate_limited_count}."
-            )
-
-        out = add_martin_fit_columns(pd.DataFrame(results))
-        out.attrs["scan_stats"] = {
-            "selected": int(total_cands),
-            "results": int(len(results)),
-            "data_filtered": int(no_result_count),
-            "errors": int(failed_count),
-            "rate_limited": int(rate_limited_count),
-            "workers": int(max_workers),
-        }
-        return out
+        return self._execute_candidate_scan(signals, config, candidates, quote_asset)
 
     def process_coin(self, cand, args):
         if self.stop_event.is_set():
@@ -1363,11 +1552,11 @@ class VolatilityScannerGUI(QMainWindow):
         requested_days = args['requested_days']
         min_avg_vol = args['min_avg_vol']
         is_manual = cand.get('is_manual', False)
-        is_stock_token = bool(cand.get('is_stock_token', False))
-        kline_pause = 0.0 if str(exch_name).lower() == "pionex" else 0.12
+        is_stock = bool(cand.get('is_stock', False))
+        kline_pause = 0.12
 
         try:
-            base = sym.split('/')[0] if '/' in sym else sym.replace(quote_asset, "")
+            base = sym.split('/', 1)[0] if '/' in sym else sym
             kline_context = {
                 "interval": interval,
                 "start_str": start_str,
@@ -1375,53 +1564,83 @@ class VolatilityScannerGUI(QMainWindow):
                 "exch_name": exch_name,
                 "quote_asset": quote_asset,
             }
-            df = self._get_cached_chart_df(sym, kline_context)
-            if df is None:
-                df = martin.get_klines(
-                    symbol=base,
-                    interval=interval,
-                    start=start_str,
-                    end=end_str,
-                    exch_list=[exch_name],
-                    pause=kline_pause,
-                    refresh_policy="auto",
-                    require_full_coverage=False,
-                )
-            has_complete_ohlc = (
-                df is not None
-                and not df.empty
-                and {"high", "low", "close"}.issubset(df.columns)
-                and not df[["high", "low", "close"]].isna().any().any()
+            request_start, request_end = source_date_range(
+                exch_name, start_str, end_str
             )
-            if df is not None and not df.empty and not has_complete_ohlc:
-                df = martin.get_klines(
-                    symbol=base,
-                    interval=interval,
-                    start=start_str,
-                    end=end_str,
-                    exch_list=[exch_name],
-                    pause=kline_pause,
-                    refresh_policy="force",
-                    require_full_coverage=False,
+            try:
+                df = self._get_cached_chart_df(sym, kline_context)
+                if df is None:
+                    df = martin.get_klines(
+                        symbol=base,
+                        interval=interval,
+                        start=request_start,
+                        end=request_end,
+                        exch_list=[exch_name],
+                        pause=kline_pause,
+                        refresh_policy="auto",
+                        allow_gaps=is_stock,
+                        require_full_coverage=False,
+                    )
+                has_complete_ohlc = (
+                    df is not None
+                    and not df.empty
+                    and {"high", "low", "close"}.issubset(df.columns)
+                    and not df[["high", "low", "close"]].isna().any().any()
+                )
+                if df is not None and not df.empty and not has_complete_ohlc:
+                    df = martin.get_klines(
+                        symbol=base,
+                        interval=interval,
+                        start=request_start,
+                        end=request_end,
+                        exch_list=[exch_name],
+                        pause=kline_pause,
+                        refresh_policy="force",
+                        allow_gaps=is_stock,
+                        require_full_coverage=False,
+                    )
+            except martin.KlineDataUnavailableError as exc:
+                return make_data_filtered_result(
+                    cand,
+                    f"No K-line data returned for the requested period: {exc}",
                 )
 
             if df is not None and not df.empty:
                 self._store_chart_df(sym, kline_context, df)
 
-            if df is None or df.empty or len(df) < 50:
-                return None
+            if df is None or df.empty:
+                return make_data_filtered_result(
+                    cand, "No K-line data returned for the requested period (0 bars)."
+                )
+            if len(df) < 50:
+                return make_data_filtered_result(
+                    cand,
+                    f"Only {len(df)} K-lines available; minimum required is 50.",
+                    Price=(
+                        float(df["close"].iloc[-1])
+                        if "close" in df and not df["close"].empty
+                        else np.nan
+                    ),
+                )
 
             closes = df['close'].astype(float)
 
             change = (closes.iloc[-1] / closes.iloc[0]) - 1.0
 
             step_ms = martin._interval_ms(interval)
-            bars_per_year = (365.25 * 24 * 3600) / (step_ms / 1000.0)
+            if is_stock:
+                bars_per_day = stock_bars_per_trading_day(df, interval)
+                bars_per_year = bars_per_day * US_EQUITY_TRADING_DAYS_PER_YEAR
+            else:
+                bars_per_day = 24 * 3600 * 1000 / step_ms
+                bars_per_year = (365.25 * 24 * 3600) / (step_ms / 1000.0)
             rv_annual = realized_vol_annual_from_closes(closes, bars_per_year)
 
-            bars_per_day = 24 * 3600 * 1000 / step_ms
             atr_day_window = max(1, min(len(df), int(round(bars_per_day))))
-            atr_month_window = max(1, min(len(df), int(round(bars_per_day * 30))))
+            month_days = 21.0 if is_stock else 30.0
+            atr_month_window = max(
+                1, min(len(df), int(round(bars_per_day * month_days)))
+            )
             atr_daily_est = true_atr_pct(df, n=atr_day_window)
             if not np.isfinite(atr_daily_est):
                 atr_daily_est = approx_atr_pct_from_close(closes, n=atr_day_window)
@@ -1482,19 +1701,30 @@ class VolatilityScannerGUI(QMainWindow):
             required_days = max(1.0, (requested_days - 1) * MIN_HISTORY_COVERAGE_RATIO)
             if requested_days > 30:
                 required_days = max(30.0, required_days)
-            if is_stock_token:
-                # Many tokenized equities are newly listed, and Pionex exposes
-                # at most 10,000 public K-lines.  Still require a meaningful
-                # recent sample without demanding nonexistent multi-year data.
-                required_days = min(required_days, STOCK_TOKEN_MAX_REQUIRED_HISTORY_DAYS)
             if time_span_days < required_days and not is_manual:
-                return None
+                coverage_pct = 100.0 * time_span_days / max(required_days, 1e-12)
+                return make_data_filtered_result(
+                    cand,
+                    f"History coverage {time_span_days:.1f}/{required_days:.1f} days "
+                    f"({coverage_pct:.0f}% of minimum); requested-period coverage "
+                    f"must be at least {MIN_HISTORY_COVERAGE_RATIO:.0%}.",
+                    Price=float(closes.iloc[-1]),
+                    **{
+                        "Active%": active_ratio * 100,
+                        "MaxGap%": max_gap * 100,
+                        "MC Rank": cand.get('mc_rank', -1),
+                    },
+                )
 
             if time_span_days < 0.5:
                 time_span_days = 0.5
 
-            recent_bars = max(2, int(round(bars_per_day * 90.0)))
-            recent_closes = closes.iloc[-min(len(closes), recent_bars):]
+            if is_stock:
+                recent_cutoff = df["time"].iloc[-1] - pd.Timedelta(days=90)
+                recent_closes = closes.loc[df["time"] >= recent_cutoff]
+            else:
+                recent_bars = max(2, int(round(bars_per_day * 90.0)))
+                recent_closes = closes.iloc[-min(len(closes), recent_bars):]
             recent_change = (
                 (recent_closes.iloc[-1] / recent_closes.iloc[0]) - 1.0
                 if len(recent_closes) >= 2 else 0.0
@@ -1510,14 +1740,34 @@ class VolatilityScannerGUI(QMainWindow):
                 max_recovery_days=30.0,
             )
 
-            avg_daily_vol = total_quote_vol / time_span_days
-            bypass_volume = universe.bypass_scanner_volume_filters(exch_name)
-            if avg_daily_vol < min_avg_vol and not is_manual and not bypass_volume:
-                return None
+            if is_stock:
+                stock_index = pd.DatetimeIndex(df["time"])
+                if stock_index.tz is None:
+                    stock_index = stock_index.tz_localize("UTC")
+                trading_days = max(
+                    1,
+                    len(set(stock_index.tz_convert("America/New_York").date)),
+                )
+                avg_daily_vol = total_quote_vol / trading_days
+            else:
+                avg_daily_vol = total_quote_vol / time_span_days
+            if avg_daily_vol < min_avg_vol and not is_manual:
+                return make_data_filtered_result(
+                    cand,
+                    f"Average daily volume {avg_daily_vol / 1_000_000:.2f}M is below "
+                    f"the configured minimum {min_avg_vol / 1_000_000:.2f}M.",
+                    Price=float(closes.iloc[-1]),
+                    **{
+                        "Vol(M)": avg_daily_vol / 1_000_000,
+                        "Active%": active_ratio * 100,
+                        "MaxGap%": max_gap * 100,
+                        "MC Rank": cand.get('mc_rank', -1),
+                    },
+                )
 
             return {
                 "Symbol": sym,
-                "Asset": cand.get('asset_type', "Stock/RWA" if is_stock_token else "Crypto"),
+                "Asset": cand.get('asset_type', "US Stock/ETF" if is_stock else "Crypto Spot"),
                 "Price": closes.iloc[-1],
                 "Vol(M)": avg_daily_vol / 1_000_000,
                 "Active%": active_ratio * 100,
@@ -1560,6 +1810,7 @@ class VolatilityScannerGUI(QMainWindow):
         self.scan_results.sort_values(
             ["Martin Score", "Recovery%", "Cycles/30D"],
             ascending=[False, False, False],
+            na_position="last",
             inplace=True,
         )
         self.scan_results.reset_index(drop=True, inplace=True)
@@ -1596,13 +1847,19 @@ class VolatilityScannerGUI(QMainWindow):
             work = work[work["Verdict"] == "Suitable"]
         elif mode == "Suitable + Watch":
             work = work[work["Verdict"].isin(["Suitable", "Watch"])]
+        elif mode == "Data Filtered":
+            work = work[work["Verdict"] == DATA_FILTERED_VERDICT]
         self.display_results = work.reset_index(drop=True)
 
         suitable = int((self.scan_results["Verdict"] == "Suitable").sum())
         watch = int((self.scan_results["Verdict"] == "Watch").sum())
         unsuitable = int((self.scan_results["Verdict"] == "Unsuitable").sum())
+        data_filtered = int(
+            (self.scan_results["Verdict"] == DATA_FILTERED_VERDICT).sum()
+        )
         self.lbl_result_summary.setText(
-            f"Suitable {suitable} | Watch {watch} | Unsuitable {unsuitable} | Showing {len(work)}"
+            f"Suitable {suitable} | Watch {watch} | Unsuitable {unsuitable} | "
+            f"Data Filtered {data_filtered} | Showing {len(work)}"
         )
         self._render_table(self.display_results)
 
@@ -1618,35 +1875,43 @@ class VolatilityScannerGUI(QMainWindow):
         if advanced:
             disp = pd.DataFrame({
                 "Symbol": df["Symbol"],
-                "Martin Score": df["Martin Score"].map(lambda v: f"{int(v)}"),
+                "Martin Score": df["Martin Score"].map(display_int),
                 "Verdict": df["Verdict"],
-                "Recovery%": df["Recovery%"].map(lambda v: f"{float(v):.0f}"),
-                "Cycles/30D": df["Cycles/30D"].map(lambda v: f"{float(v):.2f}"),
-                "Recent90%": df["Recent90%"].map(lambda v: f"{float(v):.2f}"),
-                "CurrentDD%": df["CurrentDD%"].map(lambda v: f"{float(v):.2f}"),
+                "Recovery%": df["Recovery%"].map(lambda v: display_float(v, 0)),
+                "Cycles/30D": df["Cycles/30D"].map(lambda v: display_float(v, 2)),
+                "Recent90%": df["Recent90%"].map(lambda v: display_float(v, 2)),
+                "CurrentDD%": df["CurrentDD%"].map(lambda v: display_float(v, 2)),
                 "Downtrend Risk": df["Downtrend Risk"],
                 "Reason": df["Reason"],
                 "Asset": df["Asset"],
-                "Price": df["Price"].map(lambda v: f"{float(v):.8f}" if float(v) < 0.01 else f"{float(v):.4f}"),
-                "Vol(M)": df["Vol(M)"].map(lambda v: f"{float(v):.2f}"),
-                "Active%": df["Active%"].map(lambda v: f"{float(v):.2f}"),
-                "MaxGap%": df["MaxGap%"].map(lambda v: f"{float(v):.2f}"),
-                "RV(A)%": df["RV(A)%"].map(lambda v: f"{float(v):.2f}"),
-                "ATR(M)%": df["ATR(M)%"].map(lambda v: f"{float(v):.2f}"),
-                "MaxDD%": df["MaxDD%"].map(lambda v: f"{float(v):.2f}"),
-                "Chg%": df["Chg%"].map(lambda v: f"{float(v):.2f}"),
-                "ER": df["ER"].map(lambda v: f"{float(v):.3f}"),
-                "MaxRed": df["MaxRed"].map(lambda v: f"{int(v)}"),
-                "MC Rank": df["MC Rank"].map(lambda v: f"{int(v)}" if pd.notna(v) and float(v) > 0 else "-"),
+                "Price": df["Price"].map(
+                    lambda v: "-" if pd.isna(v) else display_float(v, 8 if float(v) < 0.01 else 4)
+                ),
+                "Vol(M)": df["Vol(M)"].map(lambda v: display_float(v, 2)),
+                "Active%": df["Active%"].map(lambda v: display_float(v, 2)),
+                "MaxGap%": df["MaxGap%"].map(lambda v: display_float(v, 2)),
+                "RV(A)%": df["RV(A)%"].map(lambda v: display_float(v, 2)),
+                "ATR(M)%": df["ATR(M)%"].map(lambda v: display_float(v, 2)),
+                "MaxDD%": df["MaxDD%"].map(lambda v: display_float(v, 2)),
+                "Chg%": df["Chg%"].map(lambda v: display_float(v, 2)),
+                "ER": df["ER"].map(lambda v: display_float(v, 3)),
+                "MaxRed": df["MaxRed"].map(display_int),
+                "MC Rank": df["MC Rank"].map(
+                    lambda v: display_int(v) if pd.notna(v) and float(v) > 0 else "-"
+                ),
             })
         else:
             disp = pd.DataFrame({
                 "Rank": df["_Rank"].map(lambda v: f"{int(v)}"),
                 "Symbol": df["Symbol"],
-                "Martin Fit": df["Martin Score"].map(lambda v: f"{int(v)}/100"),
+                "Martin Fit": df["Martin Score"].map(
+                    lambda v: "-" if pd.isna(v) else f"{int(v)}/100"
+                ),
                 "Verdict": df["Verdict"],
-                "Recovery Rate": df["Recovery%"].map(lambda v: f"{float(v):.0f}%"),
-                "Cycles/30D": df["Cycles/30D"].map(lambda v: f"{float(v):.1f}"),
+                "Recovery Rate": df["Recovery%"].map(
+                    lambda v: display_float(v, 0, "%")
+                ),
+                "Cycles/30D": df["Cycles/30D"].map(lambda v: display_float(v, 1)),
                 "Downtrend Risk": df["Downtrend Risk"],
                 "Reason": df["Reason"],
             })
@@ -1718,6 +1983,9 @@ class VolatilityScannerGUI(QMainWindow):
         if df is not None:
             self.plot_chart(df, sym, context.get("interval"))
             return
+        if is_data_filtered_row(record):
+            self._set_status(f"No chart for {sym}: {record.get('Reason', 'data filtered')}", ok=False)
+            return
         self._set_status(f"Loading chart: {sym}")
         worker = ScanWorker(self._load_chart_data, request_token, sym, context)
         worker.signals.finished.connect(self._on_chart_data_loaded)
@@ -1774,10 +2042,20 @@ class VolatilityScannerGUI(QMainWindow):
 
 
 if __name__ == "__main__":
+    alpaca_startup_warning = initialize_alpaca_environment()
     app = QApplication([])
     if _import_error is not None:
         QMessageBox.critical(None, "Import Error", f"Could not import martin.py:\n{_import_error}")
         raise SystemExit(1)
     w = VolatilityScannerGUI()
     w.show()
+    if alpaca_startup_warning:
+        QTimer.singleShot(
+            0,
+            lambda message=alpaca_startup_warning: QMessageBox.warning(
+                w,
+                "Alpaca Configuration",
+                f"{message}\n\nBinance scanning remains available.",
+            ),
+        )
     app.exec()

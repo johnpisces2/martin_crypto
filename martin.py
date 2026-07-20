@@ -18,26 +18,28 @@
 期末未平倉的 final_equity 採保守清算價值，包含假設性賣出費。
 """
 import os
-import time
 import math
 import numpy as np
 import pandas as pd
 from pandas.api.types import DatetimeTZDtype
-import matplotlib.pyplot as plt
 from datetime import datetime, timezone
 from numba import njit, prange
-import traceback
 from market_data import sources as market_sources
 
 # ===================== 交易所清單 =====================
 _EXCH_LIST = [
-    "binance",  # First choice for regular spot symbols.
-    "pionex",   # Fallback and Pionex stock/RWA token source.
+    "binance",  # Binance crypto spot only.
 ]
 
 # ===================== Parquet 快取設定 =====================
 DEFAULT_CACHE_DIR = "cache"
 ALLOWED_REFRESH_POLICIES = {"never", "auto", "force"}
+
+
+class KlineDataUnavailableError(ValueError):
+    """The provider request succeeded but no usable bars were available."""
+
+
 try:
     import pyarrow  # noqa: F401
     PARQUET_OK = True
@@ -57,7 +59,8 @@ def _cache_key(base: str, interval: str, exchange: str, market_type: str) -> str
     base = base.upper()
     safe_exchange = str(exchange).lower().replace("/", "_").replace(":", "_")
     safe_market = str(market_type).lower().replace("/", "_").replace(":", "_")
-    return f"{base}_USDT_{safe_exchange}_{safe_market}_{interval}.parquet"
+    quote = "USD" if str(market_type).lower() == "stock" else "USDT"
+    return f"{base}_{quote}_{safe_exchange}_{safe_market}_{interval}.parquet"
 
 
 def _load_cached_klines(cache_dir: str, base: str, interval: str, exchange: str, market_type: str):
@@ -87,7 +90,7 @@ def _load_cached_klines(cache_dir: str, base: str, interval: str, exchange: str,
                 attrs[k] = str(df[k].dropna().iloc[0])
         loaded_market_type = attrs.get("market_type")
         if loaded_market_type is None:
-            loaded_market_type = "swap" if "perp" in attrs.get("market", "") else "spot"
+            loaded_market_type = str(market_type)
             attrs["market_type"] = loaded_market_type
         if attrs.get("exchange") != str(exchange) or loaded_market_type != str(market_type):
             return None
@@ -132,9 +135,11 @@ def _interval_ms(interval: str) -> int:
 
 def _to_timestamp(dt_str: str, *, end_of_day: bool = False) -> pd.Timestamp:
     """把使用者輸入的日期/時間解析成 Asia/Taipei 時區 Timestamp。"""
-    if "." in dt_str:
-        dt_str = dt_str.replace(".", "-")
     dt_str = dt_str.strip()
+    # Accept the legacy YYYY.MM.DD date separator without corrupting the
+    # fractional seconds in an ISO-8601 timestamp such as 23:59:59.999000.
+    if len(dt_str) >= 10 and dt_str[4] == "." and dt_str[7] == ".":
+        dt_str = dt_str[:10].replace(".", "-") + dt_str[10:]
     date_only = (":" not in dt_str) and ("T" not in dt_str)
     if end_of_day and date_only:
         dt_str = f"{dt_str} 23:59:59.999"
@@ -203,6 +208,22 @@ def _align_to_interval_end(now_ms: int, step_ms: int) -> int:
     return now_ms - (now_ms % step_ms) - step_ms
 
 
+def _source_market_preferences(source_name):
+    if str(source_name or "").strip().lower() == "alpaca":
+        return ["stock"]
+    return ["spot"]
+
+
+def _source_market_label(source_name, market_type):
+    if str(market_type).lower() == "stock":
+        return f"stock:{source_name}"
+    return f"spot:{source_name}"
+
+
+def _source_symbol_label(base, market_type):
+    return str(base).upper() if str(market_type).lower() == "stock" else f"{base}USDT"
+
+
 def _ohlcv_to_taipei_df(ohlcv):
     """把 ccxt OHLCV 轉成 Taipei 時區 DataFrame；同時去重/排序。"""
     if not ohlcv:
@@ -223,9 +244,9 @@ _fetch_source_ohlcv = market_sources.fetch_source_ohlcv
 # ===================== get_klines（含 Parquet 快取 + refresh_policy） =====================
 
 def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pause=0.12,
-               exch_list=None, prefer_spot=True,
+               exch_list=None,
                cache_dir=DEFAULT_CACHE_DIR, use_cache=True, refresh_policy: str = "auto",
-               allow_swap_fallback=False, allow_gaps=False, require_full_coverage=True,
+               allow_gaps=False, require_full_coverage=True,
                allow_partial_sources=()):
     """
     多交易所抓 'BASE/USDT' 的 K 線，回傳 df[['time','close']]，
@@ -262,11 +283,9 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
                     end=end,
                     pause=pause,
                     exch_list=[source_name],
-                    prefer_spot=prefer_spot,
                     cache_dir=cache_dir,
                     use_cache=use_cache,
                     refresh_policy=refresh_policy,
-                    allow_swap_fallback=allow_swap_fallback,
                     allow_gaps=allow_gaps,
                     require_full_coverage=require_full_coverage,
                     allow_partial_sources=partial_sources,
@@ -285,11 +304,8 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
     cached_exchange = None
     cached_market_type = None
     if use_cache and refresh_policy != "force":
-        if prefer_spot:
-            market_preferences = ["spot"] + (["swap"] if allow_swap_fallback else [])
-        else:
-            market_preferences = ["swap", "spot"]
         for name in exnames:
+            market_preferences = _source_market_preferences(name)
             for market_type in market_preferences:
                 cached_df = _load_cached_klines(
                     cache_dir, base, interval, str(name), market_type
@@ -342,7 +358,6 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
                 try:
                     refresh_names = [cached_exchange] if cached_exchange else list(exnames)
                     for name in refresh_names:
-                        require_spot = cached_market_type != "swap"
                         m_symbol, m_type, ohlcv_new = _fetch_source_ohlcv(
                             name,
                             base,
@@ -350,8 +365,6 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
                             refresh_since,
                             refresh_end,
                             pause,
-                            prefer_spot=require_spot,
-                            allow_swap_fallback=(cached_market_type == "swap"),
                         )
                         if not m_symbol or (cached_market_type and m_type != cached_market_type):
                             continue
@@ -367,9 +380,9 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
 
                             attrs = {
                                 "exchange": name,
-                                "market": (f"spot:{name}" if m_type=="spot" else f"usdt_perp:{name}"),
+                                "market": _source_market_label(name, m_type),
                                 "market_type": m_type,
-                                "symbol": f"{base}USDT",
+                                "symbol": _source_symbol_label(base, m_type),
                                 "interval": interval
                             }
                             if use_cache and PARQUET_OK:
@@ -394,7 +407,9 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
             if len(out) >= n:
                 out = out.iloc[-n:].copy()
                 base_attrs = getattr(cached_df, "attrs", {})
-                out.attrs["symbol"]   = base_attrs.get("symbol",   f"{base}USDT")
+                out.attrs["symbol"]   = base_attrs.get(
+                    "symbol", _source_symbol_label(base, cached_market_type)
+                )
                 out.attrs["interval"] = base_attrs.get("interval", interval)
                 out.attrs["exchange"] = base_attrs.get("exchange", base_attrs.get("exch", None))
                 out.attrs["market"]   = base_attrs.get("market",   None)
@@ -422,7 +437,9 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
             coverage_complete = _range_is_covered(sliced, s_ms, e_ms, step_ms)
             if (not cached_requires_full and not sliced.empty) or coverage_complete:
                 base_attrs = getattr(cached_df, "attrs", {})
-                sliced.attrs["symbol"]   = base_attrs.get("symbol",   f"{base}USDT")
+                sliced.attrs["symbol"]   = base_attrs.get(
+                    "symbol", _source_symbol_label(base, cached_market_type)
+                )
                 sliced.attrs["interval"] = base_attrs.get("interval", interval)
                 sliced.attrs["exchange"] = base_attrs.get("exchange", base_attrs.get("exch", None))
                 sliced.attrs["market"]   = base_attrs.get("market",   None)
@@ -455,6 +472,7 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
             raise ValueError("指定區間尚無已收盤 K 線")
 
     last_error = None
+    saw_source_without_data = False
     for name in exnames:
         try:
             m_symbol, m_type, ohlcv = _fetch_source_ohlcv(
@@ -464,19 +482,19 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
                 since_ms,
                 end_ms,
                 pause,
-                prefer_spot=prefer_spot,
-                allow_swap_fallback=allow_swap_fallback,
             )
             if not m_symbol:
+                saw_source_without_data = True
                 continue
             df = _ohlcv_to_taipei_df(ohlcv)
             if df is None or df.empty:
+                saw_source_without_data = True
                 continue
 
             df.attrs["exchange"] = name
-            df.attrs["market"] = f"spot:{name}" if m_type == "spot" else f"usdt_perp:{name}"
+            df.attrs["market"] = _source_market_label(name, m_type)
             df.attrs["market_type"] = m_type
-            df.attrs["symbol"] = f"{base}USDT"
+            df.attrs["symbol"] = _source_symbol_label(base, m_type)
             df.attrs["interval"] = interval
 
             if bars is not None and len(df) > int(bars):
@@ -511,6 +529,13 @@ def get_klines(symbol="ETH", interval="1h", bars=None, start=None, end=None, pau
             last_error = e
             continue
 
+    if last_error is None and (saw_source_without_data or not exnames):
+        quote = "USD" if exnames and all(
+            str(name).strip().lower() == "alpaca" for name in exnames
+        ) else "USDT"
+        raise KlineDataUnavailableError(
+            f"資料來源沒有 {base}/{quote} 在指定區間的 K 線資料"
+        )
     raise ValueError(f"資料來源無法取得 {base}/USDT 的 K 線。最後錯誤：{last_error}")
 
 
@@ -635,6 +660,7 @@ def compute_performance_metrics(
     position_curve=None,
     open_trade=None,
     max_dd_override=None,
+    annualization_factor=None,
 ):
     if not math.isfinite(float(capital)) or capital <= 0:
         raise ValueError("capital 必須為有限正數")
@@ -660,7 +686,12 @@ def compute_performance_metrics(
         baseline_ts = first_ts - inferred_step
         ec_stats = pd.concat([pd.Series([float(capital)], index=[baseline_ts]), ec])
 
-    af = _annualization_factor_from_times(ec_stats.index.tolist())
+    if annualization_factor is None:
+        af = _annualization_factor_from_times(ec_stats.index.tolist())
+    else:
+        af = float(annualization_factor)
+        if not math.isfinite(af) or af <= 0:
+            raise ValueError("annualization_factor 必須為有限正數")
     rets = ec_stats.pct_change().dropna()
     total_return = ec_stats.iloc[-1] / ec_stats.iloc[0] - 1.0
     years = _years_between(ec_stats.index[0], ec_stats.index[-1]) if len(ec_stats) >= 2 else np.nan

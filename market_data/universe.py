@@ -5,13 +5,47 @@ from __future__ import annotations
 import re
 
 
-# Real crypto bases whose ticker happens to end in X. Pionex public symbol
-# metadata has no asset category, so these protect the xStock suffix heuristic.
-KNOWN_CRYPTO_X_BASES = frozenset({
-    "AVAX", "BEAMX", "CFX", "CVX", "DYDX", "FLUX", "GMX", "HTX",
-    "ICX", "IDEX", "IMX", "IOTX", "MBOX", "PIVX", "POLYX", "PUNDIX",
-    "SNX", "STRAX", "STX", "TRX", "ZRX",
+# Exclusion-only denylist. Binance tokenized equities are never exposed as
+# supported symbols; keeping their exact bases here prevents manual entry or
+# market discovery from treating them as cryptocurrencies. Explicit symbols
+# avoid false positives for real crypto assets ending in ``B`` such as BNB.
+BINANCE_TOKENIZED_EQUITY_BASES = frozenset({
+    "AAOIB", "AMDB", "ARMB", "AVGOB", "BABAB", "CBRSB", "COINB",
+    "CRCLB", "DRAMB", "EWYB", "GLWB", "GOOGLB", "HOODB", "IBMB",
+    "INTCB", "LITEB", "METAB", "MRVLB", "MSFTB", "MSTRB", "MUB",
+    "NBISB", "NOKB", "NVDAB", "PLTRB", "QCOMB", "QQQB", "RKLBB",
+    "SKHYB", "SNDKB", "SOXLB", "SPCXB", "SPYB", "TSLAB", "TSMB",
+    "WDCB",
 })
+
+# Ordered by broad US-market relevance so the scanner's default limit selects
+# liquid, widely followed names first.
+ALPACA_MAINSTREAM_STOCK_SYMBOLS = tuple(dict.fromkeys((
+    # Default top 50: liquid US stocks and ETFs relevant to this workflow.
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO",
+    "AMD", "TSM", "ARM", "QCOM", "MU", "INTC", "SNDK", "WDC", "JPM",
+    "BAC", "GS", "MS", "V", "MA", "LLY", "UNH", "JNJ", "ABBV", "MRK",
+    "COST", "WMT", "HD", "MCD", "XOM", "CVX", "ORCL", "NFLX", "CRM",
+    "ADBE", "PLTR", "COIN", "HOOD", "MSTR", "STRC", "CRCL", "RKLB", "SPY",
+    "QQQ", "SOXX", "SMH", "SOXL", "GLD",
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA", "BRK.B",
+    "AVGO", "JPM", "LLY", "V", "XOM", "UNH", "MA", "COST", "WMT",
+    "ORCL", "NFLX", "HD", "PG", "JNJ", "ABBV", "BAC", "CRM", "KO",
+    "AMD", "MRK", "CVX", "PLTR", "CSCO", "PEP", "ADBE", "TMO", "MCD",
+    "GE", "IBM", "WFC", "QCOM", "AMGN", "TXN", "INTU", "CAT", "NOW",
+    "ISRG", "GS", "DIS", "UBER", "RTX", "BKNG", "SPGI", "LOW", "AXP",
+    "BLK", "SCHW", "C", "MS", "VZ", "T", "PM", "MO", "NKE", "SBUX",
+    "TGT", "CMCSA", "PFE", "GILD", "MDT", "SYK", "BA", "LMT", "DE",
+    "UPS", "FDX", "COP", "SLB", "NEE", "DUK",
+    "ARM", "TSM", "ASML", "AMAT", "LRCX", "KLAC", "MU", "INTC", "MRVL",
+    "DELL", "ANET", "PANW", "CRWD", "SNOW", "APP", "SHOP", "ABNB",
+    "DASH", "PYPL", "XYZ", "COIN", "HOOD", "MSTR", "STRC", "RDDT", "RBLX",
+    "ROKU", "SOFI", "CRCL", "SNDK", "WDC", "RKLB", "ASTS", "NBIS",
+    "AAOI", "LITE", "GLW", "BABA", "NOK",
+    "SPY", "QQQ", "DIA", "IWM", "VTI", "VOO", "SOXX", "SMH", "XLK",
+    "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "TLT", "IEF",
+    "GLD", "SLV", "ARKK", "SOXL", "TQQQ", "SQQQ", "EWY",
+)))
 
 STABLECOIN_BASES = frozenset({
     "USDT", "USDC", "USDD", "TUSD", "BUSD", "DAI", "FRAX", "FDUSD",
@@ -19,17 +53,6 @@ STABLECOIN_BASES = frozenset({
     "USDK", "USDX", "USTC", "EUR", "EURT", "EURS", "GBP", "GBPT",
     "USDR", "USDN", "USDB",
 })
-
-
-def is_probable_stock_token(base: str, known_crypto_symbols=None) -> bool:
-    """Best-effort xStock/Ondo-style classification from public metadata.
-
-    CoinGecko symbols are intentionally not used as exclusions because it also
-    lists xStocks such as TSLAX, SPYX and NVDAX. ``known_crypto_symbols`` is
-    retained only for compatibility with earlier callers.
-    """
-    base_u = str(base or "").strip().upper()
-    return base_u.endswith("X") and base_u not in KNOWN_CRYPTO_X_BASES
 
 
 def is_stablecoin_base(base: str) -> bool:
@@ -43,25 +66,19 @@ def is_stablecoin_base(base: str) -> bool:
     )
 
 
-def listed_stock_token_bases(markets: dict, quote: str = "USDT") -> list[str]:
-    """Return active spot stock-token bases from normalized market metadata."""
+def is_binance_crypto_spot_market(market: dict, quote: str = "USDT") -> bool:
+    """Allow active Binance crypto spot markets and reject tokenized equities."""
     quote_u = str(quote or "").strip().upper()
-    bases = {
-        str(market.get("base") or "").strip().upper()
-        for market in (markets or {}).values()
-        if market
+    if not market:
+        return False
+    base = str(market.get("base") or "").strip().upper()
+    return bool(
+        base
+        and base not in BINANCE_TOKENIZED_EQUITY_BASES
         and market.get("active", True)
         and market.get("spot")
         and str(market.get("quote") or "").strip().upper() == quote_u
-        and is_probable_stock_token(market.get("base"))
-    }
-    bases.discard("")
-    return sorted(bases)
-
-
-def bypass_scanner_volume_filters(exchange_name: str) -> bool:
-    """Pionex volume is not reliable enough for scanner minimum thresholds."""
-    return str(exchange_name or "").strip().lower() == "pionex"
+    )
 
 
 def scanner_rank_filter_allows(
@@ -70,9 +87,8 @@ def scanner_rank_filter_allows(
     *,
     enabled: bool,
     mapping_available: bool,
-    is_stock_token: bool,
 ) -> bool:
-    """Apply CoinGecko rank only to Crypto when rank data is available."""
-    if not enabled or not mapping_available or is_stock_token:
+    """Apply CoinGecko rank to Binance crypto when rank data is available."""
+    if not enabled or not mapping_available:
         return True
     return 0 < int(rank) <= int(max_rank)
