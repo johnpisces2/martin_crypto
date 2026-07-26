@@ -1072,6 +1072,272 @@ def martingale_backtest(
         result["trapped_mask"] = trapped_mask
     return result
 
+
+def martingale_backtest_diy(
+    prices,
+    level_ratios,
+    order_shares,
+    tp=0.01,
+    capital=1000,
+    return_curve=False,
+    times=None,
+    fee_rate=0.0,
+    opens=None,
+    highs=None,
+    lows=None,
+):
+    """Detailed Pionex DIY backtest with explicit price ratios and shares."""
+    closes = np.asarray(prices, dtype=np.float64)
+    opens_np = closes if opens is None else np.asarray(opens, dtype=np.float64)
+    highs_np = closes if highs is None else np.asarray(highs, dtype=np.float64)
+    lows_np = closes if lows is None else np.asarray(lows, dtype=np.float64)
+    levels = np.asarray(level_ratios, dtype=np.float64)
+    shares = np.asarray(order_shares, dtype=np.float64)
+    if closes.ndim != 1 or closes.size == 0:
+        raise ValueError("prices must be a non-empty 1-D array")
+    if any(x.ndim != 1 or x.size != closes.size for x in (opens_np, highs_np, lows_np)):
+        raise ValueError("open/high/low/close 長度必須一致")
+    if not all(np.isfinite(x).all() for x in (opens_np, highs_np, lows_np, closes)):
+        raise ValueError("OHLC 不可包含 NaN/Inf")
+    if not all((x > 0.0).all() for x in (opens_np, highs_np, lows_np, closes)):
+        raise ValueError("OHLC 價格必須全部 > 0")
+    if np.any(highs_np < np.maximum(opens_np, closes)) or np.any(lows_np > np.minimum(opens_np, closes)):
+        raise ValueError("OHLC 關係異常：high/low 未包住 open/close")
+    if np.any(highs_np < lows_np):
+        raise ValueError("OHLC 關係異常：high < low")
+    if (
+        levels.ndim != 1
+        or shares.ndim != 1
+        or levels.size < 2
+        or levels.size != shares.size
+        or not np.isfinite(levels).all()
+        or not np.isfinite(shares).all()
+        or not np.isclose(levels[0], 1.0)
+        or np.any(levels <= 0.0)
+        or np.any(np.diff(levels) >= 0.0)
+        or np.any(shares <= 0.0)
+    ):
+        raise ValueError("DIY levels/shares 必須等長；levels 由 1.0 嚴格遞減且 shares > 0")
+    if not math.isfinite(float(tp)) or tp <= 0.0:
+        raise ValueError("tp 必須為有限正數")
+    if not math.isfinite(float(capital)) or capital <= 0.0:
+        raise ValueError("capital 必須為有限正數")
+    if not math.isfinite(float(fee_rate)) or not (0.0 <= fee_rate < 1.0):
+        raise ValueError("fee_rate 必須滿足 0 <= fee_rate < 1")
+
+    max_orders = int(levels.size)
+    time_values = None
+    if times is not None:
+        if len(times) != closes.size:
+            raise ValueError("times 長度必須與 prices 相同")
+        time_idx = pd.DatetimeIndex(times)
+        if len(times) >= 2 and (
+            not time_idx.is_monotonic_increasing or time_idx.has_duplicates
+        ):
+            raise ValueError("times 必須嚴格遞增且不可重複")
+        time_values = time_idx.tolist()
+
+    cash = float(capital)
+    qty = 0.0
+    order_count = 0
+    round_unit = 0.0
+    round_start_cash = 0.0
+    entry_time = None
+    round_cost_sum = 0.0
+    round_fee_sum = 0.0
+    bars_held_this_round = 0
+    base_price = None
+    target_exit_price = None
+    max_order_count_round = 0
+
+    peak_equity_overall = float(capital)
+    max_drawdown_overall = 0.0
+    sell_fee_mult = 1.0 - float(fee_rate)
+    total_shares = float(shares.sum())
+
+    trades = 0
+    equity_curve, time_curve = [], []
+    trades_log = []
+    position_curve = []
+    utilization_curve = []
+    underwater_position_mask = []
+    full_capital_mask = []
+    trapped_mask = []
+    trapped_intervals = []
+    start_trapped = None
+    is_trapped_prev = False
+
+    for idx, price in enumerate(closes):
+        current_time = time_values[idx] if time_values is not None else idx
+        high = float(highs_np[idx])
+        low = float(lows_np[idx])
+        low_equity = None
+
+        if qty == 0.0 and cash > 0.0:
+            round_start_cash = cash
+            round_unit = cash / ((1.0 + fee_rate) * total_shares)
+            alloc = min(round_unit * shares[0], cash / (1.0 + fee_rate))
+            if alloc > 0.0:
+                qty = alloc / price
+                fee = alloc * fee_rate
+                cash -= alloc + fee
+                round_cost_sum = alloc
+                round_fee_sum = fee
+                entry_time = current_time
+                base_price = float(price)
+                order_count = 1
+                max_order_count_round = 1
+                bars_held_this_round = 0
+                target_exit_price = (
+                    round_cost_sum + round_fee_sum + round_cost_sum * tp
+                ) / (qty * sell_fee_mult)
+        elif qty > 0.0:
+            bars_held_this_round += 1
+            added_this_bar = False
+            while (
+                order_count < max_orders
+                and cash > 0.0
+                and low <= base_price * levels[order_count] * (1.0 + 1e-12)
+            ):
+                alloc = min(
+                    round_unit * shares[order_count],
+                    cash / (1.0 + fee_rate),
+                )
+                if alloc <= 0.0:
+                    break
+                fill_price = base_price * levels[order_count]
+                qty += alloc / fill_price
+                fee = alloc * fee_rate
+                cash -= alloc + fee
+                round_cost_sum += alloc
+                round_fee_sum += fee
+                order_count += 1
+                max_order_count_round = max(max_order_count_round, order_count)
+                added_this_bar = True
+
+            target_exit_price = (
+                round_cost_sum + round_fee_sum + round_cost_sum * tp
+            ) / (qty * sell_fee_mult)
+            low_equity = cash + qty * low * sell_fee_mult
+
+            if (not added_this_bar) and high >= target_exit_price:
+                prospective_proceeds = qty * target_exit_price * sell_fee_mult
+                pnl = prospective_proceeds - round_cost_sum - round_fee_sum
+                cash += prospective_proceeds
+                trades_log.append({
+                    "entry_time": entry_time,
+                    "exit_time": current_time,
+                    "pnl": float(pnl),
+                    "rtn": float(pnl / round_cost_sum) if round_cost_sum > 0 else np.nan,
+                    "bars_held": int(bars_held_this_round),
+                    "max_orders_reached": int(max_order_count_round),
+                })
+                qty = 0.0
+                trades += 1
+                order_count = 0
+                round_unit = 0.0
+                round_start_cash = 0.0
+                round_cost_sum = 0.0
+                round_fee_sum = 0.0
+                bars_held_this_round = 0
+                base_price = None
+                target_exit_price = None
+                max_order_count_round = 0
+
+        if low_equity is not None and peak_equity_overall > 0.0:
+            dd_low = low_equity / peak_equity_overall - 1.0
+            if dd_low < max_drawdown_overall:
+                max_drawdown_overall = dd_low
+
+        equity = cash + qty * price * sell_fee_mult
+        if equity > peak_equity_overall:
+            peak_equity_overall = equity
+        if peak_equity_overall > 0.0:
+            dd_overall = equity / peak_equity_overall - 1.0
+            if dd_overall < max_drawdown_overall:
+                max_drawdown_overall = dd_overall
+
+        utilization = (
+            round_cost_sum * (1.0 + fee_rate) / round_start_cash
+            if qty > 0.0 and round_start_cash > 0.0 else 0.0
+        )
+        utilization_curve.append(float(utilization))
+        if return_curve:
+            equity_curve.append(float(equity))
+            time_curve.append(current_time)
+            position_curve.append(qty > 0.0)
+
+        is_underwater_position = (
+            qty > 0.0
+            and qty * price * sell_fee_mult < (round_cost_sum + round_fee_sum)
+        )
+        is_full_capital = qty > 0.0 and order_count == max_orders
+        is_trapped = is_full_capital and is_underwater_position
+        underwater_position_mask.append(bool(is_underwater_position))
+        full_capital_mask.append(bool(is_full_capital))
+        trapped_mask.append(bool(is_trapped))
+        if is_trapped and not is_trapped_prev:
+            start_trapped = current_time
+        elif not is_trapped and is_trapped_prev and start_trapped is not None:
+            trapped_intervals.append((start_trapped, current_time))
+            start_trapped = None
+        is_trapped_prev = is_trapped
+
+    if start_trapped is not None:
+        if time_values is not None and len(time_values) >= 2:
+            terminal_interval_end = current_time + (time_values[-1] - time_values[-2])
+        else:
+            terminal_interval_end = current_time + 1
+        trapped_intervals.append((start_trapped, terminal_interval_end))
+
+    final_equity = cash + qty * closes[-1] * sell_fee_mult
+    open_trade = None
+    if qty > 0.0:
+        open_proceeds = qty * closes[-1] * sell_fee_mult
+        open_pnl = open_proceeds - round_cost_sum - round_fee_sum
+        open_trade = {
+            "entry_time": entry_time,
+            "exit_time": time_values[-1] if time_values is not None else int(closes.size - 1),
+            "pnl": float(open_pnl),
+            "rtn": float(open_pnl / round_cost_sum) if round_cost_sum > 0 else np.nan,
+            "bars_held": int(bars_held_this_round),
+            "max_orders_reached": int(max_order_count_round),
+            "is_open": True,
+        }
+
+    result = {
+        "strategy_mode": "diy",
+        "level_ratios": tuple(float(v) for v in levels),
+        "order_shares": tuple(float(v) for v in shares),
+        "max_orders": max_orders,
+        "tp": float(tp),
+        "capital": float(capital),
+        "final_equity": round(float(final_equity), 2),
+        "max_dd_overall": round(abs(max_drawdown_overall * 100.0), 2),
+        "trades": int(trades),
+        "trapped_time_ratio": float(np.mean(trapped_mask)) if trapped_mask else 0.0,
+        "avg_capital_utilization": float(np.mean(utilization_curve)) if utilization_curve else 0.0,
+        "underwater_position_ratio": (
+            float(np.mean(underwater_position_mask))
+            if underwater_position_mask else 0.0
+        ),
+        "full_capital_time_ratio": (
+            float(np.mean(full_capital_mask)) if full_capital_mask else 0.0
+        ),
+        "open_trade": open_trade,
+    }
+    if return_curve:
+        result["equity_curve"] = equity_curve
+        result["time_index"] = time_curve
+        result["trades_log"] = trades_log
+        result["trapped_intervals"] = trapped_intervals
+        result["position_curve"] = position_curve
+        result["trapped_mask"] = trapped_mask
+        result["capital_utilization_curve"] = utilization_curve
+        result["underwater_position_mask"] = underwater_position_mask
+        result["full_capital_mask"] = full_capital_mask
+    return result
+
 # ===================== 快速版（平行網格 + 先遮罩） =====================
 
 @njit(cache=True)
@@ -1239,6 +1505,248 @@ def _backtest_core_ohlc(opens, highs, lows, closes, add_drop, multiplier, max_or
 
 
 @njit(cache=True)
+def _backtest_core_diy_ohlc_extended(
+    opens,
+    highs,
+    lows,
+    closes,
+    level_ratios,
+    order_shares,
+    max_orders,
+    tp,
+    capital,
+    fee_rate,
+):
+    """DIY OHLC core with utilization and position-state diagnostics."""
+    total_bars = closes.shape[0]
+    if (
+        total_bars == 0
+        or opens.shape[0] != total_bars
+        or highs.shape[0] != total_bars
+        or lows.shape[0] != total_bars
+        or max_orders < 2
+        or max_orders > level_ratios.shape[0]
+        or max_orders > order_shares.shape[0]
+        or tp <= 0.0
+        or capital <= 0.0
+        or fee_rate < 0.0
+        or fee_rate >= 1.0
+    ):
+        return np.nan, np.nan, 0, np.nan, np.nan, np.nan, np.nan
+    if (
+        not math.isfinite(tp)
+        or not math.isfinite(capital)
+        or not math.isfinite(fee_rate)
+        or not math.isfinite(level_ratios[0])
+        or abs(level_ratios[0] - 1.0) > 1e-12
+    ):
+        return np.nan, np.nan, 0, np.nan, np.nan, np.nan, np.nan
+
+    total_weight = 0.0
+    previous_level = 2.0
+    for j in range(max_orders):
+        level = level_ratios[j]
+        weight = order_shares[j]
+        if (
+            not math.isfinite(level)
+            or not math.isfinite(weight)
+            or level <= 0.0
+            or weight <= 0.0
+            or (j > 0 and level >= previous_level)
+        ):
+            return np.nan, np.nan, 0, np.nan, np.nan, np.nan, np.nan
+        previous_level = level
+        total_weight += weight
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        return np.nan, np.nan, 0, np.nan, np.nan, np.nan, np.nan
+
+    cash = capital
+    qty = 0.0
+    order_count = 0
+    round_unit = 0.0
+    round_start_cash = 0.0
+    base_price = 0.0
+    round_cost_sum = 0.0
+    round_fee_sum = 0.0
+    target_exit_price = 0.0
+
+    peak_equity_overall = capital
+    inv_peak_equity = 1.0 / capital
+    max_drawdown_overall = 0.0
+    trades = 0
+    trapped_bars = 0
+    underwater_bars = 0
+    full_capital_bars = 0
+    utilization_sum = 0.0
+    inv_one_plus_fee = 1.0 / (1.0 + fee_rate)
+    sell_fee_mult = 1.0 - fee_rate
+
+    for i in range(total_bars):
+        price = closes[i]
+        high = highs[i]
+        low = lows[i]
+        open_price = opens[i]
+        if (
+            not math.isfinite(price)
+            or not math.isfinite(high)
+            or not math.isfinite(low)
+            or not math.isfinite(open_price)
+            or price <= 0.0
+            or high <= 0.0
+            or low <= 0.0
+            or open_price <= 0.0
+            or high < low
+            or high < price
+            or high < open_price
+            or low > price
+            or low > open_price
+        ):
+            return np.nan, np.nan, 0, np.nan, np.nan, np.nan, np.nan
+
+        low_equity = 0.0
+        has_low_equity = False
+        if qty == 0.0 and cash > 0.0:
+            round_start_cash = cash
+            round_unit = cash * inv_one_plus_fee / total_weight
+            alloc = round_unit * order_shares[0]
+            max_afford = cash * inv_one_plus_fee
+            if alloc > max_afford:
+                alloc = max_afford
+            if alloc > 0.0:
+                qty = alloc / price
+                fee = alloc * fee_rate
+                cash -= alloc + fee
+                base_price = price
+                order_count = 1
+                round_cost_sum = alloc
+                round_fee_sum = fee
+                target_exit_price = (
+                    round_cost_sum + round_fee_sum + round_cost_sum * tp
+                ) / (qty * sell_fee_mult)
+        elif qty > 0.0:
+            added_this_bar = False
+            while (
+                order_count < max_orders
+                and cash > 0.0
+                and low <= base_price * level_ratios[order_count] * (1.0 + 1e-12)
+            ):
+                alloc = round_unit * order_shares[order_count]
+                max_afford = cash * inv_one_plus_fee
+                if alloc > max_afford:
+                    alloc = max_afford
+                if alloc <= 0.0:
+                    break
+                fill_price = base_price * level_ratios[order_count]
+                qty += alloc / fill_price
+                fee = alloc * fee_rate
+                cash -= alloc + fee
+                round_cost_sum += alloc
+                round_fee_sum += fee
+                order_count += 1
+                added_this_bar = True
+
+            target_exit_price = (
+                round_cost_sum + round_fee_sum + round_cost_sum * tp
+            ) / (qty * sell_fee_mult)
+            low_equity = cash + qty * low * sell_fee_mult
+            has_low_equity = True
+
+            if (not added_this_bar) and high >= target_exit_price:
+                cash += qty * target_exit_price * sell_fee_mult
+                qty = 0.0
+                trades += 1
+                order_count = 0
+                round_unit = 0.0
+                round_start_cash = 0.0
+                base_price = 0.0
+                round_cost_sum = 0.0
+                round_fee_sum = 0.0
+                target_exit_price = 0.0
+
+        if has_low_equity and peak_equity_overall > 0.0:
+            dd_low = low_equity * inv_peak_equity - 1.0
+            if dd_low < max_drawdown_overall:
+                max_drawdown_overall = dd_low
+
+        equity = cash + qty * price * sell_fee_mult
+        if equity > peak_equity_overall:
+            peak_equity_overall = equity
+            inv_peak_equity = 1.0 / equity
+        else:
+            dd = equity * inv_peak_equity - 1.0
+            if dd < max_drawdown_overall:
+                max_drawdown_overall = dd
+
+        if qty > 0.0 and round_start_cash > 0.0:
+            utilization_sum += (
+                round_cost_sum * (1.0 + fee_rate) / round_start_cash
+            )
+            is_underwater = (
+                qty * price * sell_fee_mult < (round_cost_sum + round_fee_sum)
+            )
+            is_full_capital = order_count == max_orders
+            if is_underwater:
+                underwater_bars += 1
+            if is_full_capital:
+                full_capital_bars += 1
+            if is_underwater and is_full_capital:
+                trapped_bars += 1
+
+    final_equity = cash + qty * closes[-1] * sell_fee_mult
+    mdd_overall_pct = -max_drawdown_overall * 100.0
+    trapped_ratio = trapped_bars / total_bars
+    avg_utilization = utilization_sum / total_bars
+    underwater_ratio = underwater_bars / total_bars
+    full_capital_ratio = full_capital_bars / total_bars
+    return (
+        final_equity,
+        mdd_overall_pct,
+        trades,
+        trapped_ratio,
+        avg_utilization,
+        underwater_ratio,
+        full_capital_ratio,
+    )
+
+
+@njit(cache=True)
+def _backtest_core_diy_ohlc(
+    opens,
+    highs,
+    lows,
+    closes,
+    level_ratios,
+    order_shares,
+    max_orders,
+    tp,
+    capital,
+    fee_rate,
+):
+    """Backward-compatible five-metric DIY OHLC core."""
+    (
+        final_equity,
+        mdd,
+        trades,
+        trapped_ratio,
+        avg_utilization,
+        _,
+        _,
+    ) = _backtest_core_diy_ohlc_extended(
+        opens,
+        highs,
+        lows,
+        closes,
+        level_ratios,
+        order_shares,
+        max_orders,
+        tp,
+        capital,
+        fee_rate,
+    )
+    return final_equity, mdd, trades, trapped_ratio, avg_utilization
+
+
+@njit(cache=True)
 def _backtest_core(prices, add_drop, multiplier, max_orders, tp, capital, fee_rate):
     """Close-path compatibility wrapper used by Monte Carlo."""
     return _backtest_core_ohlc(
@@ -1293,6 +1801,104 @@ def _grid_search_parallel_ohlc(opens, highs, lows, closes, add_drop_arr, mul_arr
         tr[i] = tr_i
         trap[i] = trap_i
     return fe, mdd, tr, trap
+
+
+@njit(parallel=True, cache=True)
+def _grid_search_parallel_diy_ohlc(
+    opens,
+    highs,
+    lows,
+    closes,
+    level_matrix,
+    share_matrix,
+    template_index_arr,
+    max_orders_arr,
+    tp_arr,
+    capital,
+    fee_rate,
+):
+    """Evaluate DIY candidates while reusing compact ladder/share templates."""
+    n = template_index_arr.shape[0]
+    fe = np.empty(n)
+    mdd = np.empty(n)
+    tr = np.empty(n)
+    trap = np.empty(n)
+    utilization = np.empty(n)
+    for i in prange(n):
+        template_index = int(template_index_arr[i])
+        fe_i, mdd_i, tr_i, trap_i, util_i = _backtest_core_diy_ohlc(
+            opens,
+            highs,
+            lows,
+            closes,
+            level_matrix[template_index],
+            share_matrix[template_index],
+            int(max_orders_arr[i]),
+            float(tp_arr[i]),
+            float(capital),
+            float(fee_rate),
+        )
+        fe[i] = fe_i
+        mdd[i] = mdd_i
+        tr[i] = tr_i
+        trap[i] = trap_i
+        utilization[i] = util_i
+    return fe, mdd, tr, trap, utilization
+
+
+@njit(parallel=True, cache=True)
+def _grid_search_parallel_diy_idle_ohlc(
+    opens,
+    highs,
+    lows,
+    closes,
+    level_matrix,
+    share_matrix,
+    template_index_arr,
+    max_orders_arr,
+    tp_arr,
+    capital,
+    fee_rate,
+):
+    """Evaluate DIY candidates with idle/underwater diagnostics."""
+    n = template_index_arr.shape[0]
+    fe = np.empty(n)
+    mdd = np.empty(n)
+    tr = np.empty(n)
+    trap = np.empty(n)
+    utilization = np.empty(n)
+    underwater = np.empty(n)
+    full_capital = np.empty(n)
+    for i in prange(n):
+        template_index = int(template_index_arr[i])
+        (
+            fe_i,
+            mdd_i,
+            tr_i,
+            trap_i,
+            util_i,
+            underwater_i,
+            full_capital_i,
+        ) = _backtest_core_diy_ohlc_extended(
+            opens,
+            highs,
+            lows,
+            closes,
+            level_matrix[template_index],
+            share_matrix[template_index],
+            int(max_orders_arr[i]),
+            float(tp_arr[i]),
+            float(capital),
+            float(fee_rate),
+        )
+        fe[i] = fe_i
+        mdd[i] = mdd_i
+        tr[i] = tr_i
+        trap[i] = trap_i
+        utilization[i] = util_i
+        underwater[i] = underwater_i
+        full_capital[i] = full_capital_i
+    return fe, mdd, tr, trap, utilization, underwater, full_capital
 
 # ===================== 結果過濾工具（只保留必要條件） =====================
 

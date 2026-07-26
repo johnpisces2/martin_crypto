@@ -5,6 +5,8 @@
 import traceback
 import os
 import threading
+import time
+import math
 from collections import OrderedDict
 
 import numpy as np
@@ -46,6 +48,12 @@ from mc_eval import (
     ohlc_ratios_from_history,
 )
 from mc_formatters import format_hist_scan_display, format_hist_scan_csv, format_mc_scan_display
+from diy_strategy import (
+    DEFAULT_MAX_MAE_GRID_BYTES,
+    build_diy_templates,
+    compute_tp_or_horizon_mae_grid,
+    estimate_tp_or_horizon_mae_grid_bytes,
+)
 CRYPTO_SYMBOLS = [
     "ASTER", "BONK", "ENA", "PEPE", "WLD", "ZEC", "TAO", "SUI", "HBAR",
     "UNI", "NEAR", "FIL", "APT", "ARB",
@@ -62,8 +70,33 @@ DEFAULT_FEE_LABEL = "0.05%"
 ALPACA_TRADING_DAYS_PER_YEAR = 252.0
 ALPACA_BARS_PER_TRADING_DAY = dict(alpaca.DEFAULT_BARS_PER_TRADING_DAY)
 
+# DIY Mode deliberately exposes only the parameters that describe the trading
+# target.  The MAE-ladder search space stays fixed here so scans are simple and
+# reproducible; TP/Horizon MAE capital reweighting is disabled (bias = 0).
+DIY_MAE_Q_START = 0.50
+DIY_MAE_Q_END_VALUES = (0.90, 0.92, 0.94, 0.96, 0.98)
+DIY_INITIAL_FRACTION_VALUES = (0.01, 0.02, 0.03, 0.04, 0.05)
+DIY_CAPITAL_GAMMA_VALUES = (0.8, 1.0, 1.2, 1.4, 1.6, 1.8)
+DIY_IDLE_BIAS_VALUES = (0.0,)
+DIY_TOTAL_SHARES = 100
+DIY_STRESS_MAE_Q = 0.99
+DIY_MAX_LAST_ORDER_PCT = 30.0
+DIY_MAX_STRESS_LOSS_PCT = 50.0
+DIY_MAX_CANDIDATES = 2_000_000
+DIY_MAX_MAE_GRID_BYTES = DEFAULT_MAX_MAE_GRID_BYTES
+DIY_TEMPLATE_AXES_PER_MAX_ORDER = (
+    len(DIY_MAE_Q_END_VALUES)
+    * len(DIY_INITIAL_FRACTION_VALUES)
+    * len(DIY_CAPITAL_GAMMA_VALUES)
+    * len(DIY_IDLE_BIAS_VALUES)
+)
+DIY_MAX_TP_VALUES = max(
+    1,
+    DIY_MAX_CANDIDATES // DIY_TEMPLATE_AXES_PER_MAX_ORDER,
+)
 
-def parse_range(s: str, is_int=False):
+
+def parse_range(s: str, is_int=False, max_items=None):
     s = (s or "").strip()
     if not s:
         return np.array([], dtype=int if is_int else float)
@@ -76,26 +109,34 @@ def parse_range(s: str, is_int=False):
     a = (int(a) if is_int else float(a))
     b = (int(b) if is_int else float(b))
     c = (int(c) if is_int else float(c))
+    if not is_int and not all(math.isfinite(value) for value in (a, b, c)):
+        raise ValueError("範圍 start/end/step 必須為有限數值")
     if c == 0:
         raise ValueError("step 不可為 0")
     if (b - a) * c < 0:
         raise ValueError("step 方向必須能由 start 走到 end")
     if is_int:
-        return np.arange(a, b + (1 if c > 0 else -1), c, dtype=int)
-    vals = []
-    x = a
-    forward = c > 0
-    if forward:
-        while x <= b + 1e-12:
-            vals.append(x); x += c
-            if len(vals) > 2_000_000:
-                raise ValueError("單一參數範圍超過 2,000,000 個值")
+        count = (
+            (b - a) // c + 1
+            if c > 0
+            else (a - b) // (-c) + 1
+        )
     else:
-        while x >= b - 1e-12:
-            vals.append(x); x += c
-            if len(vals) > 2_000_000:
-                raise ValueError("單一參數範圍超過 2,000,000 個值")
-    return np.array(vals, dtype=float)
+        span = (b - a) / c
+        count = int(math.floor(span + 1e-12)) + 1
+    hard_limit = 2_000_000 if max_items is None else min(
+        2_000_000,
+        int(max_items),
+    )
+    if hard_limit <= 0:
+        raise ValueError("max_items 必須 > 0")
+    if count > hard_limit:
+        raise ValueError(
+            f"單一參數範圍共有 {count:,} 個值，超過 {hard_limit:,} 個限制"
+        )
+    if is_int:
+        return a + np.arange(count, dtype=int) * c
+    return a + np.arange(count, dtype=np.float64) * c
 
 
 def safe_float(s, default=None):
@@ -610,15 +651,29 @@ class MartinGUI(QMainWindow):
         self.e_capital = self._add_entry(form_data, "Capital:", "1000")
 
         form_grid = QFormLayout(gb_grid)
+        self.e_scan_mode = self._add_combobox(
+            form_grid,
+            "Mode:",
+            [
+                "Fixed Mode",
+                "DIY Mode (TP/Horizon MAE)",
+            ],
+            default="Fixed Mode",
+        )
         self.e_add_drop = self._add_entry(form_grid, "add_drop:", "0.010:0.080:0.001")
         self.e_tp = self._add_entry(form_grid, "tp:", "0.010:0.080:0.001")
         self.e_multiplier = self._add_entry(form_grid, "multiplier:", "1.5:2.0:0.1")
         self.e_max_orders = self._add_entry(form_grid, "max_orders:", "5:12:1")
+        self.e_mae_horizon = self._add_entry(form_grid, "MAE horizon(days):", "30")
+        self._hist_grid_form = form_grid
+        self._hist_diy_fields = (self.e_mae_horizon,)
+        self.e_scan_mode.currentTextChanged.connect(self._on_hist_scan_mode_changed)
+        self._on_hist_scan_mode_changed(self.e_scan_mode.currentText())
 
         form_filter = QFormLayout(gb_filter)
-        self.e_min_trades = self._add_entry(form_filter, "min_trades:", "104")
+        self.e_min_trades = self._add_entry(form_filter, "min_trades:", "")
         self.e_max_dd = self._add_entry(form_filter, "max_dd_overall(%):", "")
-        self.e_max_trap = self._add_entry(form_filter, "max_trapped_ratio(%):", "20")
+        self.e_max_trap = self._add_entry(form_filter, "max_trapped_ratio(%):", "")
         self.e_topn = self._add_entry(form_filter, "Show Top N:", "20")
 
         btn_row = QHBoxLayout()
@@ -649,8 +704,10 @@ class MartinGUI(QMainWindow):
         self.table = QTableView()
         self.scan_table_model = DataFrameTableModel(self.table)
         self.table.setModel(self.scan_table_model)
-        cols = ["add_drop", "tp", "multiplier", "max_orders", "min_buy_ratio",
-                "final_equity", "max_dd_overall", "trades", "trapped_time_ratio"]
+        cols = [
+            "Mode", "TP", "Orders", "Final Equity", "Return", "Max DD",
+            "Trades", "Trapped", "Lowest Buy", "Capital Use", "Setup",
+        ]
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -865,6 +922,14 @@ class MartinGUI(QMainWindow):
         if lbl is not None:
             lbl.setVisible(bool(visible))
         field.setVisible(bool(visible))
+
+    def _on_hist_scan_mode_changed(self, text: str):
+        mode = str(text or "").strip().lower()
+        is_diy = mode.startswith("diy")
+        self._set_form_row_visible(self._hist_grid_form, self.e_add_drop, not is_diy)
+        self._set_form_row_visible(self._hist_grid_form, self.e_multiplier, not is_diy)
+        for field in self._hist_diy_fields:
+            self._set_form_row_visible(self._hist_grid_form, field, is_diy)
 
     def _on_mc_sampling_mode_changed(self, text: str):
         mode = (text or "").strip().lower()
@@ -1134,10 +1199,12 @@ class MartinGUI(QMainWindow):
             self.e_symbol, self.e_source, self.e_interval, self.e_start, self.e_end, self.e_capital
         )
         config.update({
+            "scan_mode": self.e_scan_mode.currentText(),
             "add_drop_range": self.e_add_drop.text(),
             "tp_range": self.e_tp.text(),
             "multiplier_range": self.e_multiplier.text(),
             "max_orders_range": self.e_max_orders.text(),
+            "mae_horizon_days": self.e_mae_horizon.text(),
             "min_trades": self.e_min_trades.text(),
             "max_dd": self.e_max_dd.text(),
             "max_trap": self.e_max_trap.text(),
@@ -1265,6 +1332,9 @@ class MartinGUI(QMainWindow):
         )
 
     def _compute_filtered_scan_results(self, ctx):
+        if str(ctx.get("scan_mode", "Fixed Mode")).strip().lower().startswith("diy"):
+            return self._compute_filtered_diy_scan_results(ctx)
+
         add_drop_arr = parse_range(ctx["add_drop_range"])
         tp_arr = parse_range(ctx["tp_range"])
         mul_arr = parse_range(ctx["multiplier_range"])
@@ -1292,10 +1362,216 @@ class MartinGUI(QMainWindow):
             highs=ctx["highs_np"],
             lows=ctx["lows_np"],
         )
+        ctx["_scan_candidate_count"] = int(len(results_df))
 
         min_trades = safe_int(ctx["min_trades"].strip()) if ctx["min_trades"].strip() else None
         max_dd = safe_float(ctx["max_dd"].strip()) if ctx["max_dd"].strip() else None
         max_trap = safe_float(ctx["max_trap"].strip()) if ctx["max_trap"].strip() else None
+        if max_trap is not None:
+            max_trap /= 100.0
+        return martin.apply_filters(results_df, min_trades, max_dd, max_trap)
+
+    def _compute_filtered_diy_scan_results(self, ctx):
+        return self._compute_filtered_tp_horizon_mae_diy_scan_results(ctx)
+
+    def _compute_filtered_tp_horizon_mae_diy_scan_results(self, ctx):
+        """Build the fixed bias=0 TP-or-horizon MAE family for every TP."""
+        tp_arr = parse_range(
+            ctx["tp_range"],
+            max_items=DIY_MAX_TP_VALUES,
+        )
+        mo_arr = parse_range(
+            ctx["max_orders_range"],
+            is_int=True,
+            max_items=DIY_TOTAL_SHARES,
+        )
+        q_end_arr = np.asarray(DIY_MAE_Q_END_VALUES, dtype=np.float64)
+        initial_fraction_arr = np.asarray(
+            DIY_INITIAL_FRACTION_VALUES, dtype=np.float64
+        )
+        gamma_arr = np.asarray(DIY_CAPITAL_GAMMA_VALUES, dtype=np.float64)
+        idle_bias_arr = np.asarray(DIY_IDLE_BIAS_VALUES, dtype=np.float64)
+        if tp_arr.size == 0 or mo_arr.size == 0:
+            raise ValueError("TP/Horizon MAE DIY 掃描參數不得為空")
+        if np.any(tp_arr <= 0.0) or np.any(mo_arr < 2):
+            raise ValueError("TP/Horizon MAE DIY 需滿足 tp > 0 且 max_orders >= 2")
+
+        horizon_days = safe_float(ctx["mae_horizon_days"].strip(), None)
+        if horizon_days is None or horizon_days <= 0.0:
+            raise ValueError("MAE horizon(days) 必須 > 0")
+        if DIY_TOTAL_SHARES < int(np.max(mo_arr)):
+            raise ValueError(
+                f"max_orders 不可大於內建 Total shares ({DIY_TOTAL_SHARES})"
+            )
+
+        horizon_bars = self._days_to_bars(
+            horizon_days,
+            ctx["interval"],
+            ctx.get("source", "binance"),
+            ctx.get("df"),
+        )
+        raw_candidate_count = int(
+            tp_arr.size
+            * mo_arr.size
+            * q_end_arr.size
+            * initial_fraction_arr.size
+            * gamma_arr.size
+            * idle_bias_arr.size
+        )
+        if raw_candidate_count > DIY_MAX_CANDIDATES:
+            raise ValueError(
+                f"TP/Horizon MAE DIY 原始候選共 "
+                f"{raw_candidate_count:,} 組，超過 "
+                f"{DIY_MAX_CANDIDATES:,}；請放大 step 或縮小參數範圍"
+            )
+        mae_grid_bytes = estimate_tp_or_horizon_mae_grid_bytes(
+            len(ctx["prices_np"]),
+            horizon_bars,
+            tp_arr.size,
+        )
+        if mae_grid_bytes > DIY_MAX_MAE_GRID_BYTES:
+            raise ValueError(
+                "TP/Horizon MAE 輸出矩陣預估需要 "
+                f"{mae_grid_bytes / (1024 ** 2):,.1f} MiB，超過 "
+                f"{DIY_MAX_MAE_GRID_BYTES / (1024 ** 2):,.1f} MiB 限制；"
+                "請放大 TP step、縮小 TP 範圍或縮短資料期間"
+            )
+        mae_grid, hit_grid, bars_grid = compute_tp_or_horizon_mae_grid(
+            ctx["highs_np"],
+            ctx["lows_np"],
+            ctx["prices_np"],
+            horizon_bars,
+            tp_arr,
+            fee_rate=float(ctx["fee_rate"]),
+            max_output_bytes=DIY_MAX_MAE_GRID_BYTES,
+        )
+
+        template_frames = []
+        level_parts = []
+        share_parts = []
+        next_template_index = 0
+        for tp_index, tp_value in enumerate(tp_arr):
+            mae_samples = mae_grid[tp_index]
+            hit_mask = hit_grid[tp_index].astype(bool)
+            hit_bars = bars_grid[tp_index][hit_mask]
+            templates, levels, shares, _ = build_diy_templates(
+                mae_samples=mae_samples,
+                max_orders_values=mo_arr,
+                q_start=DIY_MAE_Q_START,
+                q_end_values=q_end_arr,
+                initial_fraction_values=initial_fraction_arr,
+                gamma_values=gamma_arr,
+                stress_quantile=DIY_STRESS_MAE_Q,
+                total_shares=DIY_TOTAL_SHARES,
+                fee_rate=float(ctx["fee_rate"]),
+                max_last_order_pct=DIY_MAX_LAST_ORDER_PCT,
+                max_stress_loss_pct=DIY_MAX_STRESS_LOSS_PCT,
+                idle_bias_values=idle_bias_arr,
+            )
+            if templates.empty:
+                continue
+            templates = templates.copy()
+            template_count = len(templates)
+            templates["template_index"] = np.arange(
+                next_template_index,
+                next_template_index + template_count,
+                dtype=np.int64,
+            )
+            templates["tp"] = float(tp_value)
+            templates["diy_variant"] = "tp_horizon_mae"
+            templates["mae_model"] = "tp_or_horizon"
+            templates["tp_hit_rate_horizon"] = float(np.mean(hit_mask))
+            templates["tp_non_hit_rate_horizon"] = float(1.0 - np.mean(hit_mask))
+            templates["median_bars_to_tp"] = (
+                float(np.median(hit_bars)) if hit_bars.size else np.nan
+            )
+            templates["p90_bars_to_tp"] = (
+                float(np.percentile(hit_bars, 90.0))
+                if hit_bars.size else np.nan
+            )
+            templates["mae_sample_count"] = int(mae_samples.size)
+            template_frames.append(templates)
+            level_parts.append(levels)
+            share_parts.append(shares)
+            next_template_index += template_count
+
+        if not template_frames:
+            raise ValueError(
+                "TP/Horizon MAE DIY 在內建風險限制下沒有可用的 Shares 模板；"
+                "請調整 TP、max_orders 或 MAE horizon"
+            )
+
+        results_df = pd.concat(template_frames, ignore_index=True)
+        level_matrix = np.ascontiguousarray(
+            np.vstack(level_parts), dtype=np.float64
+        )
+        share_matrix = np.ascontiguousarray(
+            np.vstack(share_parts), dtype=np.float64
+        )
+        candidate_count = int(len(results_df))
+        if candidate_count > DIY_MAX_CANDIDATES:
+            raise ValueError(
+                f"TP/Horizon MAE DIY 候選共 {candidate_count:,} 組，超過 "
+                f"{DIY_MAX_CANDIDATES:,}；"
+                "請放大 step 或縮小參數範圍"
+            )
+
+        template_indices = np.arange(candidate_count, dtype=np.int32)
+        max_orders_full = results_df["max_orders"].to_numpy(dtype=np.int32)
+        tp_full = results_df["tp"].to_numpy(dtype=np.float64)
+        (
+            fe,
+            mdd,
+            tr,
+            trap,
+            utilization,
+            underwater,
+            full_capital,
+        ) = martin._grid_search_parallel_diy_idle_ohlc(
+            np.asarray(ctx["opens_np"], dtype=np.float64),
+            np.asarray(ctx["highs_np"], dtype=np.float64),
+            np.asarray(ctx["lows_np"], dtype=np.float64),
+            np.asarray(ctx["prices_np"], dtype=np.float64),
+            level_matrix,
+            share_matrix,
+            template_indices,
+            max_orders_full,
+            tp_full,
+            capital=float(ctx["capital"]),
+            fee_rate=float(ctx["fee_rate"]),
+        )
+
+        results_df["capital"] = float(ctx["capital"])
+        results_df["final_equity"] = np.round(fe, 2)
+        results_df["max_dd_overall"] = np.round(mdd, 2)
+        results_df["trades"] = tr.astype(int)
+        results_df["trapped_time_ratio"] = np.round(trap, 6)
+        results_df["avg_capital_utilization"] = np.round(utilization, 6)
+        results_df["actual_idle_ratio"] = np.round(1.0 - utilization, 6)
+        results_df["underwater_position_ratio"] = np.round(underwater, 6)
+        results_df["full_capital_time_ratio"] = np.round(full_capital, 6)
+        results_df["mae_horizon_days"] = float(horizon_days)
+        results_df["mae_horizon_bars"] = int(horizon_bars)
+        results_df["stress_mae_q"] = DIY_STRESS_MAE_Q
+        results_df["diy_total_shares"] = DIY_TOTAL_SHARES
+
+        ctx["_scan_candidate_count"] = candidate_count
+        ctx["_diy_template_count"] = candidate_count
+        ctx["_mae_sample_count"] = int(mae_grid.shape[1])
+        ctx["_mae_horizon_bars"] = int(horizon_bars)
+
+        min_trades = (
+            safe_int(ctx["min_trades"].strip())
+            if ctx["min_trades"].strip() else None
+        )
+        max_dd = (
+            safe_float(ctx["max_dd"].strip())
+            if ctx["max_dd"].strip() else None
+        )
+        max_trap = (
+            safe_float(ctx["max_trap"].strip())
+            if ctx["max_trap"].strip() else None
+        )
         if max_trap is not None:
             max_trap /= 100.0
         return martin.apply_filters(results_df, min_trades, max_dd, max_trap)
@@ -1515,13 +1791,25 @@ class MartinGUI(QMainWindow):
         )
 
     def _scan_compute(self, config):
+        started = time.perf_counter()
         ctx = self._collect_context_from_config(config)
         filtered = self._compute_filtered_scan_results(ctx)
         topn = safe_int(ctx["topn"].strip(), 20)
         if topn <= 0:
             raise ValueError("Show Top N 必須 > 0")
         top_df = filtered.nlargest(topn, "final_equity").copy()
-        return top_df, dict(config)
+        run_config = dict(config)
+        for key in (
+            "_scan_candidate_count",
+            "_diy_template_count",
+            "_mae_sample_count",
+            "_mae_horizon_bars",
+            "_stress_mae",
+        ):
+            if key in ctx:
+                run_config[key] = ctx[key]
+        run_config["_scan_elapsed_seconds"] = float(time.perf_counter() - started)
+        return top_df, run_config
 
     def _populate_scan_table(self, disp: pd.DataFrame, cols):
         self.table.setUpdatesEnabled(False)
@@ -1552,7 +1840,21 @@ class MartinGUI(QMainWindow):
             self._set_status("Scan completed. No rows matched current filters.")
             QMessageBox.information(self, "Info", "篩選條件過嚴，請放寬。")
         else:
-            self._set_status("Scan completed。")
+            elapsed = (
+                float(run_config.get("_scan_elapsed_seconds", 0.0))
+                if run_config else 0.0
+            )
+            candidate_count = (
+                int(run_config.get("_scan_candidate_count", len(self.scan_df)))
+                if run_config else len(self.scan_df)
+            )
+            mode = (
+                str(run_config.get("scan_mode", "Fixed Mode")).split("(", 1)[0].strip()
+                if run_config else "Fixed Mode"
+            )
+            self._set_status(
+                f"{mode} scan completed: {candidate_count:,} candidates / {elapsed:.2f}s."
+            )
         self.scan_tabs.setCurrentWidget(self.scan_tab_table)
 
     # ---------- MC scan ----------
@@ -1825,21 +2127,53 @@ class MartinGUI(QMainWindow):
         interval_str = str(config["interval"]).strip()
         start, end = str(config["start"]), str(config["end"])
 
-        worker = Worker(
-            self._compute_backtest,
-            str(config["symbol"]).strip(),
-            interval_str,
-            start,
-            end,
-            str(config.get("refresh_policy", DEFAULT_REFRESH_POLICY)),
-            float(config.get("fee_rate", DEFAULT_FEE_RATE)),
-            float(config["capital"]),
-            float(params["add_drop"]),
-            float(params["multiplier"]),
-            int(params["max_orders"]),
-            float(params["tp"]),
-            str(config.get("source", "binance")).strip().lower(),
-        )
+        is_diy = str(params.get("strategy_mode", "fixed")).strip().lower() == "diy"
+        if is_diy:
+            metadata_keys = (
+                "mae_horizon_days", "mae_horizon_bars", "mae_sample_count",
+                "mae_q_start", "mae_q_end", "mae_quantiles", "stress_mae_q",
+                "stress_mae", "stress_loss_pct", "initial_capital_pct",
+                "capital_gamma", "idle_bias", "last_order_pct",
+                "diy_total_shares", "diy_variant", "mae_model",
+                "fill_probabilities", "expected_capital_utilization",
+                "expected_idle_ratio", "tp_hit_rate_horizon",
+                "tp_non_hit_rate_horizon", "median_bars_to_tp",
+                "p90_bars_to_tp",
+            )
+            metadata = {
+                key: params[key] for key in metadata_keys if key in params.index
+            }
+            worker = Worker(
+                self._compute_diy_backtest,
+                str(config["symbol"]).strip(),
+                interval_str,
+                start,
+                end,
+                str(config.get("refresh_policy", DEFAULT_REFRESH_POLICY)),
+                float(config.get("fee_rate", DEFAULT_FEE_RATE)),
+                float(config["capital"]),
+                tuple(params["level_ratios"]),
+                tuple(params["order_shares"]),
+                float(params["tp"]),
+                str(config.get("source", "binance")).strip().lower(),
+                metadata,
+            )
+        else:
+            worker = Worker(
+                self._compute_backtest,
+                str(config["symbol"]).strip(),
+                interval_str,
+                start,
+                end,
+                str(config.get("refresh_policy", DEFAULT_REFRESH_POLICY)),
+                float(config.get("fee_rate", DEFAULT_FEE_RATE)),
+                float(config["capital"]),
+                float(params["add_drop"]),
+                float(params["multiplier"]),
+                int(params["max_orders"]),
+                float(params["tp"]),
+                str(config.get("source", "binance")).strip().lower(),
+            )
         worker.signals.finished.connect(self._render_scan_detail)
         worker.signals.error.connect(self._show_error)
         self.thread_pool.start(worker)
@@ -1891,7 +2225,10 @@ class MartinGUI(QMainWindow):
         df, res, perf = payload
         self._render_plot_and_metrics(
             df, res, perf,
-            float(res["_add_drop"]), float(res["_multiplier"]), int(res["_max_orders"]), float(res["_tp"]),
+            float(res.get("_add_drop", np.nan)),
+            float(res.get("_multiplier", np.nan)),
+            int(res["_max_orders"]),
+            float(res["_tp"]),
             self.figure_scan, self.canvas_scan, self.scan_metrics_text
         )
         self.scan_tabs.setCurrentWidget(self.scan_tab_detail)
@@ -2149,6 +2486,125 @@ class MartinGUI(QMainWindow):
         self._set_splitter_when_ready(self.single_splitter, self.INIT_SPLIT)
 
     # ---------- compute ----------
+    def _compute_diy_backtest(
+        self,
+        symbol,
+        interval,
+        start,
+        end,
+        refresh_policy,
+        fee_rate,
+        capital,
+        level_ratios,
+        order_shares,
+        tp,
+        source="binance",
+        metadata=None,
+    ):
+        levels = tuple(float(v) for v in level_ratios)
+        shares = tuple(float(v) for v in order_shares)
+        cache_key = (
+            "diy",
+            symbol,
+            interval,
+            start,
+            end,
+            refresh_policy,
+            float(fee_rate),
+            float(capital),
+            levels,
+            shares,
+            float(tp),
+            str(source or "binance").lower(),
+            self._refresh_generation(interval, refresh_policy),
+        )
+        cached = self._get_cached_backtest(cache_key)
+        if cached is not None:
+            cached_df, cached_result, cached_performance = cached
+            result_for_row = dict(cached_result)
+            result_for_row["_diy_metadata"] = dict(metadata or {})
+            return cached_df, result_for_row, cached_performance
+
+        df = self._fetch_klines_if_needed(
+            symbol, interval, start, end, refresh_policy, source
+        )
+        prices_np = df["close"].to_numpy(dtype=np.float64)
+        if prices_np.size < 2:
+            raise ValueError("K 線資料不足（<2 根）。")
+        res = martin.martingale_backtest_diy(
+            prices_np,
+            level_ratios=levels,
+            order_shares=shares,
+            tp=float(tp),
+            capital=float(capital),
+            return_curve=True,
+            times=df["time"].tolist(),
+            fee_rate=float(fee_rate),
+            opens=df["open"].to_numpy(dtype=np.float64),
+            highs=df["high"].to_numpy(dtype=np.float64),
+            lows=df["low"].to_numpy(dtype=np.float64),
+        )
+
+        accounting = backtest_accounting_summary(res, capital)
+        res["_closed_pnl"] = accounting["closed_pnl"]
+        res["_open_pnl"] = accounting["open_pnl"]
+        res["_net_pnl"] = accounting["net_pnl"]
+        res["_accounting_final_equity"] = accounting["final_equity"]
+        res["_data_rows"] = int(len(df))
+        res["_price_start"] = float(prices_np[0])
+        res["_price_end"] = float(prices_np[-1])
+        res["_price_return"] = float(prices_np[-1] / prices_np[0] - 1.0)
+        res["_strategy_mode"] = "diy"
+        res["_max_orders"] = int(len(levels))
+        res["_tp"] = float(tp)
+        res["_diy_metadata"] = dict(metadata or {})
+
+        first_price = float(prices_np[0])
+        bh_qty = float(capital) / (first_price * (1.0 + float(fee_rate)))
+        bh_curve = bh_qty * prices_np * (1.0 - float(fee_rate))
+        perf = martin.compute_performance_metrics(
+            res["equity_curve"],
+            res["time_index"],
+            res["trades_log"],
+            capital=float(capital),
+            bh_curve=bh_curve,
+            position_curve=res.get("position_curve"),
+            open_trade=res.get("open_trade"),
+            max_dd_override=res.get("max_dd_overall"),
+            annualization_factor=self._interval_bars_per_year(
+                interval, source, df
+            ),
+        )
+        expected_total_return = accounting["final_equity"] / float(capital) - 1.0
+        if not np.isclose(
+            float(perf.get("total_return", np.nan)),
+            expected_total_return,
+            rtol=1e-10,
+            atol=1e-10,
+        ):
+            raise ValueError(
+                "Performance total-return mismatch: "
+                f"metrics={perf.get('total_return')}, expected={expected_total_return}"
+            )
+        res["bh_curve"] = bh_curve
+        res["capital"] = float(capital)
+        if df.attrs.get("coverage_complete") is False:
+            actual_start_ms = df.attrs.get("actual_start_ms")
+            actual_end_ms = df.attrs.get("actual_end_ms")
+            if actual_start_ms is not None and actual_end_ms is not None:
+                actual_start = pd.Timestamp(
+                    int(actual_start_ms), unit="ms", tz="UTC"
+                ).tz_convert("Asia/Taipei").strftime("%Y-%m-%d")
+                actual_end = pd.Timestamp(
+                    int(actual_end_ms), unit="ms", tz="UTC"
+                ).tz_convert("Asia/Taipei").strftime("%Y-%m-%d")
+                res["_coverage_note"] = (
+                    f"Partial market history used: {actual_start} → {actual_end}"
+                )
+        payload = (df, res, perf)
+        self._store_cached_backtest(cache_key, payload)
+        return payload
+
     def _compute_backtest(self, symbol, interval, start, end, refresh_policy,
                           fee_rate, capital, add_drop, multiplier, max_orders, tp,
                           source="binance"):
@@ -2270,12 +2726,30 @@ class MartinGUI(QMainWindow):
         sym = df.attrs.get("symbol", "UNKNOWN")
         interval_str = df.attrs.get("interval", "N/A")
         is_stock = str(df.attrs.get("market_type", "")).lower() == "stock"
+        is_diy = str(res.get("_strategy_mode", res.get("strategy_mode", "fixed"))).lower() == "diy"
         market_label = "Stock" if is_stock else "Spot"
         quote_currency = "USD" if is_stock else "USDT"
+        if is_diy:
+            metadata = res.get("_diy_metadata", {})
+            q_end = metadata.get("mae_q_end")
+            q_label = (
+                f"{100.0 * float(q_end):.0f}%"
+                if q_end is not None else "N/A"
+            )
+            strategy_label = (
+                f"DIY TP/Horizon MAE q_end={q_label}, "
+                f"gamma={float(metadata.get('capital_gamma', np.nan)):.2f}, "
+                f"tp={tp:.3f}, max_orders={int(max_orders)}"
+            )
+        else:
+            strategy_label = (
+                f"add_drop={add_drop:.3f}, tp={tp:.3f}, "
+                f"mul={multiplier:.1f}, max_orders={int(max_orders)}"
+            )
         ax.set_title(
             f"{sym} | {market_label} | exch={df.attrs.get('exchange','?')} | interval={interval_str}\n"
             f"[{df['time'].iloc[0].date()} → {df['time'].iloc[-1].date()}] "
-            f"add_drop={add_drop:.3f}, tp={tp:.3f}, mul={multiplier:.1f}, max_orders={int(max_orders)}",
+            f"{strategy_label}",
             fontsize=14,
             pad=12,
         )
@@ -2326,7 +2800,7 @@ class MartinGUI(QMainWindow):
             closed_pnl = float(res.get("_closed_pnl", 0.0))
             open_pnl = float(res.get("_open_pnl", 0.0))
             net_pnl = float(res.get("_net_pnl", final_equity - float(res.get("capital", 0.0))))
-            t.append("=== Data Summary ===")
+            t.append("=== Data ===")
             t.append(
                 f"Period: {df['time'].iloc[0].strftime('%Y-%m-%d %H:%M')} → "
                 f"{df['time'].iloc[-1].strftime('%Y-%m-%d %H:%M')} | "
@@ -2336,11 +2810,51 @@ class MartinGUI(QMainWindow):
                 f"Price: {price_start:.4f} → {price_end:.4f} | "
                 f"Change: {human_pct(price_return)}"
             )
+
+            metadata = {}
+            levels = ()
+            shares = ()
+            quantiles = ()
+            fill_probabilities = ()
+            share_total = 0.0
             t.append("")
-            t.append("=== Performance (Strategy) ===")
+            t.append("=== Strategy Setup ===")
+            if is_diy:
+                metadata = res.get("_diy_metadata", {})
+                levels = tuple(float(v) for v in res.get("level_ratios", ()))
+                shares = tuple(float(v) for v in res.get("order_shares", ()))
+                quantiles = tuple(
+                    float(v) for v in metadata.get("mae_quantiles", ())
+                )
+                fill_probabilities = tuple(
+                    float(v) for v in metadata.get("fill_probabilities", ())
+                )
+                share_total = float(sum(shares)) if shares else 0.0
+                t.append(
+                    f"Mode: DIY TP/Horizon MAE | TP: {human_pct(tp)} | "
+                    f"Orders: {int(max_orders)} | "
+                    f"MAE Horizon: {float(metadata.get('mae_horizon_days', np.nan)):.1f} days"
+                )
+                t.append(
+                    f"MAE q end: "
+                    f"{100.0 * float(metadata.get('mae_q_end', np.nan)):.0f}% | "
+                    f"Capital Gamma: "
+                    f"{float(metadata.get('capital_gamma', np.nan)):.1f}"
+                )
+            else:
+                t.append(
+                    f"Mode: Fixed | TP: {human_pct(tp)} | "
+                    f"Orders: {int(max_orders)} | "
+                    f"Add Drop: {human_pct(add_drop)} | "
+                    f"Multiplier: {float(multiplier):.1f}×"
+                )
+
+            t.append("")
+            t.append("=== Key Performance ===")
             t.append(
-                f"Final Equity: {final_equity:.2f} | Net PnL: {net_pnl:+.2f} | "
-                f"Closed/Open PnL: {closed_pnl:+.2f}/{open_pnl:+.2f}"
+                f"Final Equity: {final_equity:.2f} | "
+                f"Net PnL: {net_pnl:+.2f} | "
+                f"Total Return: {human_pct(perf.get('total_return'))}"
             )
             closed_trades = int(
                 perf.get("closed_trades", res.get("trades", len(res.get("trades_log", []))))
@@ -2349,58 +2863,84 @@ class MartinGUI(QMainWindow):
                 perf.get("has_open_position", isinstance(res.get("open_trade"), dict))
             )
             t.append(
-                f"Closed Trades: {closed_trades:,} | "
-                f"Open Position at End: {'Yes' if has_open_position else 'No'}"
-            )
-            t.append(
-                f"Total Return: {human_pct(perf.get('total_return'))} | CAGR: {human_pct(perf.get('cagr'))} | Ann Vol: {human_pct(perf.get('ann_vol'))}"
+                f"CAGR: {human_pct(perf.get('cagr'))} | "
+                f"Max DD: {perf.get('max_dd_pct', float('nan')):.2f}% | "
+                f"Closed Trades: {closed_trades:,}"
             )
             sharpe = perf.get('sharpe')
-            sortino = perf.get('sortino')
-            calmar = perf.get('calmar')
-            t.append(
-                f"Sharpe: {('%.2f' % sharpe) if sharpe is not None else 'NaN'} | "
-                f"Sortino: {('%.2f' % sortino) if sortino is not None else 'NaN'} | "
-                f"Calmar: {('%.2f' % calmar) if calmar is not None else 'NaN'}"
-            )
-            t.append(
-                f"Max DD: {perf.get('max_dd_pct', float('nan')):.2f}% | "
-                f"DD Duration (days): {perf.get('max_dd_days','NaN')} | Recovery: {perf.get('recovery_days','NaN')}"
-            )
-            t.append(
-                f"Underwater (avg/max): {perf.get('avg_underwater_days', float('nan')):.1f}/"
-                f"{perf.get('max_underwater_days', float('nan')):.1f} days"
-            )
             pf = perf.get('profit_factor')
             pf_str = "∞" if (isinstance(pf, (int, float)) and np.isinf(pf)) else (
                 "NaN" if pf is None or (isinstance(pf, float) and np.isnan(pf)) else f"{pf:.2f}"
             )
             t.append(
-                f"Terminal-adjusted Win Rate: {human_pct(perf.get('win_rate'))} | "
-                f"Profit Factor: {pf_str} | Exposure: {human_pct(perf.get('exposure'))}"
+                f"Sharpe: {('%.2f' % sharpe) if sharpe is not None else 'NaN'} | "
+                f"Win Rate: {human_pct(perf.get('win_rate'))} | "
+                f"Profit Factor: {pf_str}"
             )
-            if trap_ratio is not None and total_secs is not None:
-                trapped_days = trapped_secs / 86400.0
-                total_days = total_secs / 86400.0
+            effective_trap_ratio = (
+                trap_ratio
+                if trap_ratio is not None
+                else res.get("trapped_time_ratio")
+            )
+            t.append(
+                f"Trapped: {human_pct(effective_trap_ratio, 2)} | "
+                f"Exposure: {human_pct(perf.get('exposure'))} | "
+                f"Open Position: {'Yes' if has_open_position else 'No'}"
+            )
+            if has_open_position:
                 t.append(
-                    f"Trapped Time Ratio: {human_pct(trap_ratio, 2)} | Trapped/Total: {trapped_days:.1f}/{total_days:.1f} days"
+                    f"Closed/Open PnL: {closed_pnl:+.2f}/{open_pnl:+.2f}"
                 )
-            t.append(f"Avg Win: {perf.get('avg_win', float('nan')):.2f} | Avg Loss: {perf.get('avg_loss', float('nan')):.2f}")
-            t.append(
-                f"Max Consec Wins: {perf.get('max_consec_wins','NaN')} | "
-                f"Max Consec Losses: {perf.get('max_consec_losses','NaN')}"
-            )
-            t.append(
-                f"Avg Trade Return: {human_pct(perf.get('avg_trade_return'))} | "
-                f"Median Trade Return: {human_pct(perf.get('median_trade_return'))}"
-            )
+            if is_diy:
+                t.append(
+                    f"Capital Use: "
+                    f"{human_pct(res.get('avg_capital_utilization'), 2)} | "
+                    f"Position Underwater: "
+                    f"{human_pct(res.get('underwater_position_ratio'), 2)} | "
+                    f"Full Capital: "
+                    f"{human_pct(res.get('full_capital_time_ratio'), 2)}"
+                )
+
+                t.append("")
+                t.append("=== DIY Order Plan ===")
+                t.append(
+                    f"TP Hit Rate: "
+                    f"{human_pct(metadata.get('tp_hit_rate_horizon'), 2)} | "
+                    f"Median Bars to TP: "
+                    f"{float(metadata.get('median_bars_to_tp', np.nan)):.1f} | "
+                    f"Stress Loss: "
+                    f"{float(metadata.get('stress_loss_pct', np.nan)):.2f}%"
+                )
+                t.append(
+                    "Order | MAE q | Fill P | Cum.Drop | Shares | Allocation"
+                )
+                for i, (level, share) in enumerate(zip(levels, shares)):
+                    q_text = (
+                        "Initial"
+                        if i == 0
+                        else (
+                            f"{100.0 * quantiles[i]:.1f}%"
+                            if i < len(quantiles) else "N/A"
+                        )
+                    )
+                    fill_probability = (
+                        fill_probabilities[i]
+                        if i < len(fill_probabilities) else np.nan
+                    )
+                    allocation = (
+                        100.0 * share / share_total
+                        if share_total > 0 else np.nan
+                    )
+                    t.append(
+                        f"{i + 1:>5} | {q_text:>7} | "
+                        f"{100.0 * fill_probability:>6.1f}% | "
+                        f"{100.0 * (1.0 - level):>7.2f}% | "
+                        f"{int(round(share)):>6} | {allocation:>9.2f}%"
+                    )
             if "bh_total_return" in perf:
-                t.append("\n=== Buy & Hold (Benchmark) ===")
+                t.append("\n=== Buy & Hold ===")
                 t.append(
-                    f"Total: {human_pct(perf.get('bh_total_return'))} | "
-                    f"CAGR: {human_pct(perf.get('bh_cagr'))} | Ann Vol: {human_pct(perf.get('bh_ann_vol'))}"
-                )
-                t.append(
+                    f"Return: {human_pct(perf.get('bh_total_return'))} | "
                     f"Sharpe: {('%.2f' % perf.get('bh_sharpe')) if perf.get('bh_sharpe') is not None else 'NaN'} | "
                     f"Max DD: {perf.get('bh_max_dd_pct', float('nan')):.2f}%"
                 )

@@ -1,8 +1,8 @@
 # Martin 策略研究工具
 
-這個專案提供兩個 PySide6 圖形介面，用來研究固定樓梯加倉的 Martin／網格策略：
+這個專案提供兩個 PySide6 圖形介面，用來研究 Martin／網格策略：
 
-- `martin_gui.py`：歷史參數掃描、Monte Carlo 掃描、單組參數回測與績效圖表。
+- `martin_gui.py`：Fixed 等比價格樓梯、TP/Horizon MAE DIY 樓梯、歷史參數掃描、Monte Carlo 與詳細績效圖表。
 - `volatility_scanner_gui.py`：先從市場中篩選較可能適合 Martin 策略的標的。
 
 目前支援的行情來源只有：
@@ -11,6 +11,8 @@
 - Alpaca：美股與 ETF 歷史行情。
 
 Binance 股票代幣、swap、futures 與 Pionex 都不再是支援的資料來源。美股請使用 Alpaca 的原始 ticker，例如 `AAPL`、`NVDA`、`SNDK`、`STRC`，不要使用 `SNDKX`、`NVDAB` 等代幣名稱。
+
+DIY 結果會輸出可手動填入 Pionex DIY Martin Bot 的累積跌幅與 Shares，但專案沒有串接 Pionex API。
 
 > 本工具只讀取歷史行情，不會查詢交易帳戶或送出訂單。所有結果僅供策略研究，不構成投資建議。
 
@@ -123,29 +125,96 @@ MSTR, STRC, CRCL, RKLB, SPY, QQQ, SOXX, SMH, SOXL, GLD
 
 ## 主 GUI：`martin_gui.py`
 
-主 GUI 的三個頁籤各自都有 `Source`、`Symbol`、`Interval`、日期與本金欄位。預設為 Binance、`XRP`、`15m`，固定回測手續費為單邊 `0.05%`。
+主 GUI 的三個頁籤各自都有 `Source`、`Symbol`、`Interval`、日期與本金欄位。預設為 Binance、`XRP`、`15m`、最近兩年至今天、本金 `1000`，固定回測手續費為單邊 `0.05%`。日期不可選到未來。
 
 ### Historical Scan
 
-以 `start:end:step` 格式掃描四個策略參數：
+Historical Scan 可在兩種模式間切換：
+
+- `Fixed Mode`：既有等比價格樓梯與 multiplier 資金倍率。
+- `DIY Mode (TP/Horizon MAE)`：依每個 TP 分別建立「無歧義 TP 或觀察期限前 MAE」樓梯及 Pionex Shares。
+
+Fixed Mode 以 `start:end:step` 格式掃描四個既有策略參數：
 
 - `add_drop`：每層價格跌幅。
 - `tp`：含費止盈門檻。
 - `multiplier`：後續加碼倍率。
 - `max_orders`：單輪最大下單次數，包含首單。
 
-可用 `min_trades`、`max_dd_overall(%)`、`max_trapped_ratio(%)` 過濾結果，再依 `final_equity` 顯示前 N 名。結果表包含 `trades`、最大回撤、困住時間比例及最低補單價格比例，也可匯出 CSV。
+掃描欄位的 `add_drop` 與 `tp` 使用小數而非百分數，例如 `0.010:0.080:0.001` 代表 `1.0%` 到 `8.0%`、每次增加 `0.1%`。`max_orders` 必須使用整數範圍。Historical Scan 不接受單一值，仍需寫成 `start:end:step`。
+
+目前預設值：
+
+| 項目 | Fixed Mode | DIY Mode |
+| --- | --- | --- |
+| `add_drop` | `0.010:0.080:0.001` | 由 TP/Horizon MAE 產生 |
+| `tp` | `0.010:0.080:0.001` | `0.010:0.080:0.001` |
+| `multiplier` | `1.5:2.0:0.1` | 由 Shares 曲線取代 |
+| `max_orders` | `5:12:1` | `5:12:1` |
+| `MAE horizon(days)` | 不使用 | `30` |
+
+`min_trades`、`max_dd_overall(%)`、`max_trapped_ratio(%)` 預設全部留空，不限制候選；只套用 `Show Top N = 20`。若手動填入篩選條件，會在依 `final_equity` 排名前先過濾。
+
+DIY Mode 保留 `tp` 與 `max_orders` 掃描，另外只需設定：
+
+- `MAE horizon(days)`：每個歷史進場點向後觀察的完整期間。
+
+TP/Horizon MAE 模式會為每個 TP 尋找含買賣費目標價的第一個「無加倉歧義」觸及點：該棒 `high` 必須觸及目標，而且 `low` 不得低於首單基準價。若 `low` 低於首單價，代表任何一個較近的 DIY Safety Order 都可能先成交；完整回測在補單棒禁止同棒止盈，因此這個 high passage 會被略過並繼續向後搜尋。若 horizon 內沒有無歧義 TP，樣本就使用完整 horizon MAE。這些資料是明確的 TP-or-horizon capped MAE，不是「最終一定到達 TP 前」的未截尾 MAE。搜尋仍使用 sparse-table range query，避免對每個 entry/TP 全區間逐根暴力掃描。
+
+為保持操作簡潔且可重現，下列研究維度已內建，不由 GUI 輸入：
+
+| 內建項目 | 候選／限制 |
+| --- | --- |
+| MAE 起始分位數 | `50%` |
+| MAE 終點分位數 | `90/92/94/96/98%` |
+| 首單資金比例 | `1/2/3/4/5%` |
+| Capital gamma | `0.8/1.0/1.2/1.4/1.6/1.8` |
+| 總 Shares | `100` |
+| Stress MAE 分位數 | `99%` |
+| 最後一單上限 | `30%` |
+| Stress loss 上限 | `50%` |
+| TP/Horizon MAE bias | 固定 `0` |
+
+Bias 不再掃描或依觸發率重加權。舊 forward-MAE 模式與 GUI 分支已移除。程式會在配置大型陣列前檢查原始 DIY 候選上限 `2,000,000`，並限制 MAE 輸出矩陣預估值為 `512 MiB`；超過時會要求放大 TP step、縮小範圍或縮短資料期間。Drops、Shares 與 max_orders 完全相同的模板會先去重，不重複執行 Numba 回測。
+
+Fixed 與 DIY 的畫面結果表共用相同順序：
+
+```text
+Mode | TP | Orders | Final Equity | Return | Max DD | Trades |
+Trapped | Lowest Buy | Capital Use | Setup
+```
+
+- `Lowest Buy`：最後一層買入價相對首單基準價的比例。
+- `Capital Use`：DIY 在所有回測 K 線上的實際平均本金部署比例；沒有持倉的 K 線以 `0` 計入。Fixed 掃描核心尚未計算此值，因此顯示 `—`。
+- `Setup`：Fixed 顯示 `Drop + Multiplier`；DIY 顯示可手動設定到 Pionex 的累積 `Drops + Shares`。
+
+完整的 MAE 分位數、TP hit rate、逐層觸發率、壓力損失與其他診斷仍保留在 DIY CSV。
+
+雙擊結果後，Fixed 與 DIY 都會先顯示相同順序的 `Strategy Setup` 與 `Key Performance`；DIY 的逐層 MAE、觸發率與 Shares 另放在後面的 `DIY Order Plan`。
 
 雙擊結果會切到 `Backtest Chart / Performance`，使用該次掃描保存的資料來源、日期、本金與手續費設定重建詳細回測，避免之後修改畫面欄位導致圖表與表格不一致。
 
 ### MC Scan
 
-Monte Carlo 掃描分成兩階段：
+MC Scan 目前只掃描 Fixed Mode 的 `add_drop/tp/multiplier/max_orders`，不支援 DIY TP/Horizon MAE。計算分成兩階段：
 
 1. 在前段歷史資料以 LHS、Random 或 Full Grid 產生候選參數，套用歷史交易次數與 trapped ratio 篩選，並可在較佳候選附近 refine。
 2. 預設保留最後 `30%` 歷史資料建立 block-bootstrap 路徑，評估候選參數的尾端風險。
 
-主要輸出包含 terminal mean／median／P5、`P(loss)`、`P(severe)`、`P(DD>50%)`、平均最大回撤、平均 trapped ratio、已評估路徑數與是否通過風險限制。
+預設使用：
+
+| 類別 | 預設 |
+| --- | --- |
+| Parameter grid | 與 Historical Fixed Mode 相同 |
+| Sampling | LHS、`Sample size = 5000` |
+| Refine | 歷史績效前 `5%` 的相鄰 grid，最多增加 `3000` 組 |
+| 歷史篩選 | `min_trades = 104`、`max_trap = 20%` |
+| MC | `300` paths、每條 `730` 天、block `672`、seed `42` |
+| Robustness | `Seed runs = 1`、holdout `30%`、workers `0`（自動） |
+| 風險限制 | `P(loss) ≤ 30%`、`P(severe) ≤ 10%`、`P(DD>50%) ≤ 20%` |
+| 排名／顯示 | Median terminal、Top `50` |
+
+`P(loss)` 是期末資產低於初始本金的路徑比例；`P(severe)` 是期末資產低於初始本金 `50%` 的比例。主要輸出包含 terminal median／P5、三個風險機率、平均最大回撤、seed median 標準差、已評估路徑數與是否通過限制。
 
 若候選在尚未跑完全部 paths 前就已確定超過限制，會標示 `mc_early_rejected=True`。這類 row 的不完整 terminal、回撤與 trapped 統計顯示為 `N/A`。風險限制全部設為 `100%` 時使用 one-pass；有實際限制時，survivor 才進入第二輪精確計算 median 與 P5。
 
@@ -153,15 +222,17 @@ Monte Carlo 掃描分成兩階段：
 
 ### Single Backtest
 
-對一組參數執行完整回測，或以同一組參數執行 Monte Carlo。績效區會顯示：
+Single Backtest 目前只接受一組 Fixed Mode 參數；預設為 `add_drop=5%`、`tp=5%`、`multiplier=2.0`、`max_orders=7`。可執行完整歷史回測，或以同一組參數執行 Monte Carlo；Single Monte Carlo 預設為 `1000` paths、每條 `730` 天、block `672`、seed `42`，並使用整段所選歷史 OHLC 作為 bootstrap 樣本。
+
+詳細績效區目前精簡為：
 
 - 實際資料期間、K 線數、價格變化。
-- Final Equity、Net PnL、Closed／Open PnL 對帳。
-- `Closed Trades` 交易次數及期末是否仍有未平倉部位。
-- Total Return、CAGR、年化波動、Sharpe、Sortino、Calmar。
-- 最大回撤、回撤與復原時間、underwater 時間。
-- terminal-adjusted win rate、profit factor、exposure、連勝／連敗與每筆交易報酬。
-- Buy & Hold 的報酬、年化波動、Sharpe 與最大回撤。
+- Strategy Setup。
+- Final Equity、Net PnL、Total Return、CAGR、最大回撤與 Closed Trades。
+- Sharpe、terminal-adjusted Win Rate、Profit Factor。
+- Trapped ratio、Exposure、期末持倉狀態；有未平倉時另外顯示 Closed／Open PnL。
+- DIY 詳細回測另外顯示 Capital Use、Position Underwater、Full Capital 與逐層 Order Plan。
+- Buy & Hold 的報酬、Sharpe 與最大回撤。
 
 圖表包含 Strategy equity curve、含買賣費的 Buy & Hold benchmark，以及已達最大加碼層數且尚未損益兩平的 trapped intervals。若 Final Equity 無法與 `Capital + Closed PnL + Open PnL` 對帳，或績效 Total Return 不一致，詳細回測會直接報錯，不顯示可能誤導的結果。
 
@@ -179,7 +250,42 @@ base_price * (1 - add_drop) ** k
 
 歷史回測使用完整 OHLC。若同一根 K 的 low 穿越多個樓梯，每一層按自己的 trigger price 成交；若同一根 K 同時碰到補單與 TP，採保守順序：先補單，該根 K 不再止盈。只有觸及 TP 且沒有補單時，才按 TP 價成交。
 
-買入成本為 `alloc * (1 + fee_rate)`，賣出 proceeds 為 `qty * price * (1 - fee_rate)`。期末未平倉部位以扣除假設性賣出費後的保守清算價值計入 Final Equity。
+買入成本為 `alloc * (1 + fee_rate)`，賣出 proceeds 為 `qty * price * (1 - fee_rate)`。每次加倉後會依新的平均成本重算含費目標價：
+
+```text
+(deployed_capital + buy_fees + deployed_capital * tp)
+/ (position_qty * (1 - sell_fee))
+```
+
+因此回測中的 `tp` 是扣除買賣費後、相對本輪已部署本金的目標淨利。期末未平倉部位以扣除假設性賣出費後的保守清算價值計入 Final Equity。
+
+### TP/Horizon MAE DIY 樓梯
+
+首單含費 TP 價格為：
+
+```text
+entry_price * (1 + buy_fee + tp) / (1 - sell_fee)
+```
+
+對每個 entry 找到 horizon 內第一個「`high` 觸及目標且同棒 `low` 不低於 entry」的位置，並計算在該位置以前的 MAE；可能同棒先加倉的 high passage 不視為可退出。若沒有無歧義 TP，就計算到 horizon。第 `i` 個 Safety Order 由這個 TP-or-horizon MAE 分布的分位數取得累積跌幅 `D_i`，買入價格為 `base_price * (1 - D_i)`。
+
+若首單資金比例為 `u0`、最深層累積跌幅為 `D_max`，累計資金部署曲線為：
+
+```text
+U_i = u0 + (1 - u0) * (D_i / D_max) ** gamma
+```
+
+每一單的連續權重為相鄰 `U_i` 之差，再以 largest-remainder 修正方式取整為正整數 Shares，總和保持等於 `Total shares`。第一個 Share 是首單，後續才是 Safety Orders；`max_orders` 同樣包含首單。`gamma > 1` 會偏後段配置，`gamma < 1` 會偏前段配置。
+
+壓力損失會在 `Stress MAE q` 對應的價格，依序成交已被穿越的訂單、保留尚未觸發的現金，並以包含假設性賣出費的清算價值計算。這是單一歷史 MAE 壓力點，不等同於完整的未來尾端保證。
+
+若某層累積跌幅為 `D_i`，其經驗觸發率為：
+
+```text
+p_i = P(MAE_TP_or_horizon >= D_i)
+```
+
+觸發率用於診斷預期資金使用率，不再改寫資金權重；bias 固定為 `0`。所有候選仍依完整 OHLC 回測的 Final Equity 排名。
 
 ### 年化與交易日
 
@@ -196,6 +302,8 @@ Bootstrap 不只抽 close-to-close return，也會一起抽樣 open／high／low
 ## Volatility Scanner：`volatility_scanner_gui.py`
 
 Scanner 用來先找出較值得進一步做 Historical Scan 或 MC Scan 的標的。快速設定預設為 Binance、`4h`、最近一年、`Scan Limit = 50`。可選最近 180 天、1 年、2 年或自訂日期。
+
+預設畫面只顯示快速設定；勾選 `Show Advanced Settings` 才會展開自訂日期、成交量門檻、Scan Limit、CoinGecko rank 與 `Manual Include`。兩個成交量門檻預設不設限；Binance 的 CoinGecko filter 預設啟用且 Max Rank 為 `100`，切到 Alpaca 時會停用。
 
 ### 候選選取
 
@@ -248,7 +356,7 @@ listed = results + data-filtered
 
 參考跌幅會依最近月度 ATR 調整並限制在 2%–5%。分數權重為波動 `25%`、回復行為 `35%`、均值回歸 `20%`、下跌風險 `20%`；嚴重跌勢、深度回撤、低回復率或長時間單向走勢會限制最終分數。
 
-勾選 `Show Advanced Metrics` 可查看 RV、ATR、Bollinger Band width、Efficiency Ratio、OHLC 最大回撤、最近 90 天變化、Current DD、連續紅 K、連續下跌、Active%、MaxGap%、成交量與 CoinGecko rank。選取表格 row 後，下方會繪製該標的價格圖。
+勾選 `Show Advanced Metrics` 可查看年度 RV、月度 ATR、Efficiency Ratio、OHLC 最大回撤、全期與最近 90 天變化、Current DD、連續紅 K、Active%、MaxGap%、歷史平均每日成交額與 CoinGecko rank。選取表格 row 後，下方會繪製該標的價格圖。
 
 Scanner 固定用 8 個 thread 同時取得 K 線，按 `Stop` 可停止尚未完成的工作。
 
@@ -287,7 +395,7 @@ GUI 另外有程序內記憶體快取。主 GUI 最多保留 8 組行情與 24 �
 pytest -q
 ```
 
-目前測試涵蓋 Alpaca 憑證與分頁、紐約日期及夏令時間、全域節流與 retry、Binance 股票代幣排除、Scanner Data Filtered 診斷、主 GUI source routing、掃描設定快照、交易次數與美股年化等回歸案例。
+目前共有 `56` 個測試，涵蓋 Fixed／DIY OHLC 核心一致性、TP/Horizon MAE 同棒順序、矩陣記憶體上限、模板去重、詳細頁 metadata 快取、bias=`0` 內建設定、統一結果表、績效對帳、Monte Carlo、Alpaca 憑證與分頁、紐約日期及夏令時間、全域節流與 retry、Binance 股票代幣排除、Scanner Data Filtered、source routing、掃描設定快照、交易次數與美股年化等回歸案例。
 
 ## 主要檔案
 
@@ -302,6 +410,7 @@ pytest -q
 - `mc_sampling.py`：LHS、Random、Full Grid 與 refine neighbors。
 - `mc_eval.py`：OHLC block bootstrap、early rejection 與 survivor quantile。
 - `mc_formatters.py`：Historical／MC 掃描表格與 CSV 格式。
+- `diy_strategy.py`：TP/Horizon MAE sparse-table queries、分位數樓梯、Pionex Shares、觸發率診斷與壓力損失。
 - `tests/`：資料層、GUI 與 Scanner 回歸測試。
 
 ## 已知限制
@@ -309,17 +418,13 @@ pytest -q
 - 未建模 slippage、market impact、funding fee、liquidation 或 margin requirement。
 - 未套用交易所實際 amount／price precision、最小單量或最小名目金額；本專案不是下單引擎。
 - GUI 目前使用固定 `0.05%` 單邊手續費，不能代表所有帳戶、標的或市場的實際成本。
+- MC Scan 與 Single Backtest 目前只支援 Fixed Mode；DIY TP/Horizon MAE 只存在於 Historical Scan 與其詳細回測。
+- Fixed Historical Scan 尚未輸出實際平均 `Capital Use`，因此統一結果表中顯示 `—`。
 - Alpaca 可用歷史深度、ticker 與 feed 內容取決於帳戶權限和 provider 回傳；內建 143 檔 universe 不代表完整支援清單。
 - `trapped_time_ratio` 是「已達 `max_orders` 且扣除買賣費後仍未損益兩平」的 bar 比例。
+- `underwater_position_ratio` 是任何尚未損益兩平持倉的 bar 比例，與只有滿單才計入的 `trapped_time_ratio` 不同。
+- TP/Horizon MAE 的 first-passage 仍以首單成本推導 TP；可能同棒加倉的 passage 會被保守略過，加倉後平均成本與實際動態 TP 則由完整 OHLC 回測驗證，尚未做逐候選反覆迭代校準。
+- TP/Horizon MAE 是使用者指定 horizon 內的 capped MAE；未在期限內到達無歧義 TP 的路徑不代表其更長期尾端風險已被完整觀察。
 - Monte Carlo 只重抽歷史 OHLC 結構，無法保證涵蓋未來 regime shift、停牌、跳空或流動性危機。
+- DIY MAE 樓梯若直接使用同一段資料選參數與排名，仍有樣本內偏誤；正式使用前仍應做 walk-forward 與未參與選擇的 OOS 測試。
 - Martin／martingale 策略可能在長期單向下跌時持續占用資金並造成重大損失，應另外設定總資金風險與停損規則。
-
-## 畫面
-
-### 主 GUI
-
-![martin_gui](screenshot%20martin_gui.png)
-
-### Volatility Scanner
-
-![volatility_scanner_gui](screenshot%20volatility%20scanner%20gui.png)
