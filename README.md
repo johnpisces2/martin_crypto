@@ -125,7 +125,7 @@ MSTR, STRC, CRCL, RKLB, SPY, QQQ, SOXX, SMH, SOXL, GLD
 
 ## 主 GUI：`martin_gui.py`
 
-主 GUI 的三個頁籤各自都有 `Source`、`Symbol`、`Interval`、日期與本金欄位。預設為 Binance、`XRP`、`15m`、最近兩年至今天、本金 `1000`，固定回測手續費為單邊 `0.05%`。日期不可選到未來。
+主 GUI 的三個頁籤各自都有 `Source`、`Symbol`、`Interval`、日期與本金欄位。預設為 Binance、`XRP`、`15m`、最近兩年至今天、本金 `1000`，固定回測手續費為單邊 `0.1%`（買入與賣出各計一次）。日期不可選到未來。
 
 ### Historical Scan
 
@@ -417,7 +417,7 @@ pytest -q
 
 - 未建模 slippage、market impact、funding fee、liquidation 或 margin requirement。
 - 未套用交易所實際 amount／price precision、最小單量或最小名目金額；本專案不是下單引擎。
-- GUI 目前使用固定 `0.05%` 單邊手續費，不能代表所有帳戶、標的或市場的實際成本。
+- GUI 目前使用固定 `0.1%` 單邊手續費，買入與賣出各計一次；不能代表所有帳戶、標的或市場的實際成本。
 - MC Scan 與 Single Backtest 目前只支援 Fixed Mode；DIY TP/Horizon MAE 只存在於 Historical Scan 與其詳細回測。
 - Fixed Historical Scan 尚未輸出實際平均 `Capital Use`，因此統一結果表中顯示 `—`。
 - Alpaca 可用歷史深度、ticker 與 feed 內容取決於帳戶權限和 provider 回傳；內建 143 檔 universe 不代表完整支援清單。
