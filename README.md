@@ -62,13 +62,32 @@ python volatility_scanner_gui.py
 
 ## Alpaca 憑證設定
 
+### 第一次準備
+
+1. 登入 [Alpaca Dashboard](https://app.alpaca.markets/account/login)，切換到 **Paper Trading** 帳戶。
+2. 在右側 **API Keys** 區域按 **Generate New Keys**。
+3. 保存顯示的 **API Key ID** 與 **Secret Key**。Secret Key 遺失時需要重新產生，舊 key 會失效。
+4. 在 repo 根目錄執行：
+
+```bash
+mkdir -p ~/.config/workspace
+cp alpaca.env.template ~/.config/workspace/alpaca.env
+chmod 600 ~/.config/workspace/alpaca.env
+```
+
+5. 編輯 `~/.config/workspace/alpaca.env`，將 placeholder 替換成實際 key。
+
+設定檔範本也可直接參考 repo 裡的 [`alpaca.env.template`](alpaca.env.template)。
+
+### 設定檔格式
+
 兩個 GUI 在切換到 Alpaca 或開始 Alpaca 掃描時，會自動讀取：
 
 ```text
 ~/.config/workspace/alpaca.env
 ```
 
-檔案內容：
+`alpaca.env` 應包含：
 
 ```bash
 APCA_API_KEY_ID="your-key-id"
@@ -79,12 +98,6 @@ ALPACA_DATA_FEED="iex"
 
 # 選填；未設定時使用 https://data.alpaca.markets
 # ALPACA_DATA_URL="https://data.alpaca.markets"
-```
-
-建議限制檔案權限：
-
-```bash
-chmod 600 ~/.config/workspace/alpaca.env
 ```
 
 程式也接受 `ALPACA_API_KEY_ID` 與 `ALPACA_API_SECRET_KEY` 這組別名。若 shell 已經匯出任一組有效憑證，已匯出的值優先，檔案不會覆蓋它。設定檔可使用 `NAME=value`、`export NAME=value`、引號及註解。
